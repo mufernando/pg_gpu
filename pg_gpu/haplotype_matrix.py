@@ -60,15 +60,15 @@ class HaplotypeMatrix:
     def transfer_to_gpu(self):
         """Transfer data from CPU to GPU."""
         if self.device == 'CPU':
-            self.haplotypes = cp.array(self.haplotypes)
-            self.positions = cp.array(self.positions)
+            self.haplotypes = cp.asarray(self.haplotypes)
+            self.positions = cp.asarray(self.positions)
             self._device = 'GPU'
 
     def transfer_to_cpu(self):
         """Transfer data from GPU to CPU."""
         if self.device == 'GPU':
-            self.haplotypes = cp.asnumpy(self.haplotypes)
-            self.positions = cp.asnumpy(self.positions)
+            self.haplotypes = np.asarray(self.haplotypes.get())
+            self.positions = np.asarray(self.positions.get())
             self._device = 'CPU'
 
     @classmethod
@@ -201,19 +201,13 @@ class HaplotypeMatrix:
             positions = cp.array(positions)
        
         # Validate that positions are valid indices.
-        if self.device == 'CPU':
-            if not np.all((positions >= 0) & (positions < self.haplotypes.shape[1])):
-                raise ValueError("Positions must be valid indices within the haplotype matrix.")
-            # Index using NumPy arrays
-            subset_haplotypes = self.haplotypes[:, positions]
-            subset_positions = self.positions[positions]
-        else:
-            # Validate using CuPy
-            if not cp.all((positions >= 0) & (positions < self.haplotypes.shape[1])):
-                raise ValueError("Positions must be valid indices within the haplotype matrix.")
-            # Index using CuPy arrays
-            subset_haplotypes = self.haplotypes[:, positions]
-            subset_positions = self.positions[positions]
+        # Ensure positions are valid indices
+        positions = cp.asarray(positions) if self.device == 'GPU' else np.asarray(positions)
+        if not (positions >= 0).all() or not (positions < self.haplotypes.shape[1]).all():
+            raise ValueError("Positions must be valid indices within the haplotype matrix.")
+
+        subset_haplotypes = self.haplotypes[:, positions]
+        subset_positions = self.positions[positions]
         
         # Create and return a new instance, maintaining the device state.
         return HaplotypeMatrix(subset_haplotypes, subset_positions)
@@ -234,10 +228,9 @@ class HaplotypeMatrix:
             raise ValueError("Invalid range specified")
         
         # Check device and find indices of positions within the specified range
-        if self.device == 'CPU':
-            indices = np.where((self.positions >= low) & (self.positions < high))[0]
-        else:
-            indices = cp.where((self.positions >= low) & (self.positions < high))[0]
+        positions = cp.asarray(self.positions) if self.device == 'GPU' else np.asarray(self.positions)
+        indices = (positions >= low) & (positions < high)
+        indices = cp.where(indices)[0] if self.device == 'GPU' else np.where(indices)[0]
         
         # Create the subset of haplotypes based on the found indices
         return HaplotypeMatrix(
