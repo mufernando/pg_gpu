@@ -47,16 +47,26 @@ def test_from_vcf(sample_vcf):
     """Test creating HaplotypeMatrix from VCF file."""
     hap_matrix = HaplotypeMatrix.from_vcf(sample_vcf)
     assert isinstance(hap_matrix, HaplotypeMatrix)
-    assert isinstance(hap_matrix.get_matrix(), cp.ndarray)  # Now expecting CuPy array
-    assert isinstance(hap_matrix.get_positions(), cp.ndarray)  # Now expecting CuPy array
+    # by default the arrays are on the CPU
+    assert hap_matrix.device == 'CPU'
+    assert isinstance(hap_matrix.get_matrix(), np.ndarray)  # Now expecting CuPy array
+    assert isinstance(hap_matrix.get_positions(), np.ndarray)  # Now expecting CuPy array
     assert len(hap_matrix.get_positions()) > 0
 
 def test_from_ts(sample_ts):
     """Test creating HaplotypeMatrix from tskit.TreeSequence."""
     hap_matrix = HaplotypeMatrix.from_ts(sample_ts)
     assert isinstance(hap_matrix, HaplotypeMatrix)
-    assert isinstance(hap_matrix.get_matrix(), cp.ndarray)  # Now expecting CuPy array
-    assert isinstance(hap_matrix.get_positions(), cp.ndarray)  # Now expecting CuPy array
+    # by default the arrays are on the CPU
+    assert hap_matrix.device == 'CPU'
+    assert isinstance(hap_matrix.get_matrix(), np.ndarray)  # Now expecting CuPy array
+    assert isinstance(hap_matrix.get_positions(), np.ndarray)  # Now expecting CuPy array
+    
+    # make a GPU version
+    hap_matrix_gpu = HaplotypeMatrix.from_ts(sample_ts, device='GPU')
+    assert hap_matrix_gpu.device == 'GPU'
+    assert isinstance(hap_matrix_gpu.get_matrix(), cp.ndarray)
+    assert isinstance(hap_matrix_gpu.get_positions(), cp.ndarray)
     
     # Add test for pairwise_LD
     D = hap_matrix.pairwise_LD_v()
@@ -86,16 +96,24 @@ def test_get_matrix(sample_vcf):
     """Test get_matrix method."""
     hap_matrix = HaplotypeMatrix.from_vcf(sample_vcf)
     matrix = hap_matrix.get_matrix()
-    assert isinstance(matrix, cp.ndarray)
+    assert isinstance(matrix, np.ndarray)
     assert matrix.ndim == 2  # (n_variants, n_haplotypes)
+    # move to GPU
+    hap_matrix.transfer_to_gpu()
+    matrix = hap_matrix.get_matrix()
+    assert isinstance(matrix, cp.ndarray)
 
 def test_get_positions(sample_vcf):
     """Test get_positions method."""
     hap_matrix = HaplotypeMatrix.from_vcf(sample_vcf)
     positions = hap_matrix.get_positions()
-    assert isinstance(positions, cp.ndarray)
+    assert isinstance(positions, np.ndarray)
     assert positions.ndim == 1
     assert np.all(np.diff(positions) >= 0)  # Positions should be sorted
+    # move to GPU
+    hap_matrix.transfer_to_gpu()
+    positions = hap_matrix.get_positions()
+    assert isinstance(positions, cp.ndarray)
 
 def test_empty_haplotype_matrix():
     """Test handling of empty data."""

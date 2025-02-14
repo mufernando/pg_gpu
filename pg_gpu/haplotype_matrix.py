@@ -87,26 +87,27 @@ class HaplotypeMatrix:
         vcf = allel.read_vcf(path)
         genotypes = allel.GenotypeArray(vcf['calldata/GT'])
         num_variants, num_samples, ploidy = genotypes.shape
+        
         # assert that the ploidy is 2
         assert ploidy == 2
+       
         # convert to haplotype matrix
         haplotypes = np.empty((num_variants, 2*num_samples), dtype=genotypes.dtype)
         # fill the haplotypes array
         haplotypes[:, 0:num_samples] = genotypes[:, :, 0]  # First allele for all variants
         haplotypes[:, num_samples:2*num_samples] = genotypes[:, :, 1]  # Second allele for all variants
+       
         # transpose the haplotypes array
         haplotypes = haplotypes.T
-        # convert to cupy array
-        haplotypes = cp.array(haplotypes)
-        # convert positions to cupy array
-        positions = cp.array(vcf['variants/POS'])   
+        positions = np.array(vcf['variants/POS'])   
+        
         # get the chromosome start and end
         chrom_start = positions[0]
         chrom_end = positions[-1]
         return cls(haplotypes, positions, chrom_start, chrom_end)
 
     @classmethod
-    def from_ts(cls, ts) -> 'HaplotypeMatrix':
+    def from_ts(cls, ts: tskit.TreeSequence, device: str = 'CPU') -> 'HaplotypeMatrix':
         """
         Create a HaplotypeMatrix from a tskit.TreeSequence.
         
@@ -122,9 +123,10 @@ class HaplotypeMatrix:
         # get the chromosome start and end
         chrom_start = 0
         chrom_end = ts.sequence_length
-        # Convert to CuPy arrays
-        haplotypes = cp.array(haplotypes)
-        positions = cp.array(positions)
+        if device == 'GPU':
+            # Convert to CuPy arrays
+            haplotypes = cp.array(haplotypes)
+            positions = cp.array(positions)
         
         return cls(haplotypes, positions, chrom_start, chrom_end)
 
@@ -252,6 +254,8 @@ class HaplotypeMatrix:
         """
         Calculate the allele frequency spectrum for a haplotype matrix.
         """
+        if self.device == 'CPU':
+            self.transfer_to_gpu()
         n_haplotypes = self.num_haplotypes
         freqs = cp.sum(self.haplotypes, axis=0)
         return cp.histogram(freqs, bins=cp.arange(n_haplotypes+1))[0]
@@ -287,6 +291,8 @@ class HaplotypeMatrix:
         """
         Calculate Waterson's theta for the haplotype matrix.
         """
+        if self.device == 'CPU':
+            self.transfer_to_gpu()
         n_haplotypes = self.num_haplotypes
         # Compute the harmonic number a_n
         a1 = cp.sum(1.0 / cp.arange(1, n_haplotypes))  # Harmonic sum
