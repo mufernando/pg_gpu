@@ -229,9 +229,8 @@ class HaplotypeMatrix:
         
         # Check device and find indices of positions within the specified range
         positions = cp.asarray(self.positions) if self.device == 'GPU' else np.asarray(self.positions)
-        indices = (positions >= low) & (positions < high)
-        indices = cp.where(indices)[0] if self.device == 'GPU' else np.where(indices)[0]
-        
+        indices = cp.where((positions >= low) & (positions < high))[0] if self.device == 'GPU' else np.where((positions >= low) & (positions < high))[0]
+
         # Create the subset of haplotypes based on the found indices
         return HaplotypeMatrix(
             self.haplotypes[:, indices], 
@@ -250,7 +249,7 @@ class HaplotypeMatrix:
         if self.device == 'CPU':
             self.transfer_to_gpu()
         n_haplotypes = self.num_haplotypes
-        freqs = cp.sum(self.haplotypes, axis=0)
+        freqs = cp.sum(cp.nan_to_num(self.haplotypes, nan=0).astype(cp.int32), axis=0)
         return cp.histogram(freqs, bins=cp.arange(n_haplotypes+1))[0]
     
     def diversity(self, span_normalize: bool = True) -> float:
@@ -269,16 +268,15 @@ class HaplotypeMatrix:
         afs = self.allele_frequency_spectrum()
         n_haplotypes = self.num_haplotypes
         # Compute the weight factor for each allele frequency
-        i = cp.arange(1, n_haplotypes)  # Allele counts from 1 to n-1
+        i = cp.arange(1, n_haplotypes, dtype=cp.float64)  # Allele counts from 1 to n-1
         weight = (2 * i * (n_haplotypes - i)) / (n_haplotypes * (n_haplotypes - 1))
     
         # Compute π as a weighted sum over the allele frequency spectrum
-        pi = float(cp.sum(weight * afs[1:]))
+        pi = cp.sum((weight * afs[1:]).astype(cp.float64))
         if span_normalize:
-            span = float(self.chrom_end - self.chrom_start)
-            return pi / span
-        else:
-            return pi
+            span = cp.float64(self.chrom_end - self.chrom_start)
+            return float(pi / span)
+        return float(pi)
         
     def watersons_theta(self, span_normalize: bool = True) -> float:
         """
@@ -288,13 +286,12 @@ class HaplotypeMatrix:
             self.transfer_to_gpu()
         n_haplotypes = self.num_haplotypes
         # Compute the harmonic number a_n
-        a1 = cp.sum(1.0 / cp.arange(1, n_haplotypes))  # Harmonic sum
+        a1 = cp.sum((1.0 / cp.arange(1, n_haplotypes, dtype=cp.float64)))
         theta = self.num_variants / a1
         if span_normalize:
-            span = float(self.chrom_end - self.chrom_start)
-            return theta / span
-        else:
-            return theta
+            span = cp.float64(self.chrom_end - self.chrom_start)
+            return float(theta / span)
+        return float(theta)
     
     def Tajimas_D(self) -> float:
         """
@@ -306,11 +303,11 @@ class HaplotypeMatrix:
         # get theta       
         n_haplotypes = self.num_haplotypes
         S = self.num_variants
-        a1 = cp.sum(1.0 / cp.arange(1, n_haplotypes))  # Harmonic sum
+        a1 = cp.sum(1.0 / cp.arange(1, n_haplotypes), dtype=cp.float64)  # Harmonic sum
         theta = S / a1
         
         # Variance term for Tajima's D
-        a2 = cp.sum(1.0 / cp.arange(1, n_haplotypes) ** 2)
+        a2 = cp.sum(cp.power(cp.arange(1, n_haplotypes, dtype=cp.float64), 2))
         b1 = (n_haplotypes + 1) / (3 * (n_haplotypes - 1))
         b2 = 2 * (n_haplotypes**2 + n_haplotypes + 3) / (9 * n_haplotypes * (n_haplotypes - 1))
         c1 = b1 - (1 / a1)
@@ -318,7 +315,7 @@ class HaplotypeMatrix:
         e1 = c1 / a1
         e2 = c2 / ((a1 ** 2) + a2)
         V = cp.sqrt((e1 * S) + (e2 * S * (S - 1)))
-        return (pi - theta) / V
+        return float((pi - theta) / V) if V != 0 else float("nan")
 
     def pairwise_LD(self) -> cp.ndarray:
         """
