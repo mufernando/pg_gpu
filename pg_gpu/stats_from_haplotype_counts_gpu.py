@@ -487,3 +487,108 @@ def _compute_pi2_single(counts, indices):
         # Use a simple approximation for unimplemented cases
         # This is not exact but allows the code to run
         return cp.zeros_like(cp.sum(counts[i], axis=1), dtype=cp.float64)
+
+
+# Functions for missing data support
+def DD_missing(counts, n_valid):
+    """
+    Compute D^2 statistic with variable sample sizes due to missing data.
+    
+    Parameters:
+        counts (cp.ndarray): Array of shape (N, 4) with haplotype counts
+        n_valid (cp.ndarray): Array of shape (N,) with valid sample sizes for each pair
+        
+    Returns:
+        cp.ndarray: The computed D^2 values
+    """
+    c1 = counts[:, 0]
+    c2 = counts[:, 1]
+    c3 = counts[:, 2]
+    c4 = counts[:, 3]
+    
+    # Compute D for each pair
+    numer = c1 * (c1 - 1) * c4 * (c4 - 1) + c2 * (c2 - 1) * c3 * (c3 - 1) - 2 * c1 * c2 * c3 * c4
+    
+    # Use variable sample sizes
+    denom = n_valid * (n_valid - 1) * (n_valid - 2) * (n_valid - 3)
+    
+    # Handle cases where n_valid < 4
+    valid_mask = n_valid >= 4
+    result = cp.zeros_like(n_valid, dtype=cp.float64)
+    result[valid_mask] = numer[valid_mask] / denom[valid_mask]
+    
+    return result
+
+
+def Dz_missing(counts, n_valid):
+    """
+    Compute Dz statistic with variable sample sizes due to missing data.
+    
+    Parameters:
+        counts (cp.ndarray): Array of shape (N, 4) with haplotype counts
+        n_valid (cp.ndarray): Array of shape (N,) with valid sample sizes for each pair
+        
+    Returns:
+        cp.ndarray: The computed Dz values
+    """
+    c1 = counts[:, 0]
+    c2 = counts[:, 1] 
+    c3 = counts[:, 2]
+    c4 = counts[:, 3]
+    
+    # Precompute common expressions
+    diff = c1 * c4 - c2 * c3
+    sum_34_12 = (c3 + c4) - (c1 + c2)
+    sum_24_13 = (c2 + c4) - (c1 + c3)
+    sum_23_14 = (c2 + c3) - (c1 + c4)
+    
+    numer = diff * sum_34_12 * sum_24_13 + diff * sum_23_14 + 2 * (c2 * c3 + c1 * c4)
+    
+    # Use variable sample sizes
+    denom = n_valid * (n_valid - 1) * (n_valid - 2) * (n_valid - 3)
+    
+    # Handle cases where n_valid < 4
+    valid_mask = n_valid >= 4
+    result = cp.zeros_like(n_valid, dtype=cp.float64)
+    result[valid_mask] = numer[valid_mask] / denom[valid_mask]
+    
+    return result
+
+
+def pi2_missing(counts, n_valid):
+    """
+    Compute π₂ statistic with variable sample sizes due to missing data.
+    
+    Parameters:
+        counts (cp.ndarray): Array of shape (N, 4) with haplotype counts
+        n_valid (cp.ndarray): Array of shape (N,) with valid sample sizes for each pair
+        
+    Returns:
+        cp.ndarray: The computed π₂ values
+    """
+    c1 = counts[:, 0]
+    c2 = counts[:, 1]
+    c3 = counts[:, 2]
+    c4 = counts[:, 3]
+    
+    # Precompute sums
+    s12 = c1 + c2
+    s13 = c1 + c3
+    s24 = c2 + c4
+    s34 = c3 + c4
+    
+    term_a = s12 * s13 * s24 * s34
+    term_b = c1 * c4 * (-1 + c1 + 3 * c2 + 3 * c3 + c4)
+    term_c = c2 * c3 * (-1 + 3 * c1 + c2 + c3 + 3 * c4)
+    
+    numer = term_a - term_b - term_c
+    
+    # Use variable sample sizes
+    denom = n_valid * (n_valid - 1) * (n_valid - 2) * (n_valid - 3)
+    
+    # Handle cases where n_valid < 4
+    valid_mask = n_valid >= 4
+    result = cp.zeros_like(n_valid, dtype=cp.float64)
+    result[valid_mask] = numer[valid_mask] / denom[valid_mask]
+    
+    return result

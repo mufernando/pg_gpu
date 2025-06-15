@@ -245,17 +245,30 @@ class TestLDStatisticsGPUSinglePop:
         # Matrix should now be on GPU
         assert h_cpu.device == 'GPU'
     
-    def test_single_population_missing_data_error(self, single_pop_vcf):
-        """Test that missing data raises NotImplementedError."""
+    def test_single_population_missing_data_support(self, single_pop_vcf):
+        """Test that missing data is now supported."""
         h_gpu = HaplotypeMatrix.from_vcf(single_pop_vcf)
         
         bp_bins = np.array([0, 500, 2000])
         
-        # Should raise NotImplementedError for missing=True
-        with pytest.raises(NotImplementedError, match="Missing data support is not implemented"):
-            h_gpu.compute_ld_statistics_gpu_single_pop(
-                bp_bins=bp_bins,
-                missing=True,
-                raw=True,
-                ac_filter=False
-            )
+        # Should now work with missing=True
+        gpu_stats = h_gpu.compute_ld_statistics_gpu_single_pop(
+            bp_bins=bp_bins,
+            missing=True,
+            raw=True,
+            ac_filter=False
+        )
+        
+        # Check that we have results
+        assert len(gpu_stats) > 0
+        
+        # Check structure of results
+        for bin_range, stats in gpu_stats.items():
+            assert isinstance(bin_range, tuple)
+            assert len(bin_range) == 2
+            assert isinstance(stats, tuple)
+            assert len(stats) == 3  # (DD, Dz, pi2)
+            
+            # All statistics should be finite
+            for stat in stats:
+                assert np.isfinite(stat)

@@ -90,6 +90,7 @@ dependencies:
       - pure-eval==0.2.3
       - pygments==2.19.1
       - pytest==8.3.4
+      - pytest-xdist==3.6.1
       - python-dateutil==2.9.0.post0
       - pyyaml==6.0.2
       - pyzmq==26.2.1
