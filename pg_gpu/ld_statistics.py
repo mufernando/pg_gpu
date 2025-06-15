@@ -1,7 +1,7 @@
 """
-Unified GPU-accelerated linkage disequilibrium statistics.
+GPU-accelerated linkage disequilibrium statistics.
 
-This module provides a clean, consistent API for computing LD statistics
+This module provides an API for computing LD statistics
 on GPUs with automatic missing data handling.
 """
 
