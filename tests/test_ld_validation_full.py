@@ -108,7 +108,6 @@ class TestLDValidationFull:
             bp_bins=bp_bins,
             pop1="deme0",
             pop2="deme1",
-            missing=False,
             raw=True
         )
     
@@ -132,11 +131,7 @@ class TestLDValidationFull:
     def test_individual_statistics(self, moments_results, gpu_results, stat_idx, stat_name):
         """Test each statistic individually across all bins."""
         # Tolerance for comparison
-        # Dz statistics can have higher errors at large distances due to small absolute values
-        if stat_name.startswith("Dz"):
-            rtol = 0.20  # 20% relative tolerance for Dz
-        else:
-            rtol = 0.05  # 5% relative tolerance for DD and pi2
+        rtol = 0.01  # 1% relative tolerance for all statistics
         atol = 1e-6  # Small absolute tolerance for near-zero values
         
         # Compare across all bins
@@ -428,66 +423,27 @@ class TestLDValidationFull:
         
         h_gpu.sample_sets = pop_sets
         
-        # Get counts for a specific pair of variants
-        print("\nChecking first variant pair (0, 1):")
+        print(f"\nPopulation setup complete:")
+        print(f"  deme0: {len(pop_sets['deme0'])} haplotypes")
+        print(f"  deme1: {len(pop_sets['deme1'])} haplotypes")
+        print(f"  Total variants: {h_gpu.num_variants}")
         
-        # Get within-pop counts
-        counts_pop0 = h_gpu.tally_gpu_haplotypes(pop="deme0")
-        counts_pop1 = h_gpu.tally_gpu_haplotypes(pop="deme1")
-        
-        # Get the first pair's counts
-        if hasattr(counts_pop0[0], 'get'):
-            c0 = counts_pop0[0].get()
-            c1 = counts_pop1[0].get()
-        else:
-            c0 = counts_pop0[0]
-            c1 = counts_pop1[0]
-        
-        print(f"  deme0 counts: {c0} (sum={np.sum(c0)})")
-        print(f"  deme1 counts: {c1} (sum={np.sum(c1)})")
-        
-        # Manually calculate Dz(0,0,1) using moments formula
-        print("\nManual Dz calculations:")
-        
-        # For Dz(0,0,1) - D computed for pop0, z between pop0 and pop1
-        c11, c12, c13, c14 = c0[0], c0[1], c0[2], c0[3]
-        c21, c22, c23, c24 = c1[0], c1[1], c1[2], c1[3]
-        n1 = np.sum(c0)
-        n2 = np.sum(c1)
-        
-        # From moments Dz(i,i,j) formula
-        numer = (
-            (-c11 - c12 + c13 + c14)
-            * (-(c12 * c13) + c11 * c14)
-            * (-c21 + c22 - c23 + c24)
+        # Test basic computation to ensure setup is working
+        print("\nTesting basic LD computation...")
+        bp_bins = [100, 1000, 10000, 100000]
+        result = h_gpu.compute_ld_statistics_gpu_two_pops(
+            bp_bins=bp_bins,
+            pop1="deme0",
+            pop2="deme1",
+            raw=True
         )
-        denom = n2 * n1 * (n1 - 1) * (n1 - 2)
-        dz_001 = numer / denom if denom != 0 else 0
         
-        print(f"  Dz(0,0,1) = {dz_001:.6f}")
+        print(f"  Computation successful, got {len(result)} bins")
+        print(f"  First bin has {len(result[(100, 1000)])} statistics")
         
-        # For Dz(0,1,0) - D computed for pop0, z between pop1 and pop0  
-        # This uses the Dz(i,j,i) formula
-        numer2 = (
-            (-c11 + c12 - c13 + c14)
-            * (-(c12 * c13) + c11 * c14)
-            * (-c21 - c22 + c23 + c24)
-        )
-        denom2 = n2 * n1 * (n1 - 1) * (n1 - 2)
-        dz_010 = numer2 / denom2 if denom2 != 0 else 0
-        
-        print(f"  Dz(0,1,0) = {dz_010:.6f}")
-        print(f"  Average (Dz_0_0_1) = {0.5 * (dz_001 + dz_010):.6f}")
-        
-        # Also check what moments package would compute
-        print("\nComparing with moments package calculation...")
-        try:
-            import moments.LD
-            # Create dummy data for moments
-            # This is just to verify our manual calculation
-            print("  (Would need to set up moments data structure for exact comparison)")
-        except:
-            print("  (Moments comparison skipped)")
+        # Check one statistic as a sanity check
+        first_bin = result[(100, 1000)]
+        print(f"  Example - DD_0_0 in first bin: {first_bin['DD_0_0']:.6e}")
 
 
 if __name__ == "__main__":
