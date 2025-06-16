@@ -10,7 +10,9 @@ GPU-accelerated population genetics statistics for Python.
    installation
    quickstart
    api
+   missing_data
    examples
+   changelog
 
 Overview
 --------

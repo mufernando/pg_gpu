@@ -69,3 +69,66 @@ Integration with moments
    
    # Use with moments demographic models
    # (Example integration pattern)
+
+Missing Data Examples
+---------------------
+
+Basic Missing Data Handling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import HaplotypeMatrix, diversity
+   
+   # Load data with missing values
+   h = HaplotypeMatrix.from_vcf("data_missing.vcf")
+   
+   # Check missing data
+   summary = h.summarize_missing_data()
+   print(f"Missing: {summary['fraction_missing']:.1%}")
+   print(f"Sites with missing: {summary['sites_with_missing']}")
+   
+   # Filter high-missing sites
+   h_clean = h.filter_variants_by_missing(max_missing_freq=0.1)
+
+Computing Statistics with Missing Data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   # Different missing data strategies
+   pi_include = diversity.pi(h, missing_data='include')
+   pi_exclude = diversity.pi(h, missing_data='exclude')
+   
+   print(f"Pi (include): {pi_include:.4f}")
+   print(f"Pi (exclude): {pi_exclude:.4f}")
+   
+   # Span normalization options
+   pi_total = diversity.pi(h, span_normalize=True, span_denominator='total')
+   pi_callable = diversity.pi(h, span_normalize=True, span_denominator='callable')
+   
+   print(f"Pi/bp (total span): {pi_total:.6f}")
+   print(f"Pi/bp (callable): {pi_callable:.6f}")
+
+LD Statistics with Missing Data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   # LD statistics handle missing data automatically
+   result = h.tally_gpu_haplotypes()
+   if isinstance(result, tuple):
+       counts, n_valid = result
+   else:
+       counts, n_valid = result, None
+   
+   # Compute LD with missing data
+   dd_vals = ld_statistics.dd(counts, n_valid=n_valid)
+   
+   # Multiple populations with missing data
+   stats = ld_statistics.compute_ld_statistics(
+       counts,
+       statistics=['dd', 'dz'],
+       populations={'dd': (0, 1), 'dz': (0, 0, 1)},
+       n_valid=n_valid
+   )

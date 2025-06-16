@@ -79,3 +79,47 @@ Missing data is handled automatically:
    else:
        counts, n_valid = result, None
    dd_vals = ld_statistics.dd(counts, n_valid=n_valid)
+
+Diversity Statistics
+~~~~~~~~~~~~~~~~~~~~
+
+Compute population genetics diversity statistics:
+
+.. code-block:: python
+
+   from pg_gpu import diversity
+   
+   # Basic diversity statistics
+   pi = diversity.pi(h, span_normalize=True)
+   theta = diversity.theta_w(h, span_normalize=True)
+   tajimas_d = diversity.tajimas_d(h)
+   
+   # With missing data handling
+   pi_exclude = diversity.pi(h, missing_data='exclude')
+   
+   # Haplotype diversity
+   h_div = diversity.haplotype_diversity(h)
+
+Divergence Statistics
+~~~~~~~~~~~~~~~~~~~~~
+
+Compute between-population divergence:
+
+.. code-block:: python
+
+   from pg_gpu import divergence
+   
+   # Define populations
+   h.sample_sets = {
+       "pop1": [0, 1, 2, 3],
+       "pop2": [4, 5, 6, 7]
+   }
+   
+   # Compute FST
+   fst = divergence.fst(h, 'pop1', 'pop2')
+   
+   # Compute Dxy
+   dxy = divergence.dxy(h, 'pop1', 'pop2')
+   
+   # With missing data handling
+   fst_exclude = divergence.fst(h, 'pop1', 'pop2', missing_data='exclude')
