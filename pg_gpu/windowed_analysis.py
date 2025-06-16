@@ -16,6 +16,7 @@ from tqdm import tqdm
 from .haplotype_matrix import HaplotypeMatrix
 from . import ld_statistics
 from . import divergence
+from . import diversity
 
 
 @dataclass
@@ -109,11 +110,12 @@ class StatisticsComputer:
     
     # Built-in single population statistics
     SINGLE_POP_STATS = {
-        'pi': lambda w: w.matrix.diversity(span_normalize=False),
-        'theta_w': lambda w: w.matrix.watersons_theta(span_normalize=False), 
-        'tajimas_d': lambda w: w.matrix.Tajimas_D(),
+        'pi': lambda w: diversity.pi(w.matrix, span_normalize=False),
+        'theta_w': lambda w: diversity.theta_w(w.matrix, span_normalize=False), 
+        'tajimas_d': lambda w: diversity.tajimas_d(w.matrix),
         'n_variants': lambda w: w.n_variants,
-        'n_singletons': lambda w: _count_singletons(w.matrix),
+        'n_singletons': lambda w: diversity.singleton_count(w.matrix),
+        'segregating_sites': lambda w: diversity.segregating_sites(w.matrix),
     }
     
     # Built-in two population statistics  
@@ -306,8 +308,8 @@ class WindowIterator:
         window_id = 0
         start_idx = 0
         
-        while start_idx < n_variants:
-            end_idx = min(start_idx + self.params.window_size, n_variants)
+        while start_idx + self.params.window_size <= n_variants:
+            end_idx = start_idx + self.params.window_size
             
             # Get positions for this window
             window_start = int(self.positions_np[start_idx])
@@ -367,8 +369,11 @@ class WindowIterator:
                       self.params.step_size + 1)
         elif self.params.window_type == 'snp':
             n_variants = len(self.positions_np)
-            return max(1, (n_variants - self.params.window_size) // 
-                      self.params.step_size + 1)
+            if n_variants <= self.params.window_size:
+                return 1
+            else:
+                # Number of complete windows plus any partial window
+                return ((n_variants - self.params.window_size) // self.params.step_size) + 1
         elif self.params.window_type == 'regions':
             return len(self.params.regions)
 
@@ -585,15 +590,6 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
 
 
 # Helper functions for built-in statistics
-
-def _count_singletons(matrix: HaplotypeMatrix) -> int:
-    """Count singleton variants."""
-    if matrix.device == 'GPU':
-        af = cp.sum(matrix.haplotypes, axis=0)
-        return int(cp.sum(af == 1).get())
-    else:
-        af = np.sum(matrix.haplotypes, axis=0)
-        return int(np.sum(af == 1))
 
 
 

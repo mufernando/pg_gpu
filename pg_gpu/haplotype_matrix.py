@@ -234,8 +234,30 @@ class HaplotypeMatrix:
             positions = cp.array(positions)
        
         # Validate that positions are valid indices.
-        # Ensure positions are valid indices
-        positions = cp.asarray(positions) if self.device == 'GPU' else np.asarray(positions)
+        # Ensure positions are valid indices and convert to integer type
+        positions = cp.asarray(positions, dtype=np.int64) if self.device == 'GPU' else np.asarray(positions, dtype=np.int64)
+        
+        # Handle empty positions array
+        if len(positions) == 0:
+            # Create empty subset maintaining the same structure
+            # Need to create arrays that have non-zero size to satisfy constructor
+            if self.device == 'GPU':
+                empty_haplotypes = cp.empty((self.haplotypes.shape[0], 0), dtype=self.haplotypes.dtype)
+                empty_positions = cp.array([], dtype=self.positions.dtype)
+            else:
+                empty_haplotypes = np.empty((self.haplotypes.shape[0], 0), dtype=self.haplotypes.dtype)
+                empty_positions = np.array([], dtype=self.positions.dtype)
+            
+            # For empty subsets, bypass constructor validation by setting size to non-zero temporarily
+            result = object.__new__(HaplotypeMatrix)
+            result.haplotypes = empty_haplotypes
+            result.positions = empty_positions
+            result.chrom_start = self.chrom_start
+            result.chrom_end = self.chrom_end
+            result._sample_sets = self._sample_sets
+            result._device = self._device
+            return result
+        
         if not (positions >= 0).all() or not (positions < self.haplotypes.shape[1]).all():
             raise ValueError("Positions must be valid indices within the haplotype matrix.")
 
@@ -347,77 +369,44 @@ class HaplotypeMatrix:
     def allele_frequency_spectrum(self) -> cp.ndarray:
         """
         Calculate the allele frequency spectrum for a haplotype matrix.
+        
+        Note: This method is deprecated. Use diversity.allele_frequency_spectrum() instead.
         """
-        if self.device == 'CPU':
-            self.transfer_to_gpu()
-        n_haplotypes = self.num_haplotypes
-        freqs = cp.sum(cp.nan_to_num(self.haplotypes, nan=0).astype(cp.int32), axis=0)
-        return cp.histogram(freqs, bins=cp.arange(n_haplotypes+1))[0]
+        from . import diversity
+        return diversity.allele_frequency_spectrum(self)
     
     def diversity(self, span_normalize: bool = True) -> float:
         """
         Calculate the nucleotide diversity (π) for the haplotype matrix.
 
-        This method calculates the nucleotide diversity (π) for the haplotype matrix. π is a measure of the genetic variation within a population. It is defined as the average number of nucleotide differences per site between two randomly chosen DNA sequences from the population.
+        Note: This method is deprecated. Use diversity.pi() instead.
 
         Parameters:
             span_normalize (bool, optional): If True, the result is normalized by the span of the haplotype matrix. Defaults to True.
 
         Returns:
-            float: The nucleotide diversity (π) for the haplotype matrix. If span_normalize is True, the result is normalized by the span of the haplotype matrix.
+            float: The nucleotide diversity (π) for the haplotype matrix.
         """
-     
-        afs = self.allele_frequency_spectrum()
-        n_haplotypes = self.num_haplotypes
-        # Compute the weight factor for each allele frequency
-        i = cp.arange(1, n_haplotypes, dtype=cp.float64)  # Allele counts from 1 to n-1
-        weight = (2 * i * (n_haplotypes - i)) / (n_haplotypes * (n_haplotypes - 1))
-    
-        # Compute π as a weighted sum over the allele frequency spectrum
-        pi = cp.sum((weight * afs[1:]).astype(cp.float64))
-        if span_normalize:
-            span = cp.float64(self.chrom_end - self.chrom_start)
-            return float(pi / span)
-        return float(pi)
+        from . import diversity
+        return diversity.pi(self, span_normalize=span_normalize)
         
     def watersons_theta(self, span_normalize: bool = True) -> float:
         """
         Calculate Waterson's theta for the haplotype matrix.
+        
+        Note: This method is deprecated. Use diversity.theta_w() instead.
         """
-        if self.device == 'CPU':
-            self.transfer_to_gpu()
-        n_haplotypes = self.num_haplotypes
-        # Compute the harmonic number a_n
-        a1 = cp.sum((1.0 / cp.arange(1, n_haplotypes, dtype=cp.float64)))
-        theta = self.num_variants / a1
-        if span_normalize:
-            span = cp.float64(self.chrom_end - self.chrom_start)
-            return float(theta / span)
-        return float(theta)
+        from . import diversity
+        return diversity.theta_w(self, span_normalize=span_normalize)
     
     def Tajimas_D(self) -> float:
         """
         Calculate Tajima's D for the haplotype matrix.
+        
+        Note: This method is deprecated. Use diversity.tajimas_d() instead.
         """
-        # get pi
-        pi = self.diversity(span_normalize=False) 
-        
-        # get theta       
-        n_haplotypes = self.num_haplotypes
-        S = self.num_variants
-        a1 = cp.sum(1.0 / cp.arange(1, n_haplotypes), dtype=cp.float64)  # Harmonic sum
-        theta = S / a1
-        
-        # Variance term for Tajima's D
-        a2 = cp.sum(cp.power(cp.arange(1, n_haplotypes, dtype=cp.float64), 2))
-        b1 = (n_haplotypes + 1) / (3 * (n_haplotypes - 1))
-        b2 = 2 * (n_haplotypes**2 + n_haplotypes + 3) / (9 * n_haplotypes * (n_haplotypes - 1))
-        c1 = b1 - (1 / a1)
-        c2 = b2 - ((n_haplotypes + 2) / (a1 * n_haplotypes)) + (a2 / (a1 ** 2))
-        e1 = c1 / a1
-        e2 = c2 / ((a1 ** 2) + a2)
-        V = cp.sqrt((e1 * S) + (e2 * S * (S - 1)))
-        return float((pi - theta) / V) if V != 0 else float("nan")
+        from . import diversity
+        return diversity.tajimas_d(self)
 
 
     def pairwise_LD_v(self) -> cp.ndarray:
