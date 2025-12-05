@@ -1130,12 +1130,12 @@ class HaplotypeMatrix:
         from .compute_ld_moments_compatible import compute_ld_statistics_moments_compatible
         return compute_ld_statistics_moments_compatible(self, bp_bins, pop1, pop2, raw=raw)
     
-    def compute_ld_statistics_gpu_two_pops(self, bp_bins, pop1: str, pop2: str, raw=False, ac_filter=True):
-        """GPU-based implementation of computing LD statistics for two populations.
-        
-        This method computes statistics for each variant pair and then sums them,
-        matching the moments implementation approach.
-        
+    def _compute_ld_statistics_gpu_two_pops_all_pairs(self, bp_bins, pop1: str, pop2: str, raw=False, ac_filter=True):
+        """DEPRECATED: Legacy implementation that computes ALL variant pairs.
+
+        Warning: This method has O(n^2) memory complexity and will OOM on large datasets.
+        Use compute_ld_statistics_gpu_two_pops() instead, which filters by max distance.
+
         Parameters:
             bp_bins: Array of bin boundaries in base pairs
             pop1: Name of first population
@@ -1148,7 +1148,7 @@ class HaplotypeMatrix:
             # Apply biallelic filtering to match moments' is_biallelic_01() behavior
             filtered_self = self.apply_biallelic_filter()
             # Use the filtered matrix for computation
-            return filtered_self.compute_ld_statistics_gpu_two_pops(
+            return filtered_self._compute_ld_statistics_gpu_two_pops_all_pairs(
                 bp_bins=bp_bins, pop1=pop1, pop2=pop2, raw=raw, ac_filter=False
             )
         
@@ -1316,7 +1316,7 @@ class HaplotypeMatrix:
 
         return out
 
-    def compute_ld_statistics_gpu_two_pops_max_dist(
+    def compute_ld_statistics_gpu_two_pops(
         self,
         bp_bins,
         pop1: str,
@@ -1326,41 +1326,49 @@ class HaplotypeMatrix:
         chunk_size='auto'
     ):
         """
-        Memory-efficient GPU-based LD statistics computation for two populations.
+        GPU-based LD statistics computation for two populations.
 
-        Only computes statistics for variant pairs within max(bp_bins) distance,
-        dramatically reducing memory usage for large datasets.
-
-        For 72k variants with 67kb max distance:
-        - Original method: 2.6B pairs, ~200GB memory (OOM)
-        - This method: 35M pairs, ~2.5GB memory (feasible)
+        Computes DD, Dz, and pi2 statistics for variant pairs binned by distance.
+        Only processes pairs within max(bp_bins) distance for memory efficiency.
 
         Parameters
         ----------
         bp_bins : array-like
-            Array of bin boundaries in base pairs
+            Array of bin boundaries in base pairs. Pairs are binned by distance
+            into intervals [bp_bins[i], bp_bins[i+1]).
         pop1 : str
-            Name of first population
+            Name of first population (must exist in sample_sets)
         pop2 : str
-            Name of second population
+            Name of second population (must exist in sample_sets)
         raw : bool, optional
-            If True, return raw sums; if False, return means (default: False)
+            If True, return raw sums of statistics across pairs in each bin.
+            If False (default), return means.
         ac_filter : bool, optional
-            If True, apply biallelic filtering (default: True)
+            If True (default), apply biallelic filtering before computation.
         chunk_size : int or 'auto', optional
             Number of pairs to process per chunk. If 'auto' (default),
             automatically estimates optimal size based on available GPU memory.
+            Can specify an integer for manual control.
 
         Returns
         -------
         dict
             Dictionary mapping (bin_start, bin_end) tuples to OrderedDict of statistics.
-            Same format as compute_ld_statistics_gpu_two_pops.
+            Each bin contains 15 statistics:
+            - DD_0_0, DD_0_1, DD_1_1 (D squared)
+            - Dz_0_0_0, Dz_0_0_1, Dz_0_1_1, Dz_1_0_0, Dz_1_0_1, Dz_1_1_1
+            - pi2_0_0_0_0, pi2_0_0_0_1, pi2_0_0_1_1, pi2_0_1_0_1, pi2_0_1_1_1, pi2_1_1_1_1
+
+        Examples
+        --------
+        >>> bp_bins = [0, 10000, 50000, 100000]
+        >>> stats = hm.compute_ld_statistics_gpu_two_pops(bp_bins, 'pop1', 'pop2')
+        >>> stats[(0.0, 10000.0)]['DD_0_0']  # D^2 for pop1 in first bin
         """
         # Apply biallelic filter if requested
         if ac_filter:
             filtered_self = self.apply_biallelic_filter()
-            return filtered_self.compute_ld_statistics_gpu_two_pops_max_dist(
+            return filtered_self.compute_ld_statistics_gpu_two_pops(
                 bp_bins=bp_bins, pop1=pop1, pop2=pop2, raw=raw,
                 ac_filter=False, chunk_size=chunk_size
             )
