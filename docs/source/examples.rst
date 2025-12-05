@@ -23,10 +23,13 @@ Complete Workflow
    dd_ceu = ld_statistics.dd(counts_ceu)
    
    # Compute between-population statistics
+   # Memory-efficient: only processes pairs within max distance
+   # chunk_size='auto' adapts to available GPU memory
    stats = h.compute_ld_statistics_gpu_two_pops(
        bp_bins=np.array([0, 1000, 5000, 10000, 50000]),
        pop1="CEU",
-       pop2="YRI"
+       pop2="YRI",
+       chunk_size='auto'  # or int for fixed size (e.g., 500_000)
    )
 
 Batch Processing

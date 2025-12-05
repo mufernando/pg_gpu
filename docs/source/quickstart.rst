@@ -54,10 +54,12 @@ Two Populations
    }
    
    # Compute between-population statistics
+   # chunk_size='auto' adapts to available GPU memory (default)
    stats = h.compute_ld_statistics_gpu_two_pops(
        bp_bins=[0, 1000, 5000, 10000],
        pop1="pop1",
-       pop2="pop2"
+       pop2="pop2",
+       chunk_size='auto'  # or specify int for fixed chunk size
    )
 
 Missing Data
