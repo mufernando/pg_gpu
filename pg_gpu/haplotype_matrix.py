@@ -2,7 +2,8 @@ import cupy as cp
 import numpy as np
 import allel
 import tskit
-from collections import Counter
+from collections import Counter, OrderedDict
+
 
 class HaplotypeMatrix:
     """
@@ -1314,3 +1315,347 @@ class HaplotypeMatrix:
             out[(bin_start, bin_end)] = stats_dict
 
         return out
+
+    def compute_ld_statistics_gpu_two_pops_max_dist(
+        self,
+        bp_bins,
+        pop1: str,
+        pop2: str,
+        raw=False,
+        ac_filter=True,
+        chunk_size: int = 1_000_000
+    ):
+        """
+        Memory-efficient GPU-based LD statistics computation for two populations.
+
+        Only computes statistics for variant pairs within max(bp_bins) distance,
+        dramatically reducing memory usage for large datasets.
+
+        For 72k variants with 67kb max distance:
+        - Original method: 2.6B pairs, ~200GB memory (OOM)
+        - This method: 35M pairs, ~2.5GB memory (feasible)
+
+        Parameters
+        ----------
+        bp_bins : array-like
+            Array of bin boundaries in base pairs
+        pop1 : str
+            Name of first population
+        pop2 : str
+            Name of second population
+        raw : bool, optional
+            If True, return raw sums; if False, return means (default: False)
+        ac_filter : bool, optional
+            If True, apply biallelic filtering (default: True)
+        chunk_size : int, optional
+            Number of pairs to process per chunk (default: 1,000,000)
+
+        Returns
+        -------
+        dict
+            Dictionary mapping (bin_start, bin_end) tuples to OrderedDict of statistics.
+            Same format as compute_ld_statistics_gpu_two_pops.
+        """
+        # Apply biallelic filter if requested
+        if ac_filter:
+            filtered_self = self.apply_biallelic_filter()
+            return filtered_self.compute_ld_statistics_gpu_two_pops_max_dist(
+                bp_bins=bp_bins, pop1=pop1, pop2=pop2, raw=raw,
+                ac_filter=False, chunk_size=chunk_size
+            )
+
+        # Ensure GPU setup
+        if self.device == 'CPU':
+            self.transfer_to_gpu()
+
+        from pg_gpu import ld_statistics
+
+        # Get positions and compute max distance
+        pos = self.positions
+        if not isinstance(pos, cp.ndarray):
+            pos = cp.array(pos)
+
+        bp_bins = np.array(bp_bins)
+        max_dist = float(bp_bins[-1])
+        n_bins = len(bp_bins) - 1
+
+        # Get population indices
+        pop1_indices = self._sample_sets[pop1]
+        pop2_indices = self._sample_sets[pop2]
+
+        # Generate distance-filtered pair indices
+        idx_i, idx_j = _generate_pairs_within_distance(pos, max_dist)
+        total_pairs = len(idx_i)
+
+        if total_pairs == 0:
+            # No pairs within distance - return zeros for all bins
+            out = {}
+            for i in range(n_bins):
+                out[(float(bp_bins[i]), float(bp_bins[i + 1]))] = OrderedDict([
+                    ('DD_0_0', 0.0), ('DD_0_1', 0.0), ('DD_1_1', 0.0),
+                    ('Dz_0_0_0', 0.0), ('Dz_0_0_1', 0.0), ('Dz_0_1_1', 0.0),
+                    ('Dz_1_0_0', 0.0), ('Dz_1_0_1', 0.0), ('Dz_1_1_1', 0.0),
+                    ('pi2_0_0_0_0', 0.0), ('pi2_0_0_0_1', 0.0), ('pi2_0_0_1_1', 0.0),
+                    ('pi2_0_1_0_1', 0.0), ('pi2_0_1_1_1', 0.0), ('pi2_1_1_1_1', 0.0)
+                ])
+            return out
+
+        # Compute distances for all pairs
+        distances = pos[idx_j] - pos[idx_i]
+
+        # Bin assignment
+        bp_bins_cp = cp.array(bp_bins)
+        bin_inds = cp.digitize(distances, bp_bins_cp) - 1
+
+        # Initialize accumulators: sums and counts per bin
+        stat_names = [
+            'DD_0_0', 'DD_0_1', 'DD_1_1',
+            'Dz_0_0_0', 'Dz_0_0_1', 'Dz_0_1_1', 'Dz_1_0_0', 'Dz_1_0_1', 'Dz_1_1_1',
+            'pi2_0_0_0_0', 'pi2_0_0_0_1', 'pi2_0_0_1_1', 'pi2_0_1_0_1', 'pi2_0_1_1_1', 'pi2_1_1_1_1'
+        ]
+        bin_sums = cp.zeros((n_bins, 15), dtype=cp.float64)
+        bin_counts = cp.zeros(n_bins, dtype=cp.float64)  # float64 for scatter_add compatibility
+
+        # Process in chunks
+        for chunk_start in range(0, total_pairs, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_pairs)
+
+            # Get chunk indices
+            chunk_idx_i = idx_i[chunk_start:chunk_end]
+            chunk_idx_j = idx_j[chunk_start:chunk_end]
+            chunk_bin_inds = bin_inds[chunk_start:chunk_end]
+
+            # Compute haplotype counts for this chunk
+            counts_pop1, n_valid1 = _compute_counts_for_pairs(
+                self.haplotypes, chunk_idx_i, chunk_idx_j, pop1_indices
+            )
+            counts_pop2, n_valid2 = _compute_counts_for_pairs(
+                self.haplotypes, chunk_idx_i, chunk_idx_j, pop2_indices
+            )
+
+            # Compute all 15 statistics for this chunk
+            chunk_stats = _compute_two_pop_statistics_batch(
+                counts_pop1, counts_pop2, n_valid1, n_valid2, ld_statistics
+            )
+
+            # Accumulate into bins using scatter_add
+            valid_mask = (chunk_bin_inds >= 0) & (chunk_bin_inds < n_bins)
+            valid_bin_inds = chunk_bin_inds[valid_mask]
+            valid_stats = chunk_stats[valid_mask]
+
+            # Accumulate sums using cupyx.scatter_add
+            import cupyx
+            for stat_idx in range(15):
+                cupyx.scatter_add(bin_sums[:, stat_idx], valid_bin_inds, valid_stats[:, stat_idx])
+
+            # Accumulate counts
+            cupyx.scatter_add(bin_counts, valid_bin_inds, cp.ones(len(valid_bin_inds), dtype=cp.float64))
+
+            # Free chunk memory
+            del counts_pop1, counts_pop2, n_valid1, n_valid2, chunk_stats
+            del chunk_idx_i, chunk_idx_j, valid_stats
+
+        # Build output dictionary
+        out = {}
+        for i in range(n_bins):
+            bin_start = float(bp_bins[i])
+            bin_end = float(bp_bins[i + 1])
+            count = int(bin_counts[i].get())
+
+            if raw:
+                stats_dict = OrderedDict([
+                    (name, float(bin_sums[i, j].get()))
+                    for j, name in enumerate(stat_names)
+                ])
+            else:
+                if count > 0:
+                    stats_dict = OrderedDict([
+                        (name, float((bin_sums[i, j] / bin_counts[i]).get()))
+                        for j, name in enumerate(stat_names)
+                    ])
+                else:
+                    stats_dict = OrderedDict([
+                        (name, 0.0) for name in stat_names
+                    ])
+
+            out[(bin_start, bin_end)] = stats_dict
+
+        return out
+
+
+# =============================================================================
+# Helper functions for memory-efficient LD computation with max distance filter
+# =============================================================================
+
+def _generate_pairs_within_distance(positions, max_dist):
+    """
+    Generate (i, j) pair indices for all variant pairs where pos[j] - pos[i] <= max_dist.
+
+    Uses binary search for O(n log n) complexity instead of O(n^2).
+    Assumes positions are sorted.
+
+    Parameters
+    ----------
+    positions : cp.ndarray
+        Sorted variant positions on GPU
+    max_dist : float
+        Maximum distance between variants to include
+
+    Returns
+    -------
+    idx_i : cp.ndarray[int32]
+        First index of each pair
+    idx_j : cp.ndarray[int32]
+        Second index of each pair
+    """
+    n = len(positions)
+
+    # Binary search: for each i, find first j where pos[j] > pos[i] + max_dist
+    upper_bounds = positions + max_dist
+    j_max = cp.searchsorted(positions, upper_bounds, side='right')
+
+    # Count pairs per variant: valid j's are in range [i+1, j_max)
+    variant_indices = cp.arange(n, dtype=cp.int64)
+    pairs_per_variant = cp.maximum(0, j_max - variant_indices - 1)
+    total_pairs = int(cp.sum(pairs_per_variant).get())
+
+    if total_pairs == 0:
+        return cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)
+
+    # Generate indices on CPU (more memory efficient for large arrays with repeat)
+    pairs_per_variant_cpu = pairs_per_variant.get().astype(np.int64)
+    j_max_cpu = j_max.get()
+
+    # Pre-allocate arrays
+    idx_i_cpu = np.empty(total_pairs, dtype=np.int32)
+    idx_j_cpu = np.empty(total_pairs, dtype=np.int32)
+
+    # Fill arrays
+    offset = 0
+    for i in range(n):
+        n_pairs_i = int(pairs_per_variant_cpu[i])
+        if n_pairs_i > 0:
+            idx_i_cpu[offset:offset + n_pairs_i] = i
+            idx_j_cpu[offset:offset + n_pairs_i] = np.arange(i + 1, j_max_cpu[i], dtype=np.int32)
+            offset += n_pairs_i
+
+    return cp.array(idx_i_cpu), cp.array(idx_j_cpu)
+
+
+def _compute_counts_for_pairs(haplotypes, idx_i, idx_j, pop_indices=None):
+    """
+    Compute haplotype counts [n11, n10, n01, n00] for specific pairs.
+
+    Parameters
+    ----------
+    haplotypes : cp.ndarray
+        Shape (n_haplotypes, n_variants), values 0, 1, or -1 (missing)
+    idx_i, idx_j : cp.ndarray
+        Pair indices, shape (n_pairs,)
+    pop_indices : list or cp.ndarray, optional
+        Indices of samples to include (for population-specific counts)
+
+    Returns
+    -------
+    counts : cp.ndarray
+        Shape (n_pairs, 4), columns [n11, n10, n01, n00]
+    n_valid : cp.ndarray or None
+        Shape (n_pairs,), valid sample counts per pair. None if no missing data.
+    """
+    # Select population if specified
+    if pop_indices is not None:
+        if isinstance(pop_indices, list):
+            pop_indices = cp.array(pop_indices, dtype=cp.int32)
+        haplotypes = haplotypes[pop_indices, :]
+
+    n_haps = haplotypes.shape[0]
+    n_pairs = len(idx_i)
+
+    # Get haplotype values at pair positions: shape (n_haplotypes, n_pairs)
+    hap_i = haplotypes[:, idx_i]
+    hap_j = haplotypes[:, idx_j]
+
+    # Check for missing data
+    has_missing = cp.any(haplotypes == -1)
+
+    if has_missing:
+        # Valid mask: both variants non-missing
+        valid_mask = (hap_i >= 0) & (hap_j >= 0)
+        n_valid = cp.sum(valid_mask, axis=0, dtype=cp.int32)
+
+        # Count combinations only where valid
+        n11 = cp.sum((hap_i == 1) & (hap_j == 1) & valid_mask, axis=0, dtype=cp.int32)
+        n10 = cp.sum((hap_i == 1) & (hap_j == 0) & valid_mask, axis=0, dtype=cp.int32)
+        n01 = cp.sum((hap_i == 0) & (hap_j == 1) & valid_mask, axis=0, dtype=cp.int32)
+        n00 = cp.sum((hap_i == 0) & (hap_j == 0) & valid_mask, axis=0, dtype=cp.int32)
+    else:
+        n_valid = None
+        # Count haplotype combinations
+        n11 = cp.sum((hap_i == 1) & (hap_j == 1), axis=0, dtype=cp.int32)
+        n10 = cp.sum((hap_i == 1) & (hap_j == 0), axis=0, dtype=cp.int32)
+        n01 = cp.sum((hap_i == 0) & (hap_j == 1), axis=0, dtype=cp.int32)
+        n00 = cp.sum((hap_i == 0) & (hap_j == 0), axis=0, dtype=cp.int32)
+
+    counts = cp.stack([n11, n10, n01, n00], axis=1)
+    return counts, n_valid
+
+
+def _compute_two_pop_statistics_batch(counts_pop1, counts_pop2, n_valid1, n_valid2, ld_statistics):
+    """
+    Compute all 15 two-population LD statistics for a batch of pairs.
+
+    Parameters
+    ----------
+    counts_pop1 : cp.ndarray
+        Shape (n_pairs, 4), haplotype counts for population 1
+    counts_pop2 : cp.ndarray
+        Shape (n_pairs, 4), haplotype counts for population 2
+    n_valid1, n_valid2 : cp.ndarray or None
+        Valid sample counts per pair per population
+    ld_statistics : module
+        The ld_statistics module with dd, dz, pi2 functions
+
+    Returns
+    -------
+    statistics : cp.ndarray
+        Shape (n_pairs, 15), all statistics for each pair
+    """
+    # Stack for between-population computations
+    counts_between = cp.concatenate([counts_pop1, counts_pop2], axis=1)
+    n_valid_between = (n_valid1, n_valid2) if n_valid1 is not None else None
+
+    # DD statistics
+    DD_0_0 = ld_statistics.dd(counts_pop1, n_valid=n_valid1)
+    DD_0_1 = ld_statistics.dd(counts_between, populations=(0, 1), n_valid=n_valid_between)
+    DD_1_1 = ld_statistics.dd(counts_pop2, n_valid=n_valid2)
+
+    # Dz statistics
+    Dz_0_0_0 = ld_statistics.dz(counts_pop1, n_valid=n_valid1)
+
+    Dz_0_0_1_part1 = ld_statistics.dz(counts_between, populations=(0, 0, 1), n_valid=n_valid_between)
+    Dz_0_0_1_part2 = ld_statistics.dz(counts_between, populations=(0, 1, 0), n_valid=n_valid_between)
+    Dz_0_0_1 = 0.5 * Dz_0_0_1_part1 + 0.5 * Dz_0_0_1_part2
+
+    Dz_0_1_1 = ld_statistics.dz(counts_between, populations=(0, 1, 1), n_valid=n_valid_between)
+    Dz_1_0_0 = ld_statistics.dz(counts_between, populations=(1, 0, 0), n_valid=n_valid_between)
+
+    Dz_1_0_1_part1 = ld_statistics.dz(counts_between, populations=(1, 0, 1), n_valid=n_valid_between)
+    Dz_1_0_1_part2 = ld_statistics.dz(counts_between, populations=(1, 1, 0), n_valid=n_valid_between)
+    Dz_1_0_1 = 0.5 * Dz_1_0_1_part1 + 0.5 * Dz_1_0_1_part2
+
+    Dz_1_1_1 = ld_statistics.dz(counts_pop2, n_valid=n_valid2)
+
+    # pi2 statistics
+    pi2_0_0_0_0 = ld_statistics.pi2(counts_pop1, n_valid=n_valid1)
+    pi2_0_0_0_1 = ld_statistics.pi2(counts_between, populations=(0, 0, 0, 1), n_valid=n_valid_between)
+    pi2_0_0_1_1 = ld_statistics.pi2(counts_between, populations=(0, 0, 1, 1), n_valid=n_valid_between)
+    pi2_0_1_0_1 = ld_statistics.pi2(counts_between, populations=(0, 1, 0, 1), n_valid=n_valid_between)
+    pi2_0_1_1_1 = ld_statistics.pi2(counts_between, populations=(0, 1, 1, 1), n_valid=n_valid_between)
+    pi2_1_1_1_1 = ld_statistics.pi2(counts_pop2, n_valid=n_valid2)
+
+    # Stack all 15 statistics
+    return cp.stack([
+        DD_0_0, DD_0_1, DD_1_1,
+        Dz_0_0_0, Dz_0_0_1, Dz_0_1_1, Dz_1_0_0, Dz_1_0_1, Dz_1_1_1,
+        pi2_0_0_0_0, pi2_0_0_0_1, pi2_0_0_1_1, pi2_0_1_0_1, pi2_0_1_1_1, pi2_1_1_1_1
+    ], axis=1)
