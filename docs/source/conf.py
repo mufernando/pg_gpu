@@ -6,9 +6,9 @@ sys.path.insert(0, os.path.abspath('../..'))
 
 # Project information
 project = 'pg_gpu'
-copyright = '2024, pg_gpu contributors'
-author = 'pg_gpu contributors'
-release = '0.1.0'
+copyright = '2025, Andrew Kern'
+author = 'Andrew Kern'
+release = '0.3.0'
 
 # Extensions
 extensions = [

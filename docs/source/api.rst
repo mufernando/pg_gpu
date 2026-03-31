@@ -12,7 +12,6 @@ HaplotypeMatrix
 Missing Data Methods
 ~~~~~~~~~~~~~~~~~~~~
 
-.. automethod:: pg_gpu.HaplotypeMatrix.has_missing
 .. automethod:: pg_gpu.HaplotypeMatrix.is_missing
 .. automethod:: pg_gpu.HaplotypeMatrix.is_called
 .. automethod:: pg_gpu.HaplotypeMatrix.count_missing
@@ -21,8 +20,15 @@ Missing Data Methods
 .. automethod:: pg_gpu.HaplotypeMatrix.filter_variants_by_missing
 .. automethod:: pg_gpu.HaplotypeMatrix.summarize_missing_data
 
-LD Statistics Functions
------------------------
+LD Methods
+~~~~~~~~~~
+
+.. automethod:: pg_gpu.HaplotypeMatrix.pairwise_r2
+.. automethod:: pg_gpu.HaplotypeMatrix.locate_unlinked
+.. automethod:: pg_gpu.HaplotypeMatrix.windowed_r_squared
+
+LD Statistics
+-------------
 
 Core Functions
 ~~~~~~~~~~~~~~
@@ -33,6 +39,10 @@ Core Functions
 
 .. autofunction:: pg_gpu.ld_statistics.pi2
 
+.. autofunction:: pg_gpu.ld_statistics.r
+
+.. autofunction:: pg_gpu.ld_statistics.r_squared
+
 Convenience Functions
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -42,22 +52,13 @@ Convenience Functions
 
 .. autofunction:: pg_gpu.ld_statistics.compute_ld_statistics
 
-Parameters
-----------
-
-All LD statistics functions accept:
-
-* **counts** : CuPy array of haplotype counts
-* **populations** : Tuple specifying population indices (optional)
-* **n_valid** : Valid sample counts for missing data (optional)
-
 Population Specifications
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * Single population: ``populations=None`` or omit
 * Two populations: ``populations=(0, 1)`` for DD
 * Three indices: ``populations=(0, 0, 1)`` for Dz
-* Four indices: ``populations=(0, 0, 1, 1)`` for π₂
+* Four indices: ``populations=(0, 0, 1, 1)`` for pi2
 
 Diversity Statistics
 --------------------
@@ -73,20 +74,15 @@ Core Functions
 .. autofunction:: pg_gpu.diversity.segregating_sites
 .. autofunction:: pg_gpu.diversity.singleton_count
 .. autofunction:: pg_gpu.diversity.fay_wus_h
+.. autofunction:: pg_gpu.diversity.heterozygosity_expected
+.. autofunction:: pg_gpu.diversity.heterozygosity_observed
+.. autofunction:: pg_gpu.diversity.inbreeding_coefficient
 
 Convenience Functions
 ~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: pg_gpu.diversity.diversity_stats
 .. autofunction:: pg_gpu.diversity.neutrality_tests
-
-Parameters
-~~~~~~~~~~
-
-All diversity functions support:
-
-* **missing_data** : How to handle missing data ('include', 'exclude', 'ignore')
-* **span_denominator** : For span normalization ('total', 'sites', 'callable')
 
 Divergence Statistics
 ---------------------
@@ -107,10 +103,77 @@ Convenience Functions
 .. autofunction:: pg_gpu.divergence.divergence_stats
 .. autofunction:: pg_gpu.divergence.pairwise_fst
 
-Parameters
-~~~~~~~~~~
+Selection Scan Statistics
+-------------------------
 
-Divergence functions support:
+Haplotype-Based Selection Scans
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-* **missing_data** : How to handle missing data (where applicable)
-* **span_denominator** : For span normalization (dxy, da, pi_within_population)
+.. autofunction:: pg_gpu.selection.ihs
+.. autofunction:: pg_gpu.selection.xpehh
+.. autofunction:: pg_gpu.selection.nsl
+.. autofunction:: pg_gpu.selection.xpnsl
+
+EHH and Haplotype Homozygosity
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.selection.ehh_decay
+.. autofunction:: pg_gpu.selection.garud_h
+.. autofunction:: pg_gpu.selection.moving_garud_h
+
+Standardization
+~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.selection.standardize
+.. autofunction:: pg_gpu.selection.standardize_by_allele_count
+
+Site Frequency Spectrum
+-----------------------
+
+Single Population
+~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.sfs.sfs
+.. autofunction:: pg_gpu.sfs.sfs_folded
+.. autofunction:: pg_gpu.sfs.sfs_scaled
+.. autofunction:: pg_gpu.sfs.sfs_folded_scaled
+
+Joint (Two-Population)
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.sfs.joint_sfs
+.. autofunction:: pg_gpu.sfs.joint_sfs_folded
+.. autofunction:: pg_gpu.sfs.joint_sfs_scaled
+.. autofunction:: pg_gpu.sfs.joint_sfs_folded_scaled
+
+Scaling and Folding Utilities
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.sfs.scale_sfs
+.. autofunction:: pg_gpu.sfs.scale_sfs_folded
+.. autofunction:: pg_gpu.sfs.scale_joint_sfs
+.. autofunction:: pg_gpu.sfs.scale_joint_sfs_folded
+.. autofunction:: pg_gpu.sfs.fold_sfs
+.. autofunction:: pg_gpu.sfs.fold_joint_sfs
+
+Admixture and F-Statistics
+--------------------------
+
+Per-Variant Statistics
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.admixture.patterson_f2
+.. autofunction:: pg_gpu.admixture.patterson_f3
+.. autofunction:: pg_gpu.admixture.patterson_d
+
+Windowed Statistics
+~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.admixture.moving_patterson_f3
+.. autofunction:: pg_gpu.admixture.moving_patterson_d
+
+Block-Jackknife Averaged
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: pg_gpu.admixture.average_patterson_f3
+.. autofunction:: pg_gpu.admixture.average_patterson_d

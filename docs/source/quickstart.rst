@@ -10,118 +10,156 @@ Loading Data
 .. code-block:: python
 
    from pg_gpu import HaplotypeMatrix
-   
+
    # From VCF file
    h = HaplotypeMatrix.from_vcf("data.vcf")
-   
-   # From NumPy array
+
+   # From NumPy array (n_haplotypes, n_variants)
    import numpy as np
-   data = np.array([[0, 1, 0], [1, 0, 1]], dtype=np.int8)
-   positions = np.array([100, 200])
-   h = HaplotypeMatrix(data, positions)
-
-Computing LD Statistics
-~~~~~~~~~~~~~~~~~~~~~~~
-
-Single Population
-^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-   from pg_gpu import ld_statistics
-   
-   # Get haplotype counts
-   result = h.tally_gpu_haplotypes()
-   if isinstance(result, tuple):
-       counts, n_valid = result
-   else:
-       counts, n_valid = result, None
-   
-   # Compute statistics
-   dd_vals = ld_statistics.dd(counts, n_valid=n_valid)
-   dz_vals = ld_statistics.dz(counts, n_valid=n_valid)
-   pi2_vals = ld_statistics.pi2(counts, n_valid=n_valid)
-
-Two Populations
-^^^^^^^^^^^^^^^
-
-.. code-block:: python
+   hap = np.array([[0, 1, 0], [1, 0, 1]], dtype=np.int8)
+   positions = np.array([100, 200, 300])
+   h = HaplotypeMatrix(hap, positions, chrom_start=0, chrom_end=400)
 
    # Define populations
    h.sample_sets = {
        "pop1": [0, 1, 2, 3],
        "pop2": [4, 5, 6, 7]
    }
-   
-   # Compute between-population statistics
-   # chunk_size='auto' adapts to available GPU memory (default)
+
+LD Statistics
+~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import ld_statistics
+
+   # Pairwise r-squared matrix
+   r2 = h.pairwise_r2()
+
+   # Haplotype count-based statistics
+   counts, n_valid = h.tally_gpu_haplotypes()
+   dd_vals = ld_statistics.dd(counts, n_valid=n_valid)
+   r_vals = ld_statistics.r(counts, n_valid=n_valid)
+   r2_vals = ld_statistics.r_squared(counts, n_valid=n_valid)
+
+   # LD pruning
+   unlinked = h.locate_unlinked(size=100, step=20, threshold=0.1)
+
+   # Windowed r-squared
+   result, pair_counts = h.windowed_r_squared(
+       bp_bins=[0, 1000, 5000, 10000]
+   )
+
+   # Two-population LD
    stats = h.compute_ld_statistics_gpu_two_pops(
        bp_bins=[0, 1000, 5000, 10000],
-       pop1="pop1",
-       pop2="pop2",
-       chunk_size='auto'  # or specify int for fixed chunk size
+       pop1="pop1", pop2="pop2"
+   )
+
+Diversity Statistics
+~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import diversity
+
+   # Basic diversity
+   pi_val = diversity.pi(h, span_normalize=True)
+   theta = diversity.theta_w(h, span_normalize=True)
+   tajd = diversity.tajimas_d(h)
+
+   # Heterozygosity
+   he = diversity.heterozygosity_expected(h)
+   ho = diversity.heterozygosity_observed(h)
+   f = diversity.inbreeding_coefficient(h)
+
+   # Allele frequency spectrum
+   afs = diversity.allele_frequency_spectrum(h)
+
+   # Population-specific
+   pi_pop1 = diversity.pi(h, population='pop1')
+
+Divergence Statistics
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import divergence
+
+   fst = divergence.fst(h, 'pop1', 'pop2')
+   dxy_val = divergence.dxy(h, 'pop1', 'pop2')
+
+Selection Scans
+~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import selection
+
+   # Integrated haplotype score
+   ihs_scores = selection.ihs(h)
+   ihs_std = selection.standardize(ihs_scores)
+
+   # Cross-population EHH
+   xpehh_scores = selection.xpehh(h, 'pop1', 'pop2')
+
+   # nSL (no distance weighting)
+   nsl_scores = selection.nsl(h)
+
+   # Garud's H statistics
+   h1, h12, h123, h2_h1 = selection.garud_h(h)
+
+   # EHH decay
+   ehh = selection.ehh_decay(h)
+
+Site Frequency Spectrum
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import sfs
+
+   # Unfolded and folded SFS
+   s = sfs.sfs(h)
+   s_folded = sfs.sfs_folded(h)
+
+   # Scaled SFS
+   s_scaled = sfs.sfs_scaled(h)
+
+   # Joint SFS (two populations)
+   j = sfs.joint_sfs(h, 'pop1', 'pop2')
+   j_folded = sfs.joint_sfs_folded(h, 'pop1', 'pop2')
+
+Admixture / F-Statistics
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import admixture
+
+   # Patterson's F2 (branch length)
+   f2 = admixture.patterson_f2(h, 'pop1', 'pop2')
+
+   # Patterson's F3 (admixture test)
+   T, B = admixture.patterson_f3(h, 'test_pop', 'source1', 'source2')
+   f3_star = np.nansum(T) / np.nansum(B)
+
+   # Patterson's D (ABBA-BABA)
+   num, den = admixture.patterson_d(h, 'popA', 'popB', 'popC', 'popD')
+
+   # Block-jackknife with standard error
+   d, se, z, vb, vj = admixture.average_patterson_d(
+       h, 'popA', 'popB', 'popC', 'popD', blen=100
    )
 
 Missing Data
 ~~~~~~~~~~~~
 
-Missing data is handled automatically:
+Missing data is encoded as -1 and handled automatically:
 
 .. code-block:: python
 
-   # Data with missing values (-1)
-   data_missing = np.array([[0, -1, 1], [1, 0, -1]], dtype=np.int8)
-   positions = np.array([100, 200])
-   h = HaplotypeMatrix(data_missing, positions)
-   
-   # Compute statistics (automatic missing data handling)
-   result = h.tally_gpu_haplotypes()
-   if isinstance(result, tuple):
-       counts, n_valid = result
-   else:
-       counts, n_valid = result, None
-   dd_vals = ld_statistics.dd(counts, n_valid=n_valid)
-
-Diversity Statistics
-~~~~~~~~~~~~~~~~~~~~
-
-Compute population genetics diversity statistics:
-
-.. code-block:: python
-
-   from pg_gpu import diversity
-   
-   # Basic diversity statistics
-   pi = diversity.pi(h, span_normalize=True)
-   theta = diversity.theta_w(h, span_normalize=True)
-   tajimas_d = diversity.tajimas_d(h)
-   
-   # With missing data handling
+   # Different missing data strategies
+   pi_include = diversity.pi(h, missing_data='include')
    pi_exclude = diversity.pi(h, missing_data='exclude')
-   
-   # Haplotype diversity
-   h_div = diversity.haplotype_diversity(h)
-
-Divergence Statistics
-~~~~~~~~~~~~~~~~~~~~~
-
-Compute between-population divergence:
-
-.. code-block:: python
-
-   from pg_gpu import divergence
-   
-   # Define populations
-   h.sample_sets = {
-       "pop1": [0, 1, 2, 3],
-       "pop2": [4, 5, 6, 7]
-   }
-   
-   # Compute FST
-   fst = divergence.fst(h, 'pop1', 'pop2')
-   
-   # Compute Dxy
-   dxy = divergence.dxy(h, 'pop1', 'pop2')
-   
-   # With missing data handling
-   fst_exclude = divergence.fst(h, 'pop1', 'pop2', missing_data='exclude')
+   pi_ignore = diversity.pi(h, missing_data='ignore')

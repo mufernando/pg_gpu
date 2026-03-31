@@ -4,27 +4,28 @@ Installation
 Requirements
 ------------
 
-* Python 3.8+
-* CUDA-capable GPU
+* Python 3.12+
+* CUDA 12+ capable GPU
 * CuPy (GPU computing)
-* NumPy
-* moments (population genetics)
+* NumPy, SciPy, pandas
 
-Conda Installation
-------------------
+Installation with Pixi
+----------------------
+
+pg_gpu uses `pixi <https://pixi.sh>`_ for environment management.
 
 .. code-block:: bash
 
    # Clone repository
-   git clone https://github.com/your-org/pg_gpu.git
+   git clone https://github.com/andrewkern/pg_gpu.git
    cd pg_gpu
-   
-   # Create conda environment
-   conda env create -f environment.yml
-   conda activate pg_gpu
-   
-   # Install in development mode
-   pip install -e .
+
+   # Install and activate the environment
+   pixi install
+   pixi shell
+
+The default environment includes CUDA/CuPy, development tools (pytest, ipython),
+and documentation tools (sphinx).
 
 Verify Installation
 -------------------
@@ -33,8 +34,16 @@ Verify Installation
 
    import pg_gpu
    print(pg_gpu.__version__)
-   
+
    # Check GPU availability
    import cupy as cp
    print(f"GPU available: {cp.cuda.is_available()}")
    print(f"GPU device: {cp.cuda.Device().name}")
+
+Running Tests
+-------------
+
+.. code-block:: bash
+
+   pixi run test              # all tests
+   pixi run test-parallel     # parallel execution

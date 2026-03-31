@@ -17,44 +17,46 @@ GPU-accelerated population genetics statistics for Python.
 Overview
 --------
 
-pg_gpu provides GPU-accelerated computation of linkage disequilibrium (LD) statistics, 
-integrating with the `moments <https://github.com/moments-dev/moments>`_ population genetics package.
+pg_gpu provides GPU-accelerated computation of population genetics statistics
+using CuPy. It covers linkage disequilibrium, diversity, divergence, selection
+scans, site frequency spectra, and admixture statistics.
 
 Key Features
 ~~~~~~~~~~~~
 
-* **Fast GPU computation** using CuPy
-* **Unified API** for all LD statistics
-* **Automatic missing data handling**
-* **Support for multi-population analyses**
-* **Seamless integration** with moments
+* **Fast GPU computation** using CuPy with CUDA RawKernels for compute-intensive operations
+* **Comprehensive statistics**: LD (D, D-squared, Dz, pi2, r/r-squared), diversity (pi, theta, Tajima's D, heterozygosity, Fay & Wu's H), divergence (FST, Dxy, Da), selection scans (iHS, XP-EHH, nSL, XP-nSL, Garud's H, EHH decay), SFS (unfolded, folded, joint, scaled), admixture (Patterson's F2, F3, D)
+* **Automatic missing data handling** across all modules
+* **Multi-population analyses** with flexible population specification
+* **Validated against scikit-allel** with comprehensive test suite
 
 Installation
 ------------
 
 .. code-block:: bash
 
-   conda env create -f environment.yml
-   conda activate pg_gpu
-   pip install -e .
+   pixi install
+   pixi shell
 
 Quick Example
 -------------
 
 .. code-block:: python
 
-   from pg_gpu import HaplotypeMatrix, ld_statistics
-   
+   from pg_gpu import HaplotypeMatrix, diversity, selection
+
    # Load data
    h = HaplotypeMatrix.from_vcf("data.vcf")
-   
-   # Compute LD statistics
-   result = h.tally_gpu_haplotypes()
-   if isinstance(result, tuple):
-       counts, n_valid = result
-   else:
-       counts, n_valid = result, None
-   dd_vals = ld_statistics.dd(counts, n_valid=n_valid)
+
+   # Diversity
+   pi_val = diversity.pi(h)
+   tajd = diversity.tajimas_d(h)
+
+   # Selection scans
+   ihs_scores = selection.ihs(h)
+
+   # LD r-squared
+   r2 = h.pairwise_r2()
 
 Indices and tables
 ==================
