@@ -977,23 +977,73 @@ def haplotype_diversity(haplotype_matrix: HaplotypeMatrix,
         missing_per_var = np.sum(haplotypes_cpu < 0, axis=0)
         complete = missing_per_var == 0
         haplotypes_cpu = haplotypes_cpu[:, complete]
-    else:
-        # 'include' mode - exclude haplotypes with any missing site
-        has_missing = np.any(haplotypes_cpu < 0, axis=1)
-        haplotypes_cpu = haplotypes_cpu[~has_missing]
 
     n_haplotypes = haplotypes_cpu.shape[0]
     if n_haplotypes <= 1:
         return 0.0
 
-    from collections import Counter
-    hap_strings = [''.join(map(str, hap)) for hap in haplotypes_cpu]
-    hap_counts = Counter(hap_strings)
+    # Group haplotypes treating missing (-1) as wildcard:
+    # two haplotypes match if they agree at all jointly non-missing sites
+    cluster_id = _cluster_haplotypes_with_missing(haplotypes_cpu)
 
-    frequencies = np.array(list(hap_counts.values())) / n_haplotypes
+    from collections import Counter
+    counts = Counter(cluster_id)
+    frequencies = np.array(list(counts.values())) / n_haplotypes
     diversity = (1.0 - np.sum(frequencies ** 2)) * n_haplotypes / (n_haplotypes - 1)
 
     return float(diversity)
+
+
+def _cluster_haplotypes_with_missing(haps):
+    """Cluster haplotypes treating -1 as compatible with any allele.
+
+    Two haplotypes are in the same cluster if they match at all positions
+    where both are non-missing. Uses greedy assignment: each haplotype
+    joins the first compatible cluster.
+
+    Parameters
+    ----------
+    haps : ndarray, shape (n_haplotypes, n_variants)
+
+    Returns
+    -------
+    labels : list of int, length n_haplotypes
+    """
+    n = haps.shape[0]
+    has_any_missing = np.any(haps < 0)
+
+    if not has_any_missing:
+        # fast path: no missing data, use string hashing
+        hap_strings = [''.join(map(str, h)) for h in haps]
+        label_map = {}
+        labels = []
+        next_id = 0
+        for s in hap_strings:
+            if s not in label_map:
+                label_map[s] = next_id
+                next_id += 1
+            labels.append(label_map[s])
+        return labels
+
+    # slow path: pairwise comparison with wildcard matching
+    # representative haplotype per cluster (index into haps)
+    cluster_reps = [0]
+    labels = [0]
+
+    for i in range(1, n):
+        matched = False
+        for c_idx, rep in enumerate(cluster_reps):
+            # check if haps[i] matches haps[rep] at jointly non-missing sites
+            both_valid = (haps[i] >= 0) & (haps[rep] >= 0)
+            if np.all(haps[i][both_valid] == haps[rep][both_valid]):
+                labels.append(c_idx)
+                matched = True
+                break
+        if not matched:
+            cluster_reps.append(i)
+            labels.append(len(cluster_reps) - 1)
+
+    return labels
 
 
 _get_population_matrix = get_population_matrix
@@ -1366,13 +1416,7 @@ def max_daf(haplotype_matrix: HaplotypeMatrix,
 
     hap = matrix.haplotypes
 
-    if missing_data == 'include':
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0).astype(cp.float64)
-        usable = n_valid > 0
-        freqs = cp.where(usable, dac / n_valid, 0.0)
-    elif missing_data == 'exclude':
+    if missing_data == 'exclude':
         missing_per_var = cp.sum(hap < 0, axis=0)
         complete = missing_per_var == 0
         hap_clean = cp.where(hap >= 0, hap, 0)
@@ -1380,10 +1424,12 @@ def max_daf(haplotype_matrix: HaplotypeMatrix,
         dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
         freqs = cp.where(complete, dac / n, -1.0)  # -1 so excluded sites aren't max
     else:
-        hap_clean = cp.maximum(hap, 0)
-        n = hap.shape[0]
-        dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
-        freqs = dac / n
+        # 'include' mode (default fallback)
+        valid_mask = hap >= 0
+        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
+        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0).astype(cp.float64)
+        usable = n_valid > 0
+        freqs = cp.where(usable, dac / n_valid, 0.0)
 
     return float(cp.max(freqs).get())
 
@@ -1421,14 +1467,9 @@ def haplotype_count(haplotype_matrix: HaplotypeMatrix,
     if missing_data == 'exclude':
         missing_per_var = np.sum(hap_cpu < 0, axis=0)
         hap_cpu = hap_cpu[:, missing_per_var == 0]
-    elif missing_data == 'include':
-        has_missing = np.any(hap_cpu < 0, axis=1)
-        hap_cpu = hap_cpu[~has_missing]
-    else:
-        hap_cpu = np.maximum(hap_cpu, 0)
 
-    hap_bytes = np.array([row.tobytes() for row in hap_cpu])
-    return len(np.unique(hap_bytes))
+    labels = _cluster_haplotypes_with_missing(hap_cpu)
+    return len(set(labels))
 
 
 def daf_histogram(matrix, n_bins: int = 20,
@@ -1471,13 +1512,7 @@ def daf_histogram(matrix, n_bins: int = 20,
 
     hap = matrix.haplotypes
 
-    if missing_data == 'include':
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0).astype(cp.float64)
-        usable = n_valid > 0
-        dafs = cp.where(usable, dac / n_valid, 0.0)
-    elif missing_data == 'exclude':
+    if missing_data == 'exclude':
         missing_per_var = cp.sum(hap < 0, axis=0)
         complete = missing_per_var == 0
         hap_clean = cp.where(hap >= 0, hap, 0)
@@ -1486,9 +1521,12 @@ def daf_histogram(matrix, n_bins: int = 20,
         dafs = dac / n
         dafs = dafs[complete]  # filter to complete sites
     else:
-        hap_clean = cp.maximum(hap, 0)
-        n = hap.shape[0]
-        dafs = cp.sum(hap_clean, axis=0).astype(cp.float64) / n
+        # 'include' mode (default fallback)
+        valid_mask = hap >= 0
+        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
+        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0).astype(cp.float64)
+        usable = n_valid > 0
+        dafs = cp.where(usable, dac / n_valid, 0.0)
 
     return _histogram_from_dafs(dafs, n_bins)
 
@@ -1845,14 +1883,7 @@ def mu_sfs(haplotype_matrix: HaplotypeMatrix,
 
     hap = matrix.haplotypes
 
-    if missing_data == 'include':
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0)
-        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0)
-        usable = n_valid >= 2
-        is_seg = usable & (dac > 0) & (dac < n_valid)
-        is_edge = usable & ((dac == 1) | (dac == n_valid - 1))
-    elif missing_data == 'exclude':
+    if missing_data == 'exclude':
         missing_per_var = cp.sum(hap < 0, axis=0)
         complete = missing_per_var == 0
         hap_clean = cp.where(hap >= 0, hap, 0)
@@ -1861,11 +1892,13 @@ def mu_sfs(haplotype_matrix: HaplotypeMatrix,
         is_seg = complete & (dac > 0) & (dac < n)
         is_edge = complete & ((dac == 1) | (dac == n - 1))
     else:
-        hap_clean = cp.maximum(hap, 0)
-        n = hap.shape[0]
-        dac = cp.sum(hap_clean, axis=0)
-        is_seg = (dac > 0) & (dac < n)
-        is_edge = (dac == 1) | (dac == n - 1)
+        # 'include' mode (default fallback)
+        valid_mask = hap >= 0
+        n_valid = cp.sum(valid_mask, axis=0)
+        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0)
+        usable = n_valid >= 2
+        is_seg = usable & (dac > 0) & (dac < n_valid)
+        is_edge = usable & ((dac == 1) | (dac == n_valid - 1))
 
     n_seg = cp.sum(is_seg)
     if int(n_seg.get()) == 0:
