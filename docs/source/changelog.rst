@@ -1,7 +1,7 @@
 Changelog
 =========
 
-v0.3.0 (Current)
+v0.1.0 (Current)
 -----------------
 
 New Modules
@@ -55,36 +55,3 @@ Infrastructure
 * Shared ``_utils.py`` module for population extraction
 * Comprehensive validation test suite against scikit-allel
 
-v0.2.0
-------
-
-New Features
-~~~~~~~~~~~~
-
-* **Comprehensive Missing Data Support**
-
-  - All statistics support ``missing_data`` parameter ('include', 'exclude', 'ignore')
-  - ``span_denominator`` parameter for flexible span normalization
-  - HaplotypeMatrix methods for missing data analysis
-  - Automatic detection and handling of missing data in LD statistics
-
-* **New Statistics**
-
-  - ``haplotype_diversity()`` - Haplotype diversity with Nei's correction
-  - Population subsets in all diversity statistics
-
-* **API Improvements**
-
-  - Consistent parameter naming across all modules
-  - Integration between diversity, divergence, and LD statistics
-
-v0.1.0
-------
-
-Initial Release
-~~~~~~~~~~~~~~~
-
-* GPU-accelerated LD statistics (DD, Dz, pi2)
-* Integration with moments package
-* Basic missing data support in LD statistics
-* Windowed analysis capabilities
