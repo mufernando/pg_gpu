@@ -13,10 +13,18 @@ from .genotype_matrix import GenotypeMatrix
 from ._utils import get_population_matrix
 
 
+def _extract_upper_triangle(mat):
+    """Extract upper triangle of a square matrix as condensed vector."""
+    n = mat.shape[0]
+    idx_i, idx_j = cp.triu_indices(n, k=1)
+    return mat[idx_i, idx_j]
+
+
 def pairwise_diffs_haploid(haplotype_matrix, population=None):
     """Compute pairwise Hamming distances between haplotypes on GPU.
 
-    Uses matrix multiply for O(n^2 * m) computation entirely on GPU.
+    Uses a single matrix multiply: for 0/1 data,
+    diffs_ij = sum_i + sum_j - 2 * (X @ X.T)_ij.
 
     Parameters
     ----------
@@ -26,7 +34,6 @@ def pairwise_diffs_haploid(haplotype_matrix, population=None):
     Returns
     -------
     diffs : cupy.ndarray, float64, condensed form (n_pairs,)
-        Number of differing sites per pair.
     """
     if population is not None:
         matrix = get_population_matrix(haplotype_matrix, population)
@@ -37,22 +44,18 @@ def pairwise_diffs_haploid(haplotype_matrix, population=None):
         matrix.transfer_to_gpu()
 
     X = cp.maximum(matrix.haplotypes, 0).astype(cp.float64)
-    n_var = cp.float64(X.shape[1])
+    row_sums = cp.sum(X, axis=1)
+    gram = X @ X.T
+    diffs_mat = row_sums[:, None] + row_sums[None, :] - 2.0 * gram
 
-    # matches_ij = X @ X.T + (1-X) @ (1-X).T
-    Xc = 1.0 - X
-    matches = (X @ X.T) + (Xc @ Xc.T)
-    diffs_mat = n_var - matches
-
-    n = X.shape[0]
-    idx_i, idx_j = cp.triu_indices(n, k=1)
-    return diffs_mat[idx_i, idx_j]
+    return _extract_upper_triangle(diffs_mat)
 
 
 def pairwise_diffs_diploid(genotype_matrix, population=None):
-    """Compute pairwise genotype differences between diploid individuals on GPU.
+    """Compute pairwise genotype differences between diploid individuals.
 
-    Uses indicator matrix approach for 0/1/2 genotype values.
+    For 0/1/2 genotypes, uses indicator matrices: matches = I0.T@I0 +
+    I1.T@I1 + I2.T@I2, then diffs = n_var - matches.
 
     Parameters
     ----------
@@ -77,7 +80,6 @@ def pairwise_diffs_diploid(genotype_matrix, population=None):
     geno = cp.maximum(geno, 0)
     n_var = cp.float64(geno.shape[1])
 
-    # indicator matrices for each genotype value
     I0 = (geno == 0).astype(cp.float64)
     I1 = (geno == 1).astype(cp.float64)
     I2 = (geno == 2).astype(cp.float64)
@@ -85,13 +87,56 @@ def pairwise_diffs_diploid(genotype_matrix, population=None):
     matches = I0 @ I0.T + I1 @ I1.T + I2 @ I2.T
     diffs_mat = n_var - matches
 
-    n = geno.shape[0]
-    idx_i, idx_j = cp.triu_indices(n, k=1)
-    return diffs_mat[idx_i, idx_j]
+    return _extract_upper_triangle(diffs_mat)
+
+
+def dist_moments(matrix, population=None):
+    """Compute variance, skewness, and kurtosis of pairwise distances.
+
+    Computes the distance matrix once and derives all three moments,
+    avoiding redundant matrix multiplies.
+
+    Parameters
+    ----------
+    matrix : HaplotypeMatrix or GenotypeMatrix
+    population : str or list, optional
+
+    Returns
+    -------
+    var : float
+    skew : float
+    kurt : float
+    """
+    diffs = _get_diffs(matrix, population)
+    n = diffs.shape[0]
+
+    if n < 2:
+        return 0.0, 0.0, 0.0
+
+    mean = cp.mean(diffs)
+    centered = diffs - mean
+    c2 = centered ** 2
+    m2 = cp.mean(c2)
+
+    var_val = float((cp.sum(c2) / (n - 1)).get())
+
+    if n < 3 or float(m2.get()) == 0:
+        return var_val, 0.0, 0.0
+
+    m3 = cp.mean(centered ** 3)
+    skew_val = float((m3 / (m2 ** 1.5)).get())
+
+    if n < 4:
+        return var_val, skew_val, 0.0
+
+    m4 = cp.mean(centered ** 4)
+    kurt_val = float((m4 / (m2 ** 2) - 3.0).get())
+
+    return var_val, skew_val, kurt_val
 
 
 def dist_var(matrix, population=None):
-    """Variance of pairwise distance distribution (GPU).
+    """Variance of pairwise distance distribution.
 
     Parameters
     ----------
@@ -101,15 +146,11 @@ def dist_var(matrix, population=None):
     -------
     float
     """
-    diffs = _get_diffs(matrix, population)
-    if diffs.shape[0] < 2:
-        return 0.0
-    mean = cp.mean(diffs)
-    return float((cp.sum((diffs - mean) ** 2) / (diffs.shape[0] - 1)).get())
+    return dist_moments(matrix, population)[0]
 
 
 def dist_skew(matrix, population=None):
-    """Skewness of pairwise distance distribution (GPU).
+    """Skewness of pairwise distance distribution.
 
     Parameters
     ----------
@@ -119,20 +160,11 @@ def dist_skew(matrix, population=None):
     -------
     float
     """
-    diffs = _get_diffs(matrix, population)
-    if diffs.shape[0] < 3:
-        return 0.0
-    n = diffs.shape[0]
-    mean = cp.mean(diffs)
-    m2 = cp.mean((diffs - mean) ** 2)
-    m3 = cp.mean((diffs - mean) ** 3)
-    # scipy skewness (bias=True): m3 / m2^1.5
-    s = cp.where(m2 > 0, m3 / (m2 ** 1.5), 0.0)
-    return float(s.get())
+    return dist_moments(matrix, population)[1]
 
 
 def dist_kurt(matrix, population=None):
-    """Excess kurtosis of pairwise distance distribution (GPU).
+    """Excess kurtosis of pairwise distance distribution.
 
     Parameters
     ----------
@@ -142,19 +174,11 @@ def dist_kurt(matrix, population=None):
     -------
     float
     """
-    diffs = _get_diffs(matrix, population)
-    if diffs.shape[0] < 4:
-        return 0.0
-    mean = cp.mean(diffs)
-    m2 = cp.mean((diffs - mean) ** 2)
-    m4 = cp.mean((diffs - mean) ** 4)
-    # excess kurtosis: m4/m2^2 - 3
-    k = cp.where(m2 > 0, m4 / (m2 ** 2) - 3.0, 0.0)
-    return float(k.get())
+    return dist_moments(matrix, population)[2]
 
 
 def _get_diffs(matrix, population=None):
-    """Dispatch to haploid or diploid pairwise diffs (returns CuPy array)."""
+    """Dispatch to haploid or diploid pairwise diffs."""
     if isinstance(matrix, GenotypeMatrix):
         return pairwise_diffs_diploid(matrix, population)
     else:

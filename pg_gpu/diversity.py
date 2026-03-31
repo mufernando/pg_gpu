@@ -994,14 +994,16 @@ def haplotype_count(haplotype_matrix: HaplotypeMatrix,
     return len(np.unique(hap_bytes))
 
 
-def daf_histogram(haplotype_matrix: HaplotypeMatrix,
-                  n_bins: int = 20,
+def daf_histogram(matrix, n_bins: int = 20,
                   population: Optional[Union[str, list]] = None):
     """Normalized histogram of derived allele frequencies.
 
+    Accepts HaplotypeMatrix or GenotypeMatrix. For diploid data,
+    DAF = sum(genotypes) / (2 * n_individuals).
+
     Parameters
     ----------
-    haplotype_matrix : HaplotypeMatrix
+    matrix : HaplotypeMatrix or GenotypeMatrix
     n_bins : int
         Number of frequency bins spanning [0, 1].
     population : str or list, optional
@@ -1012,10 +1014,13 @@ def daf_histogram(haplotype_matrix: HaplotypeMatrix,
         Normalized counts (sum to 1).
     bin_edges : ndarray, float64, shape (n_bins + 1,)
     """
+    from .genotype_matrix import GenotypeMatrix
+
+    if isinstance(matrix, GenotypeMatrix):
+        return _daf_histogram_diploid(matrix, n_bins, population)
+
     if population is not None:
-        matrix = _get_population_matrix(haplotype_matrix, population)
-    else:
-        matrix = haplotype_matrix
+        matrix = _get_population_matrix(matrix, population)
 
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
@@ -1024,14 +1029,7 @@ def daf_histogram(haplotype_matrix: HaplotypeMatrix,
     n = hap.shape[0]
     dafs = cp.sum(hap, axis=0).astype(cp.float64) / n
 
-    bin_edges = cp.linspace(0, 1, n_bins + 1)
-    hist = cp.histogram(dafs, bins=bin_edges)[0].astype(cp.float64)
-
-    total = cp.sum(hist)
-    if total > 0:
-        hist = hist / total
-
-    return hist.get(), bin_edges.get()
+    return _histogram_from_dafs(dafs, n_bins)
 
 
 def diplotype_frequency_spectrum(genotype_matrix,
@@ -1073,27 +1071,18 @@ def diplotype_frequency_spectrum(genotype_matrix,
     return freqs, len(counts)
 
 
-def daf_histogram_diploid(genotype_matrix,
-                          n_bins: int = 20,
-                          population: Optional[Union[str, list]] = None):
-    """Normalized DAF histogram from diploid genotypes.
+def _histogram_from_dafs(dafs, n_bins):
+    """Shared: compute normalized histogram from DAF CuPy array."""
+    bin_edges = cp.linspace(0, 1, n_bins + 1)
+    hist = cp.histogram(dafs, bins=bin_edges)[0].astype(cp.float64)
+    total = cp.sum(hist)
+    if total > 0:
+        hist = hist / total
+    return hist.get(), bin_edges.get()
 
-    DAF = sum(genotypes) / (2 * n_individuals) since each individual
-    contributes 2 alleles.
 
-    Parameters
-    ----------
-    genotype_matrix : GenotypeMatrix
-    n_bins : int
-    population : str or list, optional
-
-    Returns
-    -------
-    hist : ndarray, float64, shape (n_bins,)
-    bin_edges : ndarray, float64, shape (n_bins + 1,)
-    """
-    from .genotype_matrix import GenotypeMatrix
-
+def _daf_histogram_diploid(genotype_matrix, n_bins=20, population=None):
+    """DAF histogram from diploid genotypes (internal)."""
     if population is not None:
         pop_idx = genotype_matrix.sample_sets.get(population)
         if pop_idx is None:
@@ -1109,14 +1098,11 @@ def daf_histogram_diploid(genotype_matrix,
     n_ind = geno.shape[0]
     dafs = cp.sum(geno, axis=0) / (2.0 * n_ind)
 
-    bin_edges = cp.linspace(0, 1, n_bins + 1)
-    hist = cp.histogram(dafs, bins=bin_edges)[0].astype(cp.float64)
+    return _histogram_from_dafs(dafs, n_bins)
 
-    total = cp.sum(hist)
-    if total > 0:
-        hist = hist / total
 
-    return hist.get(), bin_edges.get()
+# backward compat alias
+daf_histogram_diploid = _daf_histogram_diploid
 
 
 # Summary statistics combinations commonly used

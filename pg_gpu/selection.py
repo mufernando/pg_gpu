@@ -99,47 +99,46 @@ def standardize_by_allele_count(score, aac, bins=None, n_bins=None):
 # Public API: Garud's H statistics
 # ---------------------------------------------------------------------------
 
-def garud_h(haplotype_matrix: HaplotypeMatrix,
-            population: Optional[Union[str, list]] = None):
+def garud_h(matrix, population=None):
     """Compute Garud's H1, H12, H123, and H2/H1 statistics.
+
+    Accepts either HaplotypeMatrix (uses haplotype frequencies) or
+    GenotypeMatrix (uses diplotype frequencies) and dispatches
+    automatically.
 
     Parameters
     ----------
-    haplotype_matrix : HaplotypeMatrix
-        Haplotype data.
+    matrix : HaplotypeMatrix or GenotypeMatrix
+        Haplotype or diploid genotype data.
     population : str or list, optional
         Population name or list of sample indices. If None, uses all samples.
 
     Returns
     -------
     h1 : float
-        Sum of squared haplotype frequencies.
+        Sum of squared haplotype/diplotype frequencies.
     h12 : float
-        H12 statistic (top two haplotypes combined).
+        H12 statistic (top two combined).
     h123 : float
-        H123 statistic (top three haplotypes combined).
+        H123 statistic (top three combined).
     h2_h1 : float
         H2/H1 ratio indicating sweep softness.
     """
+    from .genotype_matrix import GenotypeMatrix
+
+    if isinstance(matrix, GenotypeMatrix):
+        return _garud_h_diploid(matrix, population)
+
+    haplotype_matrix = matrix
     if population is not None:
-        matrix = _get_population_matrix(haplotype_matrix, population)
-    else:
-        matrix = haplotype_matrix
+        haplotype_matrix = _get_population_matrix(haplotype_matrix, population)
 
-    if matrix.device == 'CPU':
-        matrix.transfer_to_gpu()
+    if haplotype_matrix.device == 'CPU':
+        haplotype_matrix.transfer_to_gpu()
 
-    hap = matrix.haplotypes  # (n_haplotypes, n_variants)
+    f = _distinct_haplotype_frequencies(haplotype_matrix.haplotypes)
 
-    f = _distinct_haplotype_frequencies(hap)
-
-    h1 = float(np.sum(f ** 2))
-    h12 = float(np.sum(f[:2]) ** 2 + np.sum(f[2:] ** 2))
-    h123 = float(np.sum(f[:3]) ** 2 + np.sum(f[3:] ** 2))
-    h2 = h1 - float(f[0] ** 2)
-    h2_h1 = h2 / h1 if h1 > 0 else 0.0
-
-    return h1, h12, h123, h2_h1
+    return _garud_from_freqs(f)
 
 
 def moving_garud_h(haplotype_matrix: HaplotypeMatrix,
@@ -193,43 +192,31 @@ def moving_garud_h(haplotype_matrix: HaplotypeMatrix,
         w_end = w_start + size
         hap_window = hap[:, w_start:w_end]
         f = _distinct_haplotype_frequencies(hap_window)
-        _h1 = float(np.sum(f ** 2))
-        _h12 = float(np.sum(f[:2]) ** 2 + np.sum(f[2:] ** 2))
-        _h123 = float(np.sum(f[:3]) ** 2 + np.sum(f[3:] ** 2))
-        _h2 = _h1 - float(f[0] ** 2)
-        _h2_h1 = _h2 / _h1 if _h1 > 0 else 0.0
-        results.append((_h1, _h12, _h123, _h2_h1))
+        results.append(_garud_from_freqs(f))
 
     results = np.array(results, dtype='f8')
     return results[:, 0], results[:, 1], results[:, 2], results[:, 3]
 
 
-def garud_h_diploid(genotype_matrix, population=None):
-    """Compute Garud's H1, H12, H123, H2/H1 from diploid genotypes.
-
-    Uses diplotype (multi-locus genotype pattern) frequencies instead
-    of haplotype frequencies.
-
-    Parameters
-    ----------
-    genotype_matrix : GenotypeMatrix
-    population : str or list, optional
-
-    Returns
-    -------
-    h1, h12, h123, h2_h1 : float
-    """
-    from .diversity import diplotype_frequency_spectrum
-
-    freqs, _ = diplotype_frequency_spectrum(genotype_matrix, population)
-
-    h1 = float(np.sum(freqs ** 2))
-    h12 = float(np.sum(freqs[:2]) ** 2 + np.sum(freqs[2:] ** 2))
-    h123 = float(np.sum(freqs[:3]) ** 2 + np.sum(freqs[3:] ** 2))
-    h2 = h1 - float(freqs[0] ** 2)
+def _garud_from_freqs(f):
+    """Compute H1/H12/H123/H2H1 from sorted frequency array."""
+    h1 = float(np.sum(f ** 2))
+    h12 = float(np.sum(f[:2]) ** 2 + np.sum(f[2:] ** 2))
+    h123 = float(np.sum(f[:3]) ** 2 + np.sum(f[3:] ** 2))
+    h2 = h1 - float(f[0] ** 2)
     h2_h1 = h2 / h1 if h1 > 0 else 0.0
-
     return h1, h12, h123, h2_h1
+
+
+def _garud_h_diploid(genotype_matrix, population=None):
+    """Garud's H from diplotype frequencies (internal)."""
+    from .diversity import diplotype_frequency_spectrum
+    freqs, _ = diplotype_frequency_spectrum(genotype_matrix, population)
+    return _garud_from_freqs(freqs)
+
+
+# backward compat alias
+garud_h_diploid = _garud_h_diploid
 
 
 # ---------------------------------------------------------------------------

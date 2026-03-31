@@ -205,21 +205,21 @@ def r_squared(counts: cp.ndarray,
     return r(counts, n_valid) ** 2
 
 
-def zns(r2_matrix):
+def zns(r2_matrix_or_matrix):
     """Kelly's ZnS: mean pairwise r-squared across all SNP pairs.
 
     Parameters
     ----------
-    r2_matrix : cupy or numpy ndarray, shape (m, m)
-        Square r-squared matrix (e.g. from HaplotypeMatrix.pairwise_r2()).
+    r2_matrix_or_matrix : ndarray, HaplotypeMatrix, or GenotypeMatrix
+        Square r-squared matrix, or a matrix object (dispatches to
+        haploid or diploid r-squared computation automatically).
 
     Returns
     -------
     float
         Mean r-squared (excluding diagonal).
     """
-    if not isinstance(r2_matrix, cp.ndarray):
-        r2_matrix = cp.asarray(r2_matrix, dtype=cp.float64)
+    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix)
 
     m = r2_matrix.shape[0]
     if m < 2:
@@ -228,86 +228,81 @@ def zns(r2_matrix):
     return float((total / (m * (m - 1))).get())
 
 
-def omega(r2_matrix):
+def omega(r2_matrix_or_matrix):
     """Kim and Nielsen's Omega: max ratio of within-partition to
     cross-partition mean LD.
 
-    For each possible SNP partition point, computes the ratio of
-    mean r-squared within the two blocks to mean r-squared between
-    blocks. Returns the maximum ratio across all partition points.
+    For each possible SNP partition point l, splits variants into
+    [0:l) and [l:m), computes mean r-squared within each block
+    and between blocks. Returns max(mean_within / mean_cross).
 
-    Uses GPU prefix sums to evaluate all partition points without
-    a Python loop.
+    Uses GPU prefix sums on the upper triangle to evaluate all
+    partition points without a Python loop. Matches diploSHIC's
+    convention of using upper-triangle pairs only.
 
     Parameters
     ----------
-    r2_matrix : cupy or numpy ndarray, shape (m, m)
-        Square r-squared matrix.
+    r2_matrix_or_matrix : ndarray, HaplotypeMatrix, or GenotypeMatrix
+        Square r-squared matrix, or a matrix object (dispatches to
+        haploid or diploid r-squared computation automatically).
 
     Returns
     -------
     float
-        Maximum omega value. Returns 0 if fewer than 4 SNPs.
+        Maximum omega value. Returns 0 if fewer than 5 SNPs.
     """
-    if not isinstance(r2_matrix, cp.ndarray):
-        r2_matrix = cp.asarray(r2_matrix, dtype=cp.float64)
+    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix)
 
     m = r2_matrix.shape[0]
-    if m < 4:
+    if m < 5:
         return 0.0
 
-    r2 = r2_matrix.astype(cp.float64)
+    # work with upper triangle only (i < j), matching diploSHIC
+    r2 = cp.triu(r2_matrix, k=1)
 
-    # precompute 2D prefix sums for O(1) block sum queries
-    # S[i,j] = sum of r2[0:i, 0:j]
+    # 2D prefix sums on upper triangle
     S = cp.cumsum(cp.cumsum(r2, axis=0), axis=1)
 
-    # prefix sum of diagonal for trace computation
-    diag = cp.diag(r2)
-    diag_cumsum = cp.cumsum(diag)
+    def block_sum(r_start, r_end, c_start, c_end):
+        """Sum of S[r_start:r_end, c_start:c_end] via inclusion-exclusion."""
+        val = S[r_end - 1, c_end - 1]
+        if r_start > 0:
+            val -= S[r_start - 1, c_end - 1]
+        if c_start > 0:
+            val -= S[r_end - 1, c_start - 1]
+        if r_start > 0 and c_start > 0:
+            val += S[r_start - 1, c_start - 1]
+        return val
 
-    # total sum and trace
-    total_sum = S[m-1, m-1]
-    total_trace = diag_cumsum[m-1]
+    # partition points l = 3..m-2 (matching diploSHIC)
+    l_vals = cp.arange(3, m - 1)
 
-    # for partition at l (left=[0:l], right=[l:m]):
-    # sum_left = S[l-1, l-1]
-    # sum_cross = S[l-1, m-1] - S[l-1, l-1]  (top-right block)
-    #           + S[m-1, l-1] - S[l-1, l-1]  (bottom-left block)
-    # but r2 is symmetric so cross = 2 * (S[l-1, m-1] - S[l-1, l-1])
-    # sum_right = total_sum - S[l-1, m-1] - S[m-1, l-1] + S[l-1, l-1]
+    # left block: upper triangle pairs (i,j) with i < j < l
+    # = sum of r2[0:l, 0:l] upper triangle = block_sum(0, l, 0, l)
+    left_sum = S[l_vals - 1, l_vals - 1]
 
-    # evaluate all partition points l = 2..m-2 in parallel
-    l_vals = cp.arange(2, m - 1)
+    # total upper triangle sum
+    total_upper = S[m - 1, m - 1]
 
-    sum_left = S[l_vals - 1, l_vals - 1]
-    trace_left = diag_cumsum[l_vals - 1]
+    # cross block: pairs (i,j) with i < l and j >= l
+    # = block_sum(0, l, l, m)
+    cross_sum = S[l_vals - 1, m - 1] - left_sum
 
-    sum_right = total_sum - S[l_vals - 1, m-1] - S[m-1, l_vals - 1] + sum_left
-    trace_right = total_trace - trace_left
+    # right block: pairs (i,j) with i >= l and j > i (upper triangle of right block)
+    right_sum = total_upper - left_sum - cross_sum
 
-    # cross = total - left_block - right_block
-    # S[l-1, m-1] = sum of rows 0..l-1, all cols
-    # left block = S[l-1, l-1], right block needs careful extraction
-    sum_cross = total_sum - sum_left - sum_right
-    # cross has no diagonal contribution so no trace adjustment needed
-    # but we double-counted: cross appears in both off-diagonal blocks
-    # Actually: sum_left + sum_right + sum_cross = total_sum
-    # where sum_cross is the sum of both off-diagonal blocks combined
+    # pair counts (upper triangle only)
+    n_left = l_vals * (l_vals - 1) // 2
+    n_right = (m - l_vals) * (m - l_vals - 1) // 2
+    n_cross = l_vals * (m - l_vals)
 
-    n_left = l_vals * (l_vals - 1)
-    n_right = (m - l_vals) * (m - l_vals - 1)
-    n_cross = 2 * l_vals * (m - l_vals)  # both off-diagonal blocks
-
-    # within = (left excl diag + right excl diag)
-    within_sum = (sum_left - trace_left) + (sum_right - trace_right)
     n_within = n_left + n_right
+    within_sum = left_sum + right_sum
 
-    valid = (n_within > 0) & (n_cross > 0) & (sum_cross > 0)
+    valid = (n_within > 0) & (n_cross > 0) & (cross_sum > 0)
 
-    omega_vals = cp.zeros_like(l_vals, dtype=cp.float64)
-    mean_within = cp.where(n_within > 0, within_sum / n_within, 0.0)
-    mean_cross = cp.where(n_cross > 0, sum_cross / n_cross, 1.0)
+    mean_within = cp.where(n_within > 0, within_sum / n_within.astype(cp.float64), 0.0)
+    mean_cross = cp.where(n_cross > 0, cross_sum / n_cross.astype(cp.float64), 1.0)
     omega_vals = cp.where(valid, mean_within / mean_cross, 0.0)
 
     return float(cp.max(omega_vals).get())
@@ -367,7 +362,24 @@ def mu_ld(haplotype_matrix):
     return float((n_excl_left / n_left + n_excl_right / n_right) / 2.0)
 
 
-def r2_matrix_diploid(genotype_matrix):
+def _resolve_r2_matrix(r2_matrix_or_matrix):
+    """Convert a matrix object to an r2 matrix, or pass through raw arrays."""
+    from .haplotype_matrix import HaplotypeMatrix
+    from .genotype_matrix import GenotypeMatrix
+
+    if isinstance(r2_matrix_or_matrix, GenotypeMatrix):
+        return _r2_matrix_diploid(r2_matrix_or_matrix)
+    elif isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
+        if r2_matrix_or_matrix.device == 'CPU':
+            r2_matrix_or_matrix.transfer_to_gpu()
+        return r2_matrix_or_matrix.pairwise_r2()
+    else:
+        if not isinstance(r2_matrix_or_matrix, cp.ndarray):
+            return cp.asarray(r2_matrix_or_matrix, dtype=cp.float64)
+        return r2_matrix_or_matrix
+
+
+def _r2_matrix_diploid(genotype_matrix):
     """Compute r-squared matrix from diploid genotypes (0/1/2) on GPU.
 
     Uses genotype correlation: treats 0/1/2 as continuous dosage values,
@@ -416,34 +428,10 @@ def r2_matrix_diploid(genotype_matrix):
     return r2
 
 
-def zns_diploid(genotype_matrix):
-    """Kelly's ZnS from diploid genotypes.
-
-    Parameters
-    ----------
-    genotype_matrix : GenotypeMatrix
-
-    Returns
-    -------
-    float
-    """
-    r2 = r2_matrix_diploid(genotype_matrix)
-    return zns(r2)
-
-
-def omega_diploid(genotype_matrix):
-    """Kim and Nielsen's Omega from diploid genotypes.
-
-    Parameters
-    ----------
-    genotype_matrix : GenotypeMatrix
-
-    Returns
-    -------
-    float
-    """
-    r2 = r2_matrix_diploid(genotype_matrix)
-    return omega(r2)
+# Keep old names as aliases for backward compat
+r2_matrix_diploid = _r2_matrix_diploid
+zns_diploid = zns
+omega_diploid = omega
 
 
 def compute_ld_statistics(counts: cp.ndarray,

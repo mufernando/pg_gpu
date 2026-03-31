@@ -197,6 +197,27 @@ Compute statistics across all genomic windows in a single GPU pass:
        pop1='pop1', pop2='pop2'
    )
 
+Diploid Data
+~~~~~~~~~~~~
+
+Use ``GenotypeMatrix`` for diploid genotypes (0/1/2). Many functions
+auto-dispatch based on input type:
+
+.. code-block:: python
+
+   from pg_gpu import GenotypeMatrix
+
+   # Convert from haploid (pairs consecutive haplotypes)
+   gm = GenotypeMatrix.from_haplotype_matrix(h)
+
+   # Same functions work on both types
+   h1, h12, h123, h2h1 = selection.garud_h(gm)  # uses diplotype frequencies
+   z = ld_statistics.zns(gm)                      # uses genotype correlation
+   hist, edges = diversity.daf_histogram(gm)       # DAF = sum / (2*n_ind)
+
+   # Distance distribution moments
+   var, skew, kurt = distance_stats.dist_moments(gm)
+
 Missing Data
 ~~~~~~~~~~~~
 

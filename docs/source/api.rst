@@ -58,10 +58,6 @@ Convenience Functions
 
 .. autofunction:: pg_gpu.ld_statistics.mu_ld
 
-.. autofunction:: pg_gpu.ld_statistics.zns_diploid
-
-.. autofunction:: pg_gpu.ld_statistics.omega_diploid
-
 Population Specifications
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -97,7 +93,6 @@ Convenience Functions
 .. autofunction:: pg_gpu.diversity.max_daf
 .. autofunction:: pg_gpu.diversity.haplotype_count
 .. autofunction:: pg_gpu.diversity.daf_histogram
-.. autofunction:: pg_gpu.diversity.daf_histogram_diploid
 .. autofunction:: pg_gpu.diversity.diplotype_frequency_spectrum
 .. autofunction:: pg_gpu.diversity.mu_var
 .. autofunction:: pg_gpu.diversity.mu_sfs
@@ -139,7 +134,6 @@ EHH and Haplotype Homozygosity
 .. autofunction:: pg_gpu.selection.ehh_decay
 .. autofunction:: pg_gpu.selection.garud_h
 .. autofunction:: pg_gpu.selection.moving_garud_h
-.. autofunction:: pg_gpu.selection.garud_h_diploid
 
 Standardization
 ~~~~~~~~~~~~~~~
@@ -235,6 +229,7 @@ Distance Distribution Statistics
 
 .. autofunction:: pg_gpu.distance_stats.pairwise_diffs_haploid
 .. autofunction:: pg_gpu.distance_stats.pairwise_diffs_diploid
+.. autofunction:: pg_gpu.distance_stats.dist_moments
 .. autofunction:: pg_gpu.distance_stats.dist_var
 .. autofunction:: pg_gpu.distance_stats.dist_skew
 .. autofunction:: pg_gpu.distance_stats.dist_kurt
