@@ -89,6 +89,9 @@ Divergence Statistics
    fst = divergence.fst(h, 'pop1', 'pop2')
    dxy_val = divergence.dxy(h, 'pop1', 'pop2')
 
+   # Population Branch Statistic (3 populations)
+   pbs_vals = divergence.pbs(h, 'pop1', 'pop2', 'pop3', window_size=50)
+
 Selection Scans
 ~~~~~~~~~~~~~~~
 
@@ -151,6 +154,25 @@ Admixture / F-Statistics
    d, se, z, vb, vj = admixture.average_patterson_d(
        h, 'popA', 'popB', 'popC', 'popD', blen=100
    )
+
+PCA and Distance
+~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from pg_gpu import decomposition
+
+   # PCA (GPU-accelerated SVD)
+   coords, var_ratio = decomposition.pca(h, n_components=10)
+
+   # Randomized PCA (faster for large datasets)
+   coords, var_ratio = decomposition.randomized_pca(h, n_components=10)
+
+   # Pairwise genetic distance
+   dist = decomposition.pairwise_distance(h, metric='euclidean')
+
+   # PCoA from distance matrix
+   coords, var_ratio = decomposition.pcoa(dist)
 
 Missing Data
 ~~~~~~~~~~~~

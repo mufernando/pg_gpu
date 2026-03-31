@@ -5,6 +5,7 @@ This module provides efficient computation of population divergence metrics
 including FST, Dxy, and related statistics using GPU acceleration.
 """
 
+import numpy as np
 import cupy as cp
 from typing import Union, Tuple, Optional, Dict
 from .haplotype_matrix import HaplotypeMatrix
@@ -831,3 +832,133 @@ def _get_population_indices(haplotype_matrix: HaplotypeMatrix,
         return haplotype_matrix.sample_sets[pop]
     else:
         return list(pop)
+
+
+def _pop_allele_counts(haplotype_matrix, pop):
+    """Compute per-variant allele counts for a population on GPU.
+
+    Returns (ac_0, ac_1, n) as CuPy arrays.
+    """
+    pop_idx = _get_population_indices(haplotype_matrix, pop)
+    h = haplotype_matrix.haplotypes[pop_idx, :]
+    h = cp.where(h < 0, 0, h)
+    n = cp.float64(len(pop_idx))
+    ac_1 = cp.sum(h, axis=0).astype(cp.float64)
+    ac_0 = n - ac_1
+    return ac_0, ac_1, n
+
+
+def _hudson_fst_from_counts(ac1_0, ac1_1, n1, ac2_0, ac2_1, n2):
+    """Compute per-variant Hudson FST num/den from precomputed allele counts.
+
+    Returns (num, den) as numpy arrays.
+    """
+    n1_pairs = n1 * (n1 - 1) / 2
+    n1_same = (ac1_0 * (ac1_0 - 1) + ac1_1 * (ac1_1 - 1)) / 2
+    mpd1 = cp.where(n1_pairs > 0, (n1_pairs - n1_same) / n1_pairs, 0.0)
+
+    n2_pairs = n2 * (n2 - 1) / 2
+    n2_same = (ac2_0 * (ac2_0 - 1) + ac2_1 * (ac2_1 - 1)) / 2
+    mpd2 = cp.where(n2_pairs > 0, (n2_pairs - n2_same) / n2_pairs, 0.0)
+
+    within = (mpd1 + mpd2) / 2.0
+
+    n_between = n1 * n2
+    n_between_same = ac1_0 * ac2_0 + ac1_1 * ac2_1
+    between = cp.where(n_between > 0,
+                       (n_between - n_between_same) / n_between, 0.0)
+
+    return (between - within).get(), between.get()
+
+
+def _windowed_fst(num, den, size, start=0, stop=None, step=None):
+    """Compute windowed FST from per-variant numerator/denominator."""
+    n = len(num)
+    if stop is None:
+        stop = n
+    if step is None:
+        step = size
+
+    fst_vals = []
+    for w_start in range(start, stop - size + 1, step):
+        w_end = w_start + size
+        den_sum = np.nansum(den[w_start:w_end])
+        if den_sum != 0:
+            fst_vals.append(np.nansum(num[w_start:w_end]) / den_sum)
+        else:
+            fst_vals.append(np.nan)
+
+    return np.array(fst_vals)
+
+
+def pbs(haplotype_matrix: HaplotypeMatrix,
+        pop1: Union[str, list],
+        pop2: Union[str, list],
+        pop3: Union[str, list],
+        window_size: int,
+        window_start: int = 0,
+        window_stop: Optional[int] = None,
+        window_step: Optional[int] = None,
+        normed: bool = True):
+    """Compute the Population Branch Statistic (PBS).
+
+    PBS detects genomic regions unusually differentiated in pop1 relative
+    to pop2 and pop3, using pairwise Hudson FST estimates.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+        Haplotype data containing all three populations.
+    pop1, pop2, pop3 : str or list
+        Population names or sample indices.
+    window_size : int
+        Number of variants per window.
+    window_start : int, optional
+        Starting variant index.
+    window_stop : int, optional
+        Stopping variant index.
+    window_step : int, optional
+        Stride between windows. Defaults to window_size (non-overlapping).
+    normed : bool, optional
+        If True (default), return normalized PBS (PBSn1).
+
+    Returns
+    -------
+    ndarray, float64, shape (n_windows,)
+        PBS values per window.
+    """
+    if haplotype_matrix.device == 'CPU':
+        haplotype_matrix.transfer_to_gpu()
+
+    # precompute allele counts once per population
+    ac1_0, ac1_1, n1 = _pop_allele_counts(haplotype_matrix, pop1)
+    ac2_0, ac2_1, n2 = _pop_allele_counts(haplotype_matrix, pop2)
+    ac3_0, ac3_1, n3 = _pop_allele_counts(haplotype_matrix, pop3)
+
+    # compute all three pairwise FST num/den from shared counts
+    num12, den12 = _hudson_fst_from_counts(ac1_0, ac1_1, n1, ac2_0, ac2_1, n2)
+    num13, den13 = _hudson_fst_from_counts(ac1_0, ac1_1, n1, ac3_0, ac3_1, n3)
+    num23, den23 = _hudson_fst_from_counts(ac2_0, ac2_1, n2, ac3_0, ac3_1, n3)
+
+    fst12 = _windowed_fst(num12, den12, window_size, window_start,
+                          window_stop, window_step)
+    fst13 = _windowed_fst(num13, den13, window_size, window_start,
+                          window_stop, window_step)
+    fst23 = _windowed_fst(num23, den23, window_size, window_start,
+                          window_stop, window_step)
+
+    np.clip(fst12, 0, 0.99999, out=fst12)
+    np.clip(fst13, 0, 0.99999, out=fst13)
+    np.clip(fst23, 0, 0.99999, out=fst23)
+
+    t12 = -np.log(1 - fst12)
+    t13 = -np.log(1 - fst13)
+    t23 = -np.log(1 - fst23)
+
+    ret = (t12 + t13 - t23) / 2
+
+    if normed:
+        norm = 1 + (t12 + t13 + t23) / 2
+        ret = ret / norm
+
+    return ret

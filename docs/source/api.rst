@@ -102,6 +102,7 @@ Convenience Functions
 
 .. autofunction:: pg_gpu.divergence.divergence_stats
 .. autofunction:: pg_gpu.divergence.pairwise_fst
+.. autofunction:: pg_gpu.divergence.pbs
 
 Selection Scan Statistics
 -------------------------
@@ -177,3 +178,18 @@ Block-Jackknife Averaged
 
 .. autofunction:: pg_gpu.admixture.average_patterson_f3
 .. autofunction:: pg_gpu.admixture.average_patterson_d
+
+Dimensionality Reduction and Distance
+--------------------------------------
+
+PCA
+~~~
+
+.. autofunction:: pg_gpu.decomposition.pca
+.. autofunction:: pg_gpu.decomposition.randomized_pca
+
+Distance
+~~~~~~~~
+
+.. autofunction:: pg_gpu.decomposition.pairwise_distance
+.. autofunction:: pg_gpu.decomposition.pcoa

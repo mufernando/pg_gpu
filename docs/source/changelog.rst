@@ -48,6 +48,17 @@ New Functions
   - ``heterozygosity_observed()`` - Observed heterozygosity (diploid)
   - ``inbreeding_coefficient()`` - Wright's F per variant
 
+* **Divergence Statistics**
+
+  - ``pbs()`` - Population Branch Statistic (normalized PBSn1)
+
+* **Dimensionality Reduction** (``pg_gpu.decomposition``)
+
+  - ``pca()`` - GPU-accelerated PCA via SVD (up to 56x faster than allel)
+  - ``randomized_pca()`` - Truncated SVD approximation for large datasets
+  - ``pairwise_distance()`` - GPU-accelerated with memory-safe batching
+  - ``pcoa()`` - Principal Coordinate Analysis
+
 Infrastructure
 ~~~~~~~~~~~~~~
 

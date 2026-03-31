@@ -125,6 +125,44 @@ SFS and Admixture
    )
    print(f"D = {d:.4f}, SE = {se:.4f}, Z = {z:.2f}")
 
+PBS (Population Branch Statistic)
+---------------------------------
+
+.. code-block:: python
+
+   from pg_gpu import divergence
+
+   # Detect selection in pop1 relative to pop2 and pop3
+   pbs_vals = divergence.pbs(h, "pop1", "pop2", "pop3", window_size=50)
+
+   # Un-normalized PBS
+   pbs_raw = divergence.pbs(h, "pop1", "pop2", "pop3",
+                            window_size=50, normed=False)
+
+PCA and Dimensionality Reduction
+---------------------------------
+
+.. code-block:: python
+
+   from pg_gpu import decomposition
+
+   # GPU-accelerated PCA (up to 56x faster than allel)
+   coords, var_ratio = decomposition.pca(h, n_components=10,
+                                          scaler='patterson')
+
+   # Randomized PCA for very large datasets
+   coords, var_ratio = decomposition.randomized_pca(
+       h, n_components=10, random_state=42)
+
+   # Pairwise genetic distance (batched for memory safety)
+   dist = decomposition.pairwise_distance(h, metric='euclidean')
+
+   # PCoA from distance matrix
+   coords, var_ratio = decomposition.pcoa(dist, n_components=5)
+
+   # Population-specific PCA
+   coords_ceu, _ = decomposition.pca(h, n_components=5, population="CEU")
+
 Missing Data
 ------------
 
