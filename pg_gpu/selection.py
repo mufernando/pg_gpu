@@ -11,6 +11,7 @@ import numpy as np
 import cupy as cp
 from typing import Union, Optional, Tuple
 from .haplotype_matrix import HaplotypeMatrix
+from ._utils import get_population_matrix as _get_population_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +130,13 @@ def garud_h(haplotype_matrix: HaplotypeMatrix,
         matrix.transfer_to_gpu()
 
     hap = matrix.haplotypes  # (n_haplotypes, n_variants)
-    n_hap = hap.shape[0]
 
-    # compute distinct haplotype frequencies
-    f = _distinct_haplotype_frequencies_gpu(hap)
+    f = _distinct_haplotype_frequencies(hap)
 
-    h1 = float(cp.sum(f ** 2).get())
-    h12 = float((cp.sum(f[:2]) ** 2 + cp.sum(f[2:] ** 2)).get())
-    h123 = float((cp.sum(f[:3]) ** 2 + cp.sum(f[3:] ** 2)).get())
-    h2 = h1 - float((f[0] ** 2).get())
+    h1 = float(np.sum(f ** 2))
+    h12 = float(np.sum(f[:2]) ** 2 + np.sum(f[2:] ** 2))
+    h123 = float(np.sum(f[:3]) ** 2 + np.sum(f[3:] ** 2))
+    h2 = h1 - float(f[0] ** 2)
     h2_h1 = h2 / h1 if h1 > 0 else 0.0
 
     return h1, h12, h123, h2_h1
@@ -193,11 +192,11 @@ def moving_garud_h(haplotype_matrix: HaplotypeMatrix,
     for w_start in range(start, stop - size + 1, step):
         w_end = w_start + size
         hap_window = hap[:, w_start:w_end]
-        f = _distinct_haplotype_frequencies_gpu(hap_window)
-        _h1 = float(cp.sum(f ** 2).get())
-        _h12 = float((cp.sum(f[:2]) ** 2 + cp.sum(f[2:] ** 2)).get())
-        _h123 = float((cp.sum(f[:3]) ** 2 + cp.sum(f[3:] ** 2)).get())
-        _h2 = _h1 - float((f[0] ** 2).get())
+        f = _distinct_haplotype_frequencies(hap_window)
+        _h1 = float(np.sum(f ** 2))
+        _h12 = float(np.sum(f[:2]) ** 2 + np.sum(f[2:] ** 2))
+        _h123 = float(np.sum(f[:3]) ** 2 + np.sum(f[3:] ** 2))
+        _h2 = _h1 - float(f[0] ** 2)
         _h2_h1 = _h2 / _h1 if _h1 > 0 else 0.0
         results.append((_h1, _h12, _h123, _h2_h1))
 
@@ -377,8 +376,8 @@ def ihs(haplotype_matrix: HaplotypeMatrix,
     ihh0 = ihh0_fwd + ihh0_rev
     ihh1 = ihh1_fwd + ihh1_rev
 
-    score = cp.log(ihh1 / ihh0)
-    return score.get()
+    score = np.log(ihh1 / ihh0)
+    return score
 
 
 def xpehh(haplotype_matrix: HaplotypeMatrix,
@@ -454,8 +453,8 @@ def xpehh(haplotype_matrix: HaplotypeMatrix,
     ihh1 = ihh1_fwd + ihh1_rev
     ihh2 = ihh2_fwd + ihh2_rev
 
-    score = cp.log(ihh1 / ihh2)
-    return score.get()
+    score = np.log(ihh1 / ihh2)
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -510,36 +509,10 @@ def ehh_decay(haplotype_matrix: HaplotypeMatrix,
 
 
 # ---------------------------------------------------------------------------
-# Private helpers: population extraction
-# ---------------------------------------------------------------------------
-
-def _get_population_matrix(haplotype_matrix: HaplotypeMatrix,
-                           population: Union[str, list]) -> HaplotypeMatrix:
-    """Extract a population-specific HaplotypeMatrix."""
-    if isinstance(population, str):
-        if haplotype_matrix.sample_sets is None:
-            raise ValueError("No sample_sets defined in haplotype matrix")
-        if population not in haplotype_matrix.sample_sets:
-            raise ValueError(f"Population {population} not found in sample_sets")
-        pop_indices = haplotype_matrix.sample_sets[population]
-    else:
-        pop_indices = list(population)
-
-    pop_haplotypes = haplotype_matrix.haplotypes[pop_indices, :]
-    return HaplotypeMatrix(
-        pop_haplotypes,
-        haplotype_matrix.positions,
-        haplotype_matrix.chrom_start,
-        haplotype_matrix.chrom_end,
-        sample_sets={'all': list(range(len(pop_indices)))}
-    )
-
-
-# ---------------------------------------------------------------------------
 # Private helpers: haplotype frequency computation (for Garud's H)
 # ---------------------------------------------------------------------------
 
-def _distinct_haplotype_frequencies_gpu(hap):
+def _distinct_haplotype_frequencies(hap):
     """Compute distinct haplotype frequencies, sorted descending.
 
     Parameters
@@ -548,23 +521,17 @@ def _distinct_haplotype_frequencies_gpu(hap):
 
     Returns
     -------
-    freqs : cupy.ndarray, float64, sorted descending
+    freqs : ndarray, float64, sorted descending (CPU)
     """
     n_hap = hap.shape[0]
-
-    # hash each haplotype row to a single value for grouping
-    # use a polynomial rolling hash with a large prime base
-    n_var = hap.shape[1]
-    # transfer to CPU for unique row counting (cupy unique with axis is limited)
     hap_cpu = hap.get().astype(np.int8)
 
-    # pack haplotype rows into byte strings for fast comparison
     hap_bytes = np.array([row.tobytes() for row in hap_cpu])
-    unique, counts = np.unique(hap_bytes, return_counts=True)
+    _, counts = np.unique(hap_bytes, return_counts=True)
 
     freqs = counts / n_hap
-    freqs = np.sort(freqs)[::-1]  # descending
-    return cp.asarray(freqs.astype(np.float64))
+    freqs = np.sort(freqs)[::-1]
+    return freqs
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +952,7 @@ def _ihh01_scan_gpu(h, gaps, min_ehh=0.05, min_maf=0.05,
         vihh1[i] = _ssl_hist_to_ihh(hist_11_cpu[i], n11, i, gaps_cpu,
                                      min_ehh, include_edges)
 
-    return cp.asarray(vihh0), cp.asarray(vihh1)
+    return vihh0, vihh1
 
 
 def _ihh_scan_gpu(h, gaps, min_ehh=0.05, include_edges=False):
@@ -1027,7 +994,7 @@ def _ihh_scan_gpu(h, gaps, min_ehh=0.05, include_edges=False):
         vihh[i] = _ssl_hist_to_ihh(hist_cpu[i], n_pairs, i, gaps_cpu,
                                     min_ehh, include_edges)
 
-    return cp.asarray(vihh)
+    return vihh
 
 
 # ---------------------------------------------------------------------------
