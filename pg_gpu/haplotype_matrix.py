@@ -21,12 +21,13 @@ class HaplotypeMatrix:
         chrom_start (int): Chromosome start position.
         chrom_end (int): Chromosome end position.
     """
-    def __init__(self, 
+    def __init__(self,
                  genotypes, # either a numpy array or a cupy array
                  positions, # either a numpy array or a cupy array
                  chrom_start: int = None,
                  chrom_end: int = None,
-                 sample_sets: dict = None  # new optional parameter for population sample sets
+                 sample_sets: dict = None,  # new optional parameter for population sample sets
+                 n_total_sites: int = None  # total callable sites (variant + invariant)
                 ):
         # test for empty genotypes
         if genotypes.size == 0:
@@ -39,7 +40,7 @@ class HaplotypeMatrix:
             raise ValueError("genotypes must be a numpy or cupy array")
         if not isinstance(positions, np.ndarray) and not isinstance(positions, cp.ndarray):
             raise ValueError("positions must be a numpy or cupy array")
-        
+
         # Determine device based on genotypes.
         # transfer positions if necessary
         if isinstance(genotypes, cp.ndarray):
@@ -50,13 +51,14 @@ class HaplotypeMatrix:
             self._device = 'CPU'
             if isinstance(positions, cp.ndarray):
                 positions = positions.get()
-       
+
         # set attributes
         self.haplotypes = genotypes
         self.positions = positions
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets  # store the sample set info (optional)
+        self.n_total_sites = n_total_sites  # total callable sites for pairwise mode
 
     @property
     def device(self):
@@ -91,6 +93,32 @@ class HaplotypeMatrix:
                 raise ValueError("values in sample_sets must be lists")
         self._sample_sets = sample_sets
 
+    @property
+    def has_invariant_info(self):
+        """Whether invariant site information is available for pairwise mode."""
+        return self.n_total_sites is not None
+
+    @property
+    def n_invariant_sites(self):
+        """Number of invariant (monomorphic) sites, or None if unknown.
+
+        If n_total_sites is set, computes as n_total_sites minus the number of
+        segregating sites in the matrix. If invariant sites are stored directly
+        in the matrix, counts sites where all valid alleles are identical.
+        """
+        if self.n_total_sites is None:
+            return None
+        xp = cp if self.device == 'GPU' else np
+        hap = self.haplotypes
+        valid_mask = hap >= 0
+        hap_clean = xp.where(valid_mask, hap, 0)
+        derived_counts = xp.sum(hap_clean, axis=0)
+        n_valid = xp.sum(valid_mask, axis=0)
+        # A site is variant if 0 < derived < n_valid (i.e. polymorphic among observed)
+        is_variant = (derived_counts > 0) & (derived_counts < n_valid) & (n_valid >= 2)
+        n_variant = int(xp.sum(is_variant))
+        return self.n_total_sites - n_variant
+
     def transfer_to_gpu(self):
         """Transfer data from CPU to GPU."""
         if self.device == 'CPU':
@@ -106,13 +134,17 @@ class HaplotypeMatrix:
             self._device = 'CPU'
 
     @classmethod
-    def from_vcf(cls, path: str):
+    def from_vcf(cls, path: str, include_invariant: bool = False):
         """
         Construct a HaplotypeMatrix from a VCF file.
-        
+
         Parameters:
             path (str): The file path to the VCF file.
-            
+            include_invariant (bool): If True, include invariant (monomorphic)
+                sites from the VCF. The resulting matrix will have n_total_sites
+                set to the total number of loaded sites. Requires the VCF to
+                contain invariant sites (ALT=".").
+
         Returns:
             HaplotypeMatrix: An instance created from the VCF data.
             Assumes that the VCF is phased.
@@ -121,33 +153,41 @@ class HaplotypeMatrix:
         vcf = allel.read_vcf(path)
         genotypes = allel.GenotypeArray(vcf['calldata/GT'])
         num_variants, num_samples, ploidy = genotypes.shape
-        
+
         # assert that the ploidy is 2
         assert ploidy == 2
-       
+
         # convert to haplotype matrix
         haplotypes = np.empty((num_variants, 2*num_samples), dtype=genotypes.dtype)
         # fill the haplotypes array
         haplotypes[:, 0:num_samples] = genotypes[:, :, 0]  # First allele for all variants
         haplotypes[:, num_samples:2*num_samples] = genotypes[:, :, 1]  # Second allele for all variants
-       
+
         # transpose the haplotypes array
         haplotypes = haplotypes.T
-        positions = np.array(vcf['variants/POS'])   
-        
+        positions = np.array(vcf['variants/POS'])
+
         # get the chromosome start and end
         chrom_start = positions[0]
         chrom_end = positions[-1]
-        return cls(haplotypes, positions, chrom_start, chrom_end)
+
+        n_total_sites = num_variants if include_invariant else None
+        return cls(haplotypes, positions, chrom_start, chrom_end,
+                   n_total_sites=n_total_sites)
 
     @classmethod
-    def from_ts(cls, ts: tskit.TreeSequence, device: str = 'CPU') -> 'HaplotypeMatrix':
+    def from_ts(cls, ts: tskit.TreeSequence, device: str = 'CPU',
+                include_invariant: bool = False) -> 'HaplotypeMatrix':
         """
         Create a HaplotypeMatrix from a tskit.TreeSequence.
-        
+
         Args:
             ts: A tskit.TreeSequence object
-            
+            device: 'CPU' or 'GPU'
+            include_invariant: If True, set n_total_sites from the sequence
+                length so that pairwise-mode calculations can account for
+                invariant sites analytically (no extra rows stored).
+
         Returns:
             HaplotypeMatrix: A new HaplotypeMatrix instance
         """
@@ -161,8 +201,10 @@ class HaplotypeMatrix:
             # Convert to CuPy arrays
             haplotypes = cp.array(haplotypes)
             positions = cp.array(positions)
-        
-        return cls(haplotypes, positions, chrom_start, chrom_end)
+
+        n_total_sites = int(ts.sequence_length) if include_invariant else None
+        return cls(haplotypes, positions, chrom_start, chrom_end,
+                   n_total_sites=n_total_sites)
 
     def get_matrix(self) -> cp.ndarray:
         """
@@ -257,6 +299,7 @@ class HaplotypeMatrix:
             result.chrom_end = self.chrom_end
             result._sample_sets = self._sample_sets
             result._device = self._device
+            result.n_total_sites = None
             return result
         
         if not (positions >= 0).all() or not (positions < self.haplotypes.shape[1]).all():

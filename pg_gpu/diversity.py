@@ -6,24 +6,89 @@ metrics including nucleotide diversity (π), Watterson's theta, Tajima's D, and
 related statistics.
 """
 
+import warnings
+from collections import namedtuple
+
 import numpy as np
 import cupy as cp
 from typing import Union, Optional, Dict, Tuple
 from .haplotype_matrix import HaplotypeMatrix
 from ._utils import get_population_matrix
 
+PairwiseResult = namedtuple(
+    'PairwiseResult',
+    ['value', 'total_diffs', 'total_comps', 'total_missing', 'n_sites'])
+
+
+def _pairwise_pi_components(haplotypes, n_total_sites=None, n_haplotypes_full=None):
+    """Compute pairwise differences and comparisons across all sites.
+
+    Parameters
+    ----------
+    haplotypes : cp.ndarray, shape (n_haplotypes, n_variants)
+        Haplotype data with -1 for missing.
+    n_total_sites : int, optional
+        Total callable sites (variant + invariant). If provided, invariant
+        sites contribute 0 diffs and C(n_haplotypes_full, 2) comps each.
+    n_haplotypes_full : int, optional
+        Full sample size (used for invariant site comps). Required when
+        n_total_sites is set. Defaults to haplotypes.shape[0].
+
+    Returns
+    -------
+    total_diffs : float
+    total_comps : float
+    total_missing : float
+    n_sites : int
+    """
+    valid_mask = haplotypes >= 0
+    n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)  # per site
+
+    hap_clean = cp.where(valid_mask, haplotypes, 0)
+    derived = cp.sum(hap_clean, axis=0).astype(cp.float64)
+    ancestral = n_valid - derived
+
+    # Per-site: diffs = derived * ancestral (number of mismatched pairs)
+    site_diffs = derived * ancestral
+    # Per-site: comps = C(n_valid, 2)
+    site_comps = n_valid * (n_valid - 1) / 2.0
+
+    # Only count sites with >= 2 valid samples
+    usable = n_valid >= 2
+    total_diffs = float(cp.sum(site_diffs[usable]).get())
+    total_comps = float(cp.sum(site_comps[usable]).get())
+    n_sites = int(cp.sum(usable).get())
+
+    # Invariant site contribution
+    if n_total_sites is not None:
+        n_full = n_haplotypes_full or haplotypes.shape[0]
+        n_invariant = n_total_sites - n_sites
+        if n_invariant > 0:
+            invariant_comps = n_invariant * (n_full * (n_full - 1) / 2.0)
+            total_comps += invariant_comps
+            n_sites += n_invariant
+
+    # Total possible comparisons (for missing count)
+    n_full = n_haplotypes_full or haplotypes.shape[0]
+    possible_per_site = n_full * (n_full - 1) / 2.0
+    total_possible = possible_per_site * n_sites
+    total_missing = total_possible - total_comps
+
+    return total_diffs, total_comps, total_missing, n_sites
+
 
 def pi(haplotype_matrix: HaplotypeMatrix,
        population: Optional[Union[str, list]] = None,
        span_normalize: bool = True,
        missing_data: str = 'ignore',
-       span_denominator: str = 'total') -> float:
+       span_denominator: str = 'total',
+       return_components: bool = False) -> Union[float, 'PairwiseResult']:
     """
-    Calculate nucleotide diversity (π) for a population.
-    
+    Calculate nucleotide diversity (pi) for a population.
+
     Nucleotide diversity is the average number of nucleotide differences
     per site between two randomly chosen sequences from the population.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -36,89 +101,111 @@ def pi(haplotype_matrix: HaplotypeMatrix,
         'include' - Use all sites, calculate pi from available data per site
         'exclude' - Only use sites with no missing data
         'ignore' - Treat missing as reference allele (original behavior)
+        'pairwise' - Comparison-counting normalization (pixy-style):
+            pi = sum(diffs) / sum(comps) across all sites.
+            Sites with more observed data contribute proportionally more.
+            Invariant sites are included in the denominator when available.
     span_denominator : str
         'total' - Use total genomic span (chrom_end - chrom_start)
         'sites' - Use number of sites analyzed
         'callable' - Use span from first to last site included in analysis
-        
+    return_components : bool
+        If True, return a PairwiseResult namedtuple with component statistics
+        (value, total_diffs, total_comps, total_missing, n_sites).
+        Only meaningful for 'pairwise' mode.
+
     Returns
     -------
-    float
-        Nucleotide diversity value
+    float or PairwiseResult
+        Nucleotide diversity value, or components if return_components=True
     """
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
         matrix = haplotype_matrix
-    
+
     # Ensure on GPU
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
-    
+
     # Handle missing data strategies
     if missing_data == 'exclude':
         # Filter to sites with no missing data
         missing_per_variant = matrix.count_missing(axis=0)
         valid_sites = cp.where(missing_per_variant == 0)[0]
-        
+
         if len(valid_sites) == 0:
-            return 0.0  # No valid sites
-            
+            return PairwiseResult(0.0, 0, 0, 0, 0) if return_components else 0.0
+
         # Create subset with only valid sites
         matrix = matrix.get_subset(valid_sites)
-    
+
+    if missing_data == 'pairwise':
+        if not matrix.has_invariant_info:
+            warnings.warn(
+                "No invariant site information available (n_total_sites not set). "
+                "Pairwise-mode pi will be computed from variant sites only and "
+                "may overestimate diversity. Use include_invariant=True when "
+                "loading data to correct this.",
+                stacklevel=2)
+        total_diffs, total_comps, total_missing, n_sites = _pairwise_pi_components(
+            matrix.haplotypes,
+            n_total_sites=matrix.n_total_sites,
+            n_haplotypes_full=matrix.num_haplotypes)
+        pi_value = total_diffs / total_comps if total_comps > 0 else float('nan')
+        if return_components:
+            return PairwiseResult(pi_value, total_diffs, total_comps,
+                                 total_missing, n_sites)
+        return pi_value
+
     if missing_data == 'ignore':
         # Original behavior - use standard AFS calculation
         afs = allele_frequency_spectrum(matrix, missing_data='ignore')
         n_haplotypes = matrix.num_haplotypes
-        
+
         i = cp.arange(1, n_haplotypes, dtype=cp.float64)
         weight = (2 * i * (n_haplotypes - i)) / (n_haplotypes * (n_haplotypes - 1))
         pi_value = cp.sum((weight * afs[1:n_haplotypes]).astype(cp.float64))
-        
+
     else:  # missing_data == 'include'
         # Calculate pi per site using only non-missing data at each site (vectorized)
         haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
-        
+
         # Create mask for valid (non-missing) data
         valid_mask = haplotypes >= 0  # shape: (n_haplotypes, n_variants)
-        
+
         # Count valid samples per site
         n_valid_per_site = cp.sum(valid_mask, axis=0)  # shape: (n_variants,)
-        
+
         # Only consider sites with at least 2 valid samples
         sites_with_data = n_valid_per_site >= 2
-        
+
         if not cp.any(sites_with_data):
             pi_value = cp.float64(0.0)
         else:
             # For each site, count derived alleles among valid samples
             # Set missing data to 0 for counting, but use valid_mask to exclude from counts
             hap_clean = cp.where(valid_mask, haplotypes, 0)
-            
+
             # Count derived alleles per site (only among valid samples)
             derived_counts = cp.sum(hap_clean, axis=0)  # shape: (n_variants,)
-            
-            # Calculate allele frequencies and pi for each site
-            # For biallelic sites: freq_0 = (n_valid - derived) / n_valid, freq_1 = derived / n_valid
-            # pi = 2 * freq_0 * freq_1 * n_valid / (n_valid - 1)
-            
+
             # Only compute for sites with valid data
             valid_sites = cp.where(sites_with_data)[0]
             n_valid = n_valid_per_site[valid_sites].astype(cp.float64)
             derived = derived_counts[valid_sites].astype(cp.float64)
-            
+
             # Calculate frequencies
             freq_derived = derived / n_valid
             freq_ancestral = (n_valid - derived) / n_valid
-            
+
             # Calculate pi per site with Nei's correction
             site_pi = 2 * freq_ancestral * freq_derived * n_valid / (n_valid - 1)
-            
+
             # Sum across all valid sites
             pi_value = cp.sum(site_pi)
-    
+
     # Apply span normalization
     if span_normalize:
         span = matrix.get_span(span_denominator)
@@ -126,7 +213,7 @@ def pi(haplotype_matrix: HaplotypeMatrix,
             return float(pi_value / span)
         else:
             return float('nan')
-    
+
     return float(pi_value.get() if hasattr(pi_value, 'get') else pi_value)
 
 
@@ -134,13 +221,14 @@ def theta_w(haplotype_matrix: HaplotypeMatrix,
             population: Optional[Union[str, list]] = None,
             span_normalize: bool = True,
             missing_data: str = 'ignore',
-            span_denominator: str = 'total') -> float:
+            span_denominator: str = 'total',
+            return_components: bool = False) -> Union[float, 'PairwiseResult']:
     """
     Calculate Watterson's theta for a population.
-    
+
     Watterson's theta is an estimator of the population mutation rate based
     on the number of segregating sites.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -153,14 +241,19 @@ def theta_w(haplotype_matrix: HaplotypeMatrix,
         'include' - Use all sites, calculate from available data per site
         'exclude' - Only use sites with no missing data
         'ignore' - Treat missing as reference allele (original behavior)
+        'pairwise' - Per-site 1/a(n_i) for segregating sites, normalized
+            by n_total_sites when invariant info is available.
     span_denominator : str
         'total' - Use total genomic span (chrom_end - chrom_start)
         'sites' - Use number of sites analyzed
         'callable' - Use span from first to last site included in analysis
-        
+    return_components : bool
+        If True, return PairwiseResult with raw_theta as total_diffs and
+        n_total_sites as total_comps. Only meaningful for 'pairwise' mode.
+
     Returns
     -------
-    float
+    float or PairwiseResult
         Watterson's theta value
     """
     # Get population subset if specified
@@ -173,27 +266,63 @@ def theta_w(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
     
+    # Pairwise mode: per-site 1/a(n_i) for segregating sites
+    if missing_data == 'pairwise':
+        if not matrix.has_invariant_info:
+            warnings.warn(
+                "No invariant site information available (n_total_sites not set). "
+                "Pairwise-mode theta_w will be computed from variant sites only.",
+                stacklevel=2)
+        haplotypes = matrix.haplotypes
+        valid_mask = haplotypes >= 0
+        n_valid_per_site = cp.sum(valid_mask, axis=0)
+        sites_with_data = n_valid_per_site >= 2
+        hap_clean = cp.where(valid_mask, haplotypes, 0)
+        derived_counts = cp.sum(hap_clean, axis=0)
+
+        # Identify segregating sites
+        seg_mask = sites_with_data & (derived_counts > 0) & (derived_counts < n_valid_per_site)
+        if not cp.any(seg_mask):
+            raw_theta = 0.0
+        else:
+            seg_n_valid = n_valid_per_site[seg_mask]
+            unique_n = cp.unique(seg_n_valid)
+            theta_sum = 0.0
+            for n in unique_n:
+                count_with_n = int(cp.sum(seg_n_valid == n).get())
+                a1 = float(cp.sum(1.0 / cp.arange(1, int(n), dtype=cp.float64)).get())
+                theta_sum += count_with_n / a1
+            raw_theta = theta_sum
+
+        n_sites = matrix.n_total_sites if matrix.has_invariant_info else int(cp.sum(sites_with_data).get())
+        theta_value = raw_theta / n_sites if n_sites > 0 else float('nan')
+
+        if return_components:
+            S = int(cp.sum(seg_mask).get())
+            return PairwiseResult(theta_value, raw_theta, n_sites, 0, S)
+        return theta_value
+
     # Handle missing data strategies
     if missing_data == 'exclude':
         # Filter to sites with no missing data
         missing_per_variant = matrix.count_missing(axis=0)
         valid_sites = cp.where(missing_per_variant == 0)[0]
-        
+
         if len(valid_sites) == 0:
-            return 0.0  # No valid sites
-            
+            return PairwiseResult(0.0, 0, 0, 0, 0) if return_components else 0.0
+
         # Create subset with only valid sites
         matrix = matrix.get_subset(valid_sites)
         n_haplotypes = matrix.num_haplotypes
-        
+
         # Count segregating sites in the filtered data
         seg_sites = segregating_sites(matrix, missing_data='exclude')
-        
+
     elif missing_data == 'ignore':
         # Original behavior
         n_haplotypes = matrix.num_haplotypes
         seg_sites = segregating_sites(matrix, missing_data='ignore')
-        
+
     else:  # missing_data == 'include'
         # Calculate theta using site-specific sample sizes (vectorized)
         haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
@@ -295,54 +424,111 @@ def tajimas_d(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
     
+    if missing_data == 'pairwise':
+        # Pairwise Tajima's D: use raw pairwise pi and per-site theta_w
+        # with harmonic mean of sample sizes for variance terms
+        haplotypes = matrix.haplotypes
+        valid_mask = haplotypes >= 0
+        n_valid_per_site = cp.sum(valid_mask, axis=0)
+        sites_with_data = n_valid_per_site >= 2
+        if not cp.any(sites_with_data):
+            return float("nan")
+
+        # Raw pairwise pi (sum of diffs / sum of comps, then multiply by comps
+        # to get raw count-equivalent; or just use raw diffs directly)
+        total_diffs, total_comps, _, _ = _pairwise_pi_components(
+            haplotypes, n_total_sites=None)  # no invariant correction for D
+        if total_comps == 0:
+            return float("nan")
+        # pi in "number of differences" scale: diffs/comps * C(n_mean, 2)
+        # But Tajima's D uses raw pi = sum of per-site heterozygosity
+        # Use the 'include'-style raw pi for consistency with theta_w
+        pi_value = pi(matrix, span_normalize=False, missing_data='include')
+
+        # Harmonic mean of sample sizes for variance terms
+        valid_n = n_valid_per_site[sites_with_data]
+        n_haplotypes = float(len(valid_n) / cp.sum(1.0 / valid_n).get())
+
+        # Segregating sites
+        hap_clean = cp.where(valid_mask, haplotypes, 0)
+        derived_counts = cp.sum(hap_clean, axis=0)
+        seg_mask = sites_with_data & (derived_counts > 0) & (derived_counts < n_valid_per_site)
+        S = int(cp.sum(seg_mask).get())
+        if S == 0:
+            return float("nan")
+
+        # Raw theta_w using per-site sample sizes (same as 'include' mode)
+        seg_n_valid = n_valid_per_site[seg_mask]
+        unique_n = cp.unique(seg_n_valid)
+        theta_raw = 0.0
+        for n in unique_n:
+            count_with_n = int(cp.sum(seg_n_valid == n).get())
+            a1 = float(cp.sum(1.0 / cp.arange(1, int(n), dtype=cp.float64)).get())
+            theta_raw += count_with_n / a1
+
+        # Variance terms using harmonic mean n
+        n = n_haplotypes
+        a1 = sum(1.0 / i for i in range(1, int(round(n))))
+        a2 = sum(1.0 / (i ** 2) for i in range(1, int(round(n))))
+        b1 = (n + 1) / (3 * (n - 1))
+        b2 = 2 * (n**2 + n + 3) / (9 * n * (n - 1))
+        c1 = b1 - (1 / a1)
+        c2 = b2 - ((n + 2) / (a1 * n)) + (a2 / (a1 ** 2))
+        e1 = c1 / a1
+        e2 = c2 / ((a1 ** 2) + a2)
+        V = np.sqrt((e1 * S) + (e2 * S * (S - 1)))
+        if V == 0:
+            return float("nan")
+        return (pi_value - theta_raw) / V
+
     if missing_data == 'exclude':
         # Filter to sites with no missing data
         missing_per_variant = matrix.count_missing(axis=0)
         valid_sites = cp.where(missing_per_variant == 0)[0]
-        
+
         if len(valid_sites) == 0:
             return float("nan")  # No valid sites
-            
+
         # Create subset with only valid sites
         matrix = matrix.get_subset(valid_sites)
-    
+
     # Get pi and theta with consistent missing data handling
     pi_value = pi(matrix, span_normalize=False, missing_data=missing_data)
-    
+
     if missing_data == 'include':
         # For Tajima's D with missing data, we need to use an average sample size
         # Calculate the harmonic mean of sample sizes across sites
         n_valid_per_site = matrix.count_called(axis=0)
-        
+
         # Filter to sites with at least 2 samples
         valid_site_mask = n_valid_per_site >= 2
         if not cp.any(valid_site_mask):
             return float("nan")
-        
+
         # Harmonic mean of sample sizes
-        n_haplotypes = float(len(n_valid_per_site[valid_site_mask]) / 
+        n_haplotypes = float(len(n_valid_per_site[valid_site_mask]) /
                            cp.sum(1.0 / n_valid_per_site[valid_site_mask]).get())
-        
+
         # Count segregating sites considering missing data (vectorized)
         haplotypes = matrix.haplotypes
         valid_mask = haplotypes >= 0
         n_valid_per_site = cp.sum(valid_mask, axis=0)
-        
+
         # Only consider sites with at least 2 valid samples
         sites_with_data = n_valid_per_site >= 2
-        
+
         if not cp.any(sites_with_data):
             S = 0
         else:
             # Check which sites are segregating among valid samples
             hap_clean = cp.where(valid_mask, haplotypes, 0)
             derived_counts = cp.sum(hap_clean, axis=0)
-            
+
             # Filter to sites with valid data
             valid_sites = cp.where(sites_with_data)[0]
             n_valid_sites = n_valid_per_site[valid_sites]
             derived_sites = derived_counts[valid_sites]
-            
+
             # A site is segregating if 0 < derived_count < n_valid
             segregating_mask = (derived_sites > 0) & (derived_sites < n_valid_sites)
             S = int(cp.sum(segregating_mask).get())
@@ -402,16 +588,20 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
     cp.ndarray
         Array where element i contains the number of sites with i derived alleles
     """
+    # pairwise mode uses same per-site logic as include for AFS
+    if missing_data == 'pairwise':
+        missing_data = 'include'
+
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
         matrix = haplotype_matrix
-    
+
     # Ensure on GPU
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
-    
+
     if missing_data == 'exclude':
         # Filter to sites with no missing data
         missing_per_variant = matrix.count_missing(axis=0)
@@ -512,6 +702,10 @@ def segregating_sites(haplotype_matrix: HaplotypeMatrix,
     int
         Number of segregating sites
     """
+    # pairwise mode uses same per-site logic as include for counting
+    if missing_data == 'pairwise':
+        missing_data = 'include'
+
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
@@ -599,16 +793,20 @@ def singleton_count(haplotype_matrix: HaplotypeMatrix,
     int
         Number of singleton variants
     """
+    # pairwise mode uses same per-site logic as include for counting
+    if missing_data == 'pairwise':
+        missing_data = 'include'
+
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
         matrix = haplotype_matrix
-    
+
     # Ensure on GPU
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
-    
+
     if missing_data == 'exclude':
         # Only count singletons at sites with no missing data
         missing_per_variant = matrix.count_missing(axis=0)

@@ -138,24 +138,33 @@ class StatisticsComputer:
         
     def _categorize_statistics(self):
         """Categorize statistics by type for efficient computation."""
-        # Create statistics dictionaries with current parameters
+        _is_pairwise = self.missing_data == 'pairwise'
+
+        # In pairwise mode, pi and dxy return components for proper aggregation.
+        # For other modes span_normalize controls the denominator.
         self.SINGLE_POP_STATS = {
-            'pi': lambda w: diversity.pi(w.matrix, span_normalize=True, 
-                                       missing_data=self.missing_data, 
-                                       span_denominator=self.span_denominator),
-            'theta_w': lambda w: diversity.theta_w(w.matrix, span_normalize=True,
-                                                 missing_data=self.missing_data,
-                                                 span_denominator=self.span_denominator), 
+            'pi': lambda w: diversity.pi(
+                w.matrix, span_normalize=not _is_pairwise,
+                missing_data=self.missing_data,
+                span_denominator=self.span_denominator,
+                return_components=_is_pairwise),
+            'theta_w': lambda w: diversity.theta_w(
+                w.matrix, span_normalize=not _is_pairwise,
+                missing_data=self.missing_data,
+                span_denominator=self.span_denominator,
+                return_components=_is_pairwise),
             'tajimas_d': lambda w: diversity.tajimas_d(w.matrix, missing_data=self.missing_data),
             'n_variants': lambda w: w.n_variants,
             'n_singletons': lambda w: diversity.singleton_count(w.matrix, missing_data=self.missing_data),
             'segregating_sites': lambda w: diversity.segregating_sites(w.matrix, missing_data=self.missing_data),
         }
-        
+
         self.TWO_POP_STATS = {
-            'dxy': lambda w, p1, p2: divergence.dxy(w.matrix, p1, p2, 
-                                                  missing_data=self.missing_data,
-                                                  span_denominator=self.span_denominator == 'total'),
+            'dxy': lambda w, p1, p2: divergence.dxy(
+                w.matrix, p1, p2,
+                missing_data=self.missing_data,
+                span_denominator=self.span_denominator == 'total',
+                return_components=_is_pairwise),
             'fst': lambda w, p1, p2: divergence.fst(w.matrix, p1, p2, missing_data=self.missing_data),
             'fst_hudson': lambda w, p1, p2: divergence.fst_hudson(w.matrix, p1, p2, missing_data=self.missing_data),
             'fst_wc': lambda w, p1, p2: divergence.fst_weir_cockerham(w.matrix, p1, p2, missing_data=self.missing_data),
@@ -210,22 +219,25 @@ class StatisticsComputer:
                 # Compute for each population
                 for pop in self.populations:
                     pop_matrix = self._get_population_matrix(window.matrix, pop)
-                    results[f"{stat}_{pop}"] = self.SINGLE_POP_STATS[stat](
-                        WindowData(window.chrom, window.start, window.end, 
+                    val = self.SINGLE_POP_STATS[stat](
+                        WindowData(window.chrom, window.start, window.end,
                                  window.center, pop_matrix, pop_matrix.num_variants,
                                  window.window_id)
                     )
+                    key = f"{stat}_{pop}"
+                    self._store_result(results, key, val)
             else:
-                # Compute for all samples
-                results[stat] = self.SINGLE_POP_STATS[stat](window)
-        
+                val = self.SINGLE_POP_STATS[stat](window)
+                self._store_result(results, stat, val)
+
         # Two population statistics
         if len(self.populations) >= 2:
             for stat in self.two_pop_stats:
                 for i, pop1 in enumerate(self.populations):
                     for pop2 in self.populations[i+1:]:
                         key = f"{stat}_{pop1}_{pop2}"
-                        results[key] = self.TWO_POP_STATS[stat](window, pop1, pop2)
+                        val = self.TWO_POP_STATS[stat](window, pop1, pop2)
+                        self._store_result(results, key, val)
         
         # LD statistics
         for stat in self.ld_stats:
@@ -242,7 +254,20 @@ class StatisticsComputer:
             
         return results
     
-    def _get_population_matrix(self, matrix: HaplotypeMatrix, 
+    @staticmethod
+    def _store_result(results: Dict, key: str, val):
+        """Store a scalar or PairwiseResult into the results dict."""
+        from .diversity import PairwiseResult
+        if isinstance(val, PairwiseResult):
+            results[key] = val.value
+            results[f"{key}_diffs"] = val.total_diffs
+            results[f"{key}_comps"] = val.total_comps
+            results[f"{key}_missing"] = val.total_missing
+            results[f"{key}_n_sites"] = val.n_sites
+        else:
+            results[key] = val
+
+    def _get_population_matrix(self, matrix: HaplotypeMatrix,
                              pop: str) -> HaplotypeMatrix:
         """Extract population-specific haplotype matrix."""
         if pop not in matrix.sample_sets:
@@ -256,7 +281,8 @@ class StatisticsComputer:
             matrix.positions,
             matrix.chrom_start,
             matrix.chrom_end,
-            sample_sets={'all': list(range(len(pop_indices)))}
+            sample_sets={'all': list(range(len(pop_indices)))},
+            n_total_sites=matrix.n_total_sites
         )
 
 

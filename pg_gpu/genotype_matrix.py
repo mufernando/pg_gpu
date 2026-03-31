@@ -28,7 +28,7 @@ class GenotypeMatrix:
     """
 
     def __init__(self, genotypes, positions, chrom_start=None, chrom_end=None,
-                 sample_sets=None):
+                 sample_sets=None, n_total_sites=None):
         if genotypes.size == 0:
             raise ValueError("genotypes cannot be empty")
         if positions.size == 0:
@@ -48,6 +48,7 @@ class GenotypeMatrix:
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
+        self.n_total_sites = n_total_sites
 
     @property
     def device(self):
@@ -74,6 +75,28 @@ class GenotypeMatrix:
     @property
     def num_individuals(self):
         return self.genotypes.shape[0]
+
+    @property
+    def has_invariant_info(self):
+        """Whether invariant site information is available for pairwise mode."""
+        return self.n_total_sites is not None
+
+    @property
+    def n_invariant_sites(self):
+        """Number of invariant sites, or None if unknown."""
+        if self.n_total_sites is None:
+            return None
+        xp = cp if self.device == 'GPU' else np
+        geno = self.genotypes
+        valid_mask = geno >= 0
+        geno_clean = xp.where(valid_mask, geno, 0)
+        alt_counts = xp.sum(geno_clean, axis=0)
+        n_valid = xp.sum(valid_mask, axis=0)
+        # max possible alt count per site (diploid: 2 * n_valid)
+        max_alt = 2 * n_valid
+        is_variant = (alt_counts > 0) & (alt_counts < max_alt) & (n_valid >= 2)
+        n_variant = int(xp.sum(is_variant))
+        return self.n_total_sites - n_variant
 
     def __repr__(self):
         return (f"GenotypeMatrix(shape={self.shape}, "
@@ -140,7 +163,8 @@ class GenotypeMatrix:
                 new_sample_sets[name] = ind_indices
 
         return cls(geno, hap_matrix.positions, hap_matrix.chrom_start,
-                   hap_matrix.chrom_end, sample_sets=new_sample_sets)
+                   hap_matrix.chrom_end, sample_sets=new_sample_sets,
+                   n_total_sites=hap_matrix.n_total_sites)
 
     def to_haplotype_matrix(self):
         """Convert back to HaplotypeMatrix (expand diploid to haploid).
@@ -173,16 +197,19 @@ class GenotypeMatrix:
         hap[1::2][missing] = -1
 
         return HaplotypeMatrix(hap, self.positions, self.chrom_start,
-                               self.chrom_end)
+                               self.chrom_end,
+                               n_total_sites=self.n_total_sites)
 
     @classmethod
-    def from_vcf(cls, path):
+    def from_vcf(cls, path, include_invariant=False):
         """Construct from a VCF file.
 
         Parameters
         ----------
         path : str
             Path to VCF file.
+        include_invariant : bool
+            If True, include invariant sites and set n_total_sites.
 
         Returns
         -------
@@ -202,4 +229,6 @@ class GenotypeMatrix:
         # transpose to (n_individuals, n_variants)
         geno = geno.T
 
-        return cls(geno, pos, chrom_start=pos[0], chrom_end=pos[-1])
+        n_total_sites = geno.shape[1] if include_invariant else None
+        return cls(geno, pos, chrom_start=pos[0], chrom_end=pos[-1],
+                   n_total_sites=n_total_sites)
