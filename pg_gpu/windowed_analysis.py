@@ -655,8 +655,9 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
     # Requirements: non-overlapping windows, 'include' missing data,
     # and all requested stats are supported by the fused kernel.
     fused_single = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites', 'singletons'}
-    fused_two = {'fst', 'dxy'}
-    fused_all = fused_single | fused_two
+    fused_two = {'fst', 'dxy', 'da'}
+    fused_garud = {'garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'}
+    fused_all = fused_single | fused_two | fused_garud
     requested = set(statistics)
 
     can_fuse = (step_size == window_size
@@ -862,8 +863,9 @@ void fused_windowed_twopop(const signed char* hap1_t,
                            int n_total_var, int n_windows,
                            double* out_fst_num,
                            double* out_fst_den,
-                           double* out_dxy_sum) {
-    // hap1_t, hap2_t: transposed layout (n_total_var, n_hap) for coalesced reads
+                           double* out_dxy_sum,
+                           double* out_pi1_sum,
+                           double* out_pi2_sum) {
     int wid = blockIdx.x;
     if (wid >= n_windows) return;
 
@@ -875,15 +877,16 @@ void fused_windowed_twopop(const signed char* hap1_t,
             out_fst_num[wid] = 0.0;
             out_fst_den[wid] = 0.0;
             out_dxy_sum[wid] = 0.0;
+            out_pi1_sum[wid] = 0.0;
+            out_pi2_sum[wid] = 0.0;
         }
         return;
     }
 
     double dn1 = (double)n_hap1;
     double dn2 = (double)n_hap2;
-    double t_fst_num = 0.0;
-    double t_fst_den = 0.0;
-    double t_dxy = 0.0;
+    double t_fst_num = 0.0, t_fst_den = 0.0;
+    double t_dxy = 0.0, t_pi1 = 0.0, t_pi2 = 0.0;
 
     for (int vi = threadIdx.x; vi < n_vars; vi += blockDim.x) {
         int v = v_start + vi;
@@ -903,7 +906,6 @@ void fused_windowed_twopop(const signed char* hap1_t,
         double d_ac1_1 = (double)ac1_1;
         double d_ac2_1 = (double)ac2_1;
 
-        // Within-pop mean pairwise difference
         double n1_pairs = dn1 * (dn1 - 1.0) / 2.0;
         double n1_same = (ac1_0 * (ac1_0 - 1.0) + d_ac1_1 * (d_ac1_1 - 1.0)) / 2.0;
         double mpd1 = (n1_pairs > 0) ? (n1_pairs - n1_same) / n1_pairs : 0.0;
@@ -914,7 +916,6 @@ void fused_windowed_twopop(const signed char* hap1_t,
 
         double within = (mpd1 + mpd2) / 2.0;
 
-        // Between-pop mean pairwise difference
         double n_between = dn1 * dn2;
         double n_between_same = ac1_0 * ac2_0 + d_ac1_1 * d_ac2_1;
         double between = (n_between > 0) ? (n_between - n_between_same) / n_between : 0.0;
@@ -922,21 +923,26 @@ void fused_windowed_twopop(const signed char* hap1_t,
         t_fst_num += between - within;
         t_fst_den += between;
         t_dxy += between;
+        t_pi1 += mpd1;
+        t_pi2 += mpd2;
     }
 
-    // Block reduction
-    __shared__ double smem[3 * 256];
+    __shared__ double smem[5 * 256];
     int tid = threadIdx.x;
-    smem[tid] = t_fst_num;
-    smem[256 + tid] = t_fst_den;
-    smem[512 + tid] = t_dxy;
+    smem[tid]         = t_fst_num;
+    smem[256 + tid]   = t_fst_den;
+    smem[512 + tid]   = t_dxy;
+    smem[768 + tid]   = t_pi1;
+    smem[1024 + tid]  = t_pi2;
     __syncthreads();
 
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            smem[tid] += smem[tid + s];
-            smem[256 + tid] += smem[256 + tid + s];
-            smem[512 + tid] += smem[512 + tid + s];
+            smem[tid]         += smem[tid + s];
+            smem[256 + tid]   += smem[256 + tid + s];
+            smem[512 + tid]   += smem[512 + tid + s];
+            smem[768 + tid]   += smem[768 + tid + s];
+            smem[1024 + tid]  += smem[1024 + tid + s];
         }
         __syncthreads();
     }
@@ -945,9 +951,112 @@ void fused_windowed_twopop(const signed char* hap1_t,
         out_fst_num[wid] = smem[0];
         out_fst_den[wid] = smem[256];
         out_dxy_sum[wid] = smem[512];
+        out_pi1_sum[wid] = smem[768];
+        out_pi2_sum[wid] = smem[1024];
     }
 }
 ''', 'fused_windowed_twopop')
+
+
+# Garud's H fused kernel: one block per window, sorts haplotype hashes
+# in shared memory to count unique patterns and compute H statistics.
+_fused_garud_h_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void fused_garud_h(const double* hash1,   // (n_windows, n_hap)
+                   const double* hash2,   // (n_windows, n_hap)
+                   int n_hap, int n_windows,
+                   double* out_h1, double* out_h12,
+                   double* out_h123, double* out_h2h1) {
+    int wid = blockIdx.x;
+    if (wid >= n_windows) return;
+    int tid = threadIdx.x;
+
+    // Load hashes into shared memory for sorting
+    // Max 1024 haplotypes supported (shared memory limit)
+    extern __shared__ double shm[];
+    double* s_h1 = shm;            // n_hap doubles
+    double* s_h2 = shm + n_hap;    // n_hap doubles
+
+    // Each thread loads its element
+    if (tid < n_hap) {
+        s_h1[tid] = hash1[wid * n_hap + tid];
+        s_h2[tid] = hash2[wid * n_hap + tid];
+    }
+    __syncthreads();
+
+    // Simple odd-even sort on hash1 (secondary on hash2 for ties)
+    // For n_hap <= 256 this is fast in shared memory
+    for (int phase = 0; phase < n_hap; phase++) {
+        int i = 2 * tid + (phase & 1);
+        if (i + 1 < n_hap) {
+            bool do_swap = false;
+            if (s_h1[i] > s_h1[i + 1]) {
+                do_swap = true;
+            } else if (s_h1[i] == s_h1[i + 1] && s_h2[i] > s_h2[i + 1]) {
+                do_swap = true;
+            }
+            if (do_swap) {
+                double tmp;
+                tmp = s_h1[i]; s_h1[i] = s_h1[i+1]; s_h1[i+1] = tmp;
+                tmp = s_h2[i]; s_h2[i] = s_h2[i+1]; s_h2[i+1] = tmp;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Thread 0: count unique haplotypes, compute frequencies, derive H stats
+    if (tid == 0) {
+        // Count distinct haplotypes and collect top-3 frequencies
+        double inv_n = 1.0 / (double)n_hap;
+        double tol = 1e-3;
+
+        // Walk sorted array, count runs
+        // We need: sum(f_i^2), and the top 3 frequencies
+        double sum_f2 = 0.0;
+        double top3[3] = {0.0, 0.0, 0.0};  // sorted descending
+        int run_len = 1;
+
+        for (int i = 1; i <= n_hap; i++) {
+            bool boundary = (i == n_hap);
+            if (!boundary) {
+                double d1 = s_h1[i] - s_h1[i-1];
+                double d2 = s_h2[i] - s_h2[i-1];
+                if (d1 < 0) d1 = -d1;
+                if (d2 < 0) d2 = -d2;
+                boundary = (d1 > tol) || (d2 > tol);
+            }
+            if (boundary) {
+                double f = (double)run_len * inv_n;
+                sum_f2 += f * f;
+                // Insert into top3
+                if (f > top3[0]) {
+                    top3[2] = top3[1]; top3[1] = top3[0]; top3[0] = f;
+                } else if (f > top3[1]) {
+                    top3[2] = top3[1]; top3[1] = f;
+                } else if (f > top3[2]) {
+                    top3[2] = f;
+                }
+                run_len = 1;
+            } else {
+                run_len++;
+            }
+        }
+
+        double h1_val = sum_f2;
+        double h12_val = (top3[0] + top3[1]) * (top3[0] + top3[1])
+                       + (sum_f2 - top3[0]*top3[0] - top3[1]*top3[1]);
+        double h123_val = (top3[0] + top3[1] + top3[2]) * (top3[0] + top3[1] + top3[2])
+                        + (sum_f2 - top3[0]*top3[0] - top3[1]*top3[1] - top3[2]*top3[2]);
+        double h2_val = h1_val - top3[0] * top3[0];
+        double h2h1_val = (h1_val > 0.0) ? h2_val / h1_val : 0.0;
+
+        out_h1[wid]   = h1_val;
+        out_h12[wid]  = h12_val;
+        out_h123[wid] = h123_val;
+        out_h2h1[wid] = h2h1_val;
+    }
+}
+''', 'fused_garud_h')
 
 
 def _compute_window_ranges(positions, bp_bins):
@@ -1114,10 +1223,10 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             results['tajimas_d'] = tajd
 
     # two-pop stats via fused kernel
-    two_pop_requested = any(s in statistics for s in ('fst', 'dxy'))
+    two_pop_requested = any(s in statistics for s in ('fst', 'dxy', 'da'))
     if two_pop_requested:
         if pop1 is None or pop2 is None:
-            raise ValueError("pop1 and pop2 required for fst/dxy")
+            raise ValueError("pop1 and pop2 required for fst/dxy/da")
 
         m1 = get_population_matrix(haplotype_matrix, pop1)
         m2 = get_population_matrix(haplotype_matrix, pop2)
@@ -1128,13 +1237,14 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
 
         n1 = m1.haplotypes.shape[0]
         n2 = m2.haplotypes.shape[0]
-        # transpose for coalesced kernel access
         hap1 = cp.ascontiguousarray(m1.haplotypes.T.astype(cp.int8))
         hap2 = cp.ascontiguousarray(m2.haplotypes.T.astype(cp.int8))
 
         out_fst_num = cp.zeros(n_windows, dtype=cp.float64)
         out_fst_den = cp.zeros(n_windows, dtype=cp.float64)
         out_dxy = cp.zeros(n_windows, dtype=cp.float64)
+        out_pi1 = cp.zeros(n_windows, dtype=cp.float64)
+        out_pi2 = cp.zeros(n_windows, dtype=cp.float64)
 
         block = 256
         grid = n_windows
@@ -1144,11 +1254,13 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             (hap1, hap2, win_start, win_stop,
              np.int32(n1), np.int32(n2),
              np.int32(n_total_var), np.int32(n_windows),
-             out_fst_num, out_fst_den, out_dxy))
+             out_fst_num, out_fst_den, out_dxy, out_pi1, out_pi2))
 
         fst_num = out_fst_num.get()
         fst_den = out_fst_den.get()
         dxy_sum = out_dxy.get()
+        pi1_sum = out_pi1.get()
+        pi2_sum = out_pi2.get()
 
         if 'n_variants' not in results:
             results['n_variants'] = (win_stop - win_start).get().astype(int)
@@ -1163,7 +1275,90 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             else:
                 results['dxy'] = dxy_sum
 
+        if 'da' in statistics:
+            if per_base:
+                da_sum = dxy_sum - (pi1_sum + pi2_sum) / 2.0
+                results['da'] = np.where(window_bases > 0,
+                                         da_sum / window_bases, np.nan)
+            else:
+                results['da'] = dxy_sum - (pi1_sum + pi2_sum) / 2.0
+
+    # Garud's H via fused kernel (SNP windows using prefix-sum hashing)
+    garud_stats = {'garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'}
+    garud_requested = any(s in statistics for s in garud_stats)
+    if garud_requested:
+        _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
+                               win_start, win_stop, n_windows, statistics,
+                               results)
+
     return results
+
+
+def _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
+                            win_start, win_stop, n_windows, statistics,
+                            results):
+    """Compute windowed Garud's H using prefix-sum hashing + fused GPU kernel."""
+    from ._utils import get_population_matrix
+
+    if population is not None:
+        matrix = get_population_matrix(haplotype_matrix, population)
+    else:
+        matrix = haplotype_matrix
+    if matrix.device == 'CPU':
+        matrix.transfer_to_gpu()
+
+    hap = matrix.haplotypes  # (n_hap, n_var)
+    n_hap, n_var = hap.shape
+
+    # Prefix-sum hashing: cumsum of hap * random_weights along variant axis
+    h_f64 = hap.astype(cp.float64)
+    rng = cp.random.RandomState(seed=42)
+    w1 = rng.standard_normal(n_var, dtype=cp.float64)
+    w2 = rng.standard_normal(n_var, dtype=cp.float64)
+
+    hw1 = h_f64 * w1[cp.newaxis, :]
+    hw2 = h_f64 * w2[cp.newaxis, :]
+    cs1 = cp.zeros((n_hap, n_var + 1), dtype=cp.float64)
+    cs2 = cp.zeros((n_hap, n_var + 1), dtype=cp.float64)
+    cp.cumsum(hw1, axis=1, out=cs1[:, 1:])
+    cp.cumsum(hw2, axis=1, out=cs2[:, 1:])
+
+    # Compute per-window hashes: (n_windows, n_hap)
+    ws = win_start  # int64 GPU array
+    we = win_stop
+    all_h1 = (cs1[:, we] - cs1[:, ws]).T  # (n_windows, n_hap)
+    all_h2 = (cs2[:, we] - cs2[:, ws]).T
+
+    # Make contiguous for kernel
+    all_h1 = cp.ascontiguousarray(all_h1)
+    all_h2 = cp.ascontiguousarray(all_h2)
+
+    out_h1 = cp.empty(n_windows, dtype=cp.float64)
+    out_h12 = cp.empty(n_windows, dtype=cp.float64)
+    out_h123 = cp.empty(n_windows, dtype=cp.float64)
+    out_h2h1 = cp.empty(n_windows, dtype=cp.float64)
+
+    # Launch: one block per window, n_hap/2 threads (for odd-even sort pairs)
+    block = max(1, (n_hap + 1) // 2)
+    # Round up to next power of 2 for warp efficiency
+    block = 1 << (block - 1).bit_length()
+    block = min(block, 1024)
+    shm_size = 2 * n_hap * 8  # two double arrays in shared memory
+
+    _fused_garud_h_kernel(
+        (n_windows,), (block,),
+        (all_h1, all_h2, np.int32(n_hap), np.int32(n_windows),
+         out_h1, out_h12, out_h123, out_h2h1),
+        shared_mem=shm_size)
+
+    if 'garud_h1' in statistics:
+        results['garud_h1'] = out_h1.get()
+    if 'garud_h12' in statistics:
+        results['garud_h12'] = out_h12.get()
+    if 'garud_h123' in statistics:
+        results['garud_h123'] = out_h123.get()
+    if 'garud_h2h1' in statistics:
+        results['garud_h2h1'] = out_h2h1.get()
 
 
 # ---------------------------------------------------------------------------
