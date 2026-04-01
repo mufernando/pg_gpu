@@ -654,11 +654,18 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
     # Fast path: use fused CUDA kernels when possible.
     # Requirements: non-overlapping windows, 'include' missing data,
     # and all requested stats are supported by the fused kernel.
-    fused_single = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites', 'singletons'}
+    fused_single = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites',
+                    'singletons', 'theta_h', 'fay_wu_h', 'max_daf'}
     fused_two = {'fst', 'fst_hudson', 'fst_wc', 'dxy', 'da'}
-    fused_garud = {'garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'}
+    fused_garud = {'garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1',
+                   'haplotype_count'}
     fused_selection = {'mean_nsl'}
-    fused_all = fused_single | fused_two | fused_garud | fused_selection
+    fused_diploshic = {'snp_dist_mean', 'snp_dist_var', 'snp_dist_min',
+                       'snp_dist_max', 'mu_var', 'mu_sfs', 'mu_ld',
+                       'daf_hist', 'zns', 'omega',
+                       'dist_var', 'dist_skew', 'dist_kurt'}
+    fused_all = (fused_single | fused_two | fused_garud | fused_selection
+                 | fused_diploshic)
     requested = set(statistics)
 
     can_fuse = (step_size == window_size
@@ -783,8 +790,9 @@ void fused_windowed_stats_v2(const signed char* hap_t,
                              double* out_mpd_sum,
                              double* out_seg_count,
                              double* out_sing_count,
-                             double* out_var_count) {
-    // hap_t layout: (n_total_var, n_hap) - transposed for coalesced access
+                             double* out_var_count,
+                             double* out_theta_h_sum,
+                             double* out_max_daf) {
     int wid = blockIdx.x;
     if (wid >= n_windows) return;
 
@@ -797,20 +805,18 @@ void fused_windowed_stats_v2(const signed char* hap_t,
             out_seg_count[wid] = 0.0;
             out_sing_count[wid] = 0.0;
             out_var_count[wid] = 0.0;
+            out_theta_h_sum[wid] = 0.0;
+            out_max_daf[wid] = 0.0;
         }
         return;
     }
 
     double dn = (double)n_hap;
-    double thread_mpd = 0.0;
-    double thread_seg = 0.0;
-    double thread_sing = 0.0;
-    double thread_count = 0.0;
+    double t_mpd = 0.0, t_seg = 0.0, t_sing = 0.0;
+    double t_count = 0.0, t_theta_h = 0.0, t_max_daf = 0.0;
 
     for (int vi = threadIdx.x; vi < n_vars; vi += blockDim.x) {
         int v = v_start + vi;
-
-        // hap_t[v * n_hap + h] -- consecutive h values are contiguous in memory
         int dac = 0;
         const signed char* row = hap_t + v * n_hap;
         for (int h = 0; h < n_hap; h++) {
@@ -818,36 +824,51 @@ void fused_windowed_stats_v2(const signed char* hap_t,
         }
 
         double p = (double)dac / dn;
-        double mpd = 2.0 * p * (1.0 - p) * dn / (dn - 1.0);
-        thread_mpd += mpd;
-        thread_seg += (dac > 0 && dac < n_hap) ? 1.0 : 0.0;
-        thread_sing += (dac == 1 || dac == n_hap - 1) ? 1.0 : 0.0;
-        thread_count += 1.0;
+        t_mpd += 2.0 * p * (1.0 - p) * dn / (dn - 1.0);
+
+        int is_seg = (dac > 0 && dac < n_hap) ? 1 : 0;
+        t_seg += is_seg;
+        t_sing += (dac == 1 || dac == n_hap - 1) ? 1.0 : 0.0;
+        t_count += 1.0;
+
+        if (is_seg) {
+            t_theta_h += 2.0 * (double)dac * (double)dac / (dn * (dn - 1.0));
+        }
+        if (p > t_max_daf) t_max_daf = p;
     }
 
-    __shared__ double smem[4 * 256];
+    // Sum reduction for 5 accumulators
+    __shared__ double smem[6 * 256];
     int tid = threadIdx.x;
-    smem[tid] = thread_mpd;
-    smem[256 + tid] = thread_seg;
-    smem[512 + tid] = thread_sing;
-    smem[768 + tid] = thread_count;
+    smem[tid]          = t_mpd;
+    smem[256 + tid]    = t_seg;
+    smem[512 + tid]    = t_sing;
+    smem[768 + tid]    = t_count;
+    smem[1024 + tid]   = t_theta_h;
+    smem[1280 + tid]   = t_max_daf;  // will be max-reduced
     __syncthreads();
 
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            smem[tid] += smem[tid + s];
-            smem[256 + tid] += smem[256 + tid + s];
-            smem[512 + tid] += smem[512 + tid + s];
-            smem[768 + tid] += smem[768 + tid + s];
+            smem[tid]          += smem[tid + s];
+            smem[256 + tid]    += smem[256 + tid + s];
+            smem[512 + tid]    += smem[512 + tid + s];
+            smem[768 + tid]    += smem[768 + tid + s];
+            smem[1024 + tid]   += smem[1024 + tid + s];
+            // max for max_daf
+            if (smem[1280 + tid + s] > smem[1280 + tid])
+                smem[1280 + tid] = smem[1280 + tid + s];
         }
         __syncthreads();
     }
 
     if (tid == 0) {
-        out_mpd_sum[wid] = smem[0];
-        out_seg_count[wid] = smem[256];
-        out_sing_count[wid] = smem[512];
-        out_var_count[wid] = smem[768];
+        out_mpd_sum[wid]     = smem[0];
+        out_seg_count[wid]   = smem[256];
+        out_sing_count[wid]  = smem[512];
+        out_var_count[wid]   = smem[768];
+        out_theta_h_sum[wid] = smem[1024];
+        out_max_daf[wid]     = smem[1280];
     }
 }
 ''', 'fused_windowed_stats_v2')
@@ -1000,7 +1021,8 @@ void fused_garud_h(const double* hash1,   // (n_windows, n_hap)
                    const double* hash2,   // (n_windows, n_hap)
                    int n_hap, int n_windows,
                    double* out_h1, double* out_h12,
-                   double* out_h123, double* out_h2h1) {
+                   double* out_h123, double* out_h2h1,
+                   double* out_n_distinct) {
     int wid = blockIdx.x;
     if (wid >= n_windows) return;
     int tid = threadIdx.x;
@@ -1047,8 +1069,9 @@ void fused_garud_h(const double* hash1,   // (n_windows, n_hap)
         // Walk sorted array, count runs
         // We need: sum(f_i^2), and the top 3 frequencies
         double sum_f2 = 0.0;
-        double top3[3] = {0.0, 0.0, 0.0};  // sorted descending
+        double top3[3] = {0.0, 0.0, 0.0};
         int run_len = 1;
+        int n_distinct = 0;
 
         for (int i = 1; i <= n_hap; i++) {
             bool boundary = (i == n_hap);
@@ -1060,9 +1083,9 @@ void fused_garud_h(const double* hash1,   // (n_windows, n_hap)
                 boundary = (d1 > tol) || (d2 > tol);
             }
             if (boundary) {
+                n_distinct++;
                 double f = (double)run_len * inv_n;
                 sum_f2 += f * f;
-                // Insert into top3
                 if (f > top3[0]) {
                     top3[2] = top3[1]; top3[1] = top3[0]; top3[0] = f;
                 } else if (f > top3[1]) {
@@ -1088,6 +1111,7 @@ void fused_garud_h(const double* hash1,   // (n_windows, n_hap)
         out_h12[wid]  = h12_val;
         out_h123[wid] = h123_val;
         out_h2h1[wid] = h2h1_val;
+        out_n_distinct[wid] = (double)n_distinct;
     }
 }
 ''', 'fused_garud_h')
@@ -1190,14 +1214,16 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             window_bases = np.diff(bp_bins_gpu.get())
 
     # single-pop stats via fused kernel
-    single_pop_requested = any(s in statistics for s in
-                               ('pi', 'theta_w', 'tajimas_d',
-                                'segregating_sites', 'singletons'))
+    single_pop_stats = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites',
+                        'singletons', 'theta_h', 'fay_wu_h', 'max_daf'}
+    single_pop_requested = any(s in statistics for s in single_pop_stats)
     if single_pop_requested:
         out_mpd = cp.zeros(n_windows, dtype=cp.float64)
         out_seg = cp.zeros(n_windows, dtype=cp.float64)
         out_sing = cp.zeros(n_windows, dtype=cp.float64)
         out_count = cp.zeros(n_windows, dtype=cp.float64)
+        out_theta_h = cp.zeros(n_windows, dtype=cp.float64)
+        out_max_daf = cp.zeros(n_windows, dtype=cp.float64)
 
         block = 256
         grid = n_windows
@@ -1206,12 +1232,14 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             (grid,), (block,),
             (hap, win_start, win_stop,
              np.int32(n_hap), np.int32(n_total_var), np.int32(n_windows),
-             out_mpd, out_seg, out_sing, out_count))
+             out_mpd, out_seg, out_sing, out_count, out_theta_h, out_max_daf))
 
         mpd_sum = out_mpd.get()
         seg_count = out_seg.get()
         sing_count = out_sing.get()
         var_count = out_count.get()
+        theta_h_sum = out_theta_h.get()
+        max_daf = out_max_daf.get()
 
         results['n_variants'] = var_count.astype(int)
 
@@ -1255,6 +1283,20 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             tajd = np.where(d_std > 0, d_num / d_std, np.nan)
             tajd[S < 3] = np.nan
             results['tajimas_d'] = tajd
+
+        if 'theta_h' in statistics:
+            if per_base:
+                results['theta_h'] = np.where(window_bases > 0,
+                                              theta_h_sum / window_bases, np.nan)
+            else:
+                results['theta_h'] = theta_h_sum
+
+        if 'fay_wu_h' in statistics:
+            # H = pi - theta_H (absolute, unnormalized)
+            results['fay_wu_h'] = mpd_sum - theta_h_sum
+
+        if 'max_daf' in statistics:
+            results['max_daf'] = max_daf
 
     # two-pop stats via fused kernel
     two_pop_stats = {'fst', 'fst_hudson', 'fst_wc', 'dxy', 'da'}
@@ -1331,25 +1373,25 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                 results['da'] = dxy_sum - (pi1_sum + pi2_sum) / 2.0
 
     # Garud's H via fused kernel (SNP windows using prefix-sum hashing)
-    garud_stats = {'garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'}
+    garud_stats = {'garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1',
+                   'haplotype_count'}
     garud_requested = any(s in statistics for s in garud_stats)
     if garud_requested:
         _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
                                win_start, win_stop, n_windows, statistics,
                                results)
 
-    # Per-site selection scan stats binned into windows
+    # Per-site stats binned into windows via scatter_add
+    import cupyx
+    bin_idx = cp.searchsorted(bp_bins_gpu[1:], positions)
+
     if 'mean_nsl' in statistics:
         from . import selection as sel
         nsl_scores = sel.nsl(haplotype_matrix, population=population)
         nsl_gpu = cp.asarray(nsl_scores)
-
-        # Bin into windows: sum and count finite values per window
-        bin_idx = cp.searchsorted(bp_bins_gpu[1:], positions)
         valid = cp.isfinite(nsl_gpu)
         nsl_sum = cp.zeros(n_windows, dtype=cp.float64)
         nsl_count = cp.zeros(n_windows, dtype=cp.float64)
-        import cupyx
         valid_idx = bin_idx[valid]
         in_range = (valid_idx >= 0) & (valid_idx < n_windows)
         cupyx.scatter_add(nsl_sum, valid_idx[in_range], nsl_gpu[valid][in_range])
@@ -1358,6 +1400,139 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
         nsl_mean = nsl_sum.get() / np.maximum(nsl_count.get(), 1)
         nsl_mean[nsl_count.get() == 0] = np.nan
         results['mean_nsl'] = nsl_mean
+
+    # SNP distance stats per window
+    snp_dist_stats = {'snp_dist_mean', 'snp_dist_var', 'snp_dist_min',
+                      'snp_dist_max', 'mu_var'}
+    if any(s in statistics for s in snp_dist_stats):
+        ws = win_start.get()
+        we = win_stop.get()
+        pos_cpu = positions.get() if hasattr(positions, 'get') else np.asarray(positions)
+        sd_mean = np.full(n_windows, np.nan)
+        sd_var = np.full(n_windows, np.nan)
+        sd_min = np.full(n_windows, np.nan)
+        sd_max = np.full(n_windows, np.nan)
+        mu_var_arr = np.full(n_windows, np.nan)
+
+        for wi in range(n_windows):
+            s, e = int(ws[wi]), int(we[wi])
+            if e - s < 2:
+                if e - s == 1:
+                    mu_var_arr[wi] = 1.0 / window_bases[wi] if per_base and window_bases[wi] > 0 else 1.0
+                continue
+            win_pos = pos_cpu[s:e]
+            gaps = np.diff(win_pos).astype(np.float64)
+            sd_mean[wi] = np.mean(gaps)
+            sd_var[wi] = np.var(gaps)
+            sd_min[wi] = np.min(gaps)
+            sd_max[wi] = np.max(gaps)
+            win_span = float(win_pos[-1] - win_pos[0]) if len(win_pos) > 1 else 1.0
+            mu_var_arr[wi] = len(win_pos) / window_bases[wi] if per_base and window_bases[wi] > 0 else float(len(win_pos))
+
+        if 'snp_dist_mean' in statistics:
+            results['snp_dist_mean'] = sd_mean
+        if 'snp_dist_var' in statistics:
+            results['snp_dist_var'] = sd_var
+        if 'snp_dist_min' in statistics:
+            results['snp_dist_min'] = sd_min
+        if 'snp_dist_max' in statistics:
+            results['snp_dist_max'] = sd_max
+        if 'mu_var' in statistics:
+            results['mu_var'] = mu_var_arr
+
+    # DAF histogram per window (binned derived allele frequencies)
+    if 'daf_hist' in statistics:
+        n_daf_bins = 20
+        # Compute per-site DAF on GPU
+        hap_raw = matrix.haplotypes
+        dac = cp.sum(cp.maximum(hap_raw, 0).astype(cp.int32), axis=0).astype(cp.float64)
+        daf = dac / n_hap
+        daf_cpu = daf.get()
+        bin_idx_cpu = bin_idx.get()
+
+        # Build histogram per window
+        daf_edges = np.linspace(0, 1, n_daf_bins + 1)
+        hist_matrix = np.zeros((n_windows, n_daf_bins), dtype=np.float64)
+        for vi in range(len(daf_cpu)):
+            wi = int(bin_idx_cpu[vi])
+            if 0 <= wi < n_windows:
+                b = min(int(daf_cpu[vi] * n_daf_bins), n_daf_bins - 1)
+                hist_matrix[wi, b] += 1
+        # Store each bin as a separate column
+        for b in range(n_daf_bins):
+            results[f'daf_bin_{b}'] = hist_matrix[:, b]
+
+    # muSFS: fraction of SNPs at SFS edges (singletons + near-fixed)
+    if 'mu_sfs' in statistics:
+        hap_raw = matrix.haplotypes
+        dac = cp.sum(cp.maximum(hap_raw, 0).astype(cp.int32), axis=0)
+        is_edge = ((dac == 1) | (dac == n_hap - 1)).astype(cp.float64)
+        edge_sum = cp.zeros(n_windows, dtype=cp.float64)
+        total_sum = cp.zeros(n_windows, dtype=cp.float64)
+        in_range = (bin_idx >= 0) & (bin_idx < n_windows)
+        cupyx.scatter_add(edge_sum, bin_idx[in_range], is_edge[in_range])
+        n_in_range = int(in_range.sum().get())
+        cupyx.scatter_add(total_sum, bin_idx[in_range],
+                          cp.ones(n_in_range, dtype=cp.float64))
+        mu_sfs = edge_sum.get() / np.maximum(total_sum.get(), 1)
+        mu_sfs[total_sum.get() == 0] = np.nan
+        results['mu_sfs'] = mu_sfs
+
+    # Per-window LD and haplotype pattern stats (require pairwise computation)
+    ld_stats = {'zns', 'omega', 'mu_ld'}
+    dist_stats = {'dist_var', 'dist_skew', 'dist_kurt'}
+    perwin_requested = any(s in statistics for s in (ld_stats | dist_stats))
+
+    if perwin_requested:
+        from . import ld_statistics
+        from . import distance_stats
+        ws_np = win_start.get()
+        we_np = win_stop.get()
+
+        zns_arr = np.full(n_windows, np.nan) if 'zns' in statistics else None
+        omega_arr = np.full(n_windows, np.nan) if 'omega' in statistics else None
+        mu_ld_arr = np.full(n_windows, np.nan) if 'mu_ld' in statistics else None
+        dvar_arr = np.full(n_windows, np.nan) if 'dist_var' in statistics else None
+        dskew_arr = np.full(n_windows, np.nan) if 'dist_skew' in statistics else None
+        dkurt_arr = np.full(n_windows, np.nan) if 'dist_kurt' in statistics else None
+
+        for wi in range(n_windows):
+            s, e = int(ws_np[wi]), int(we_np[wi])
+            if e - s < 4:
+                continue
+            win_pos = matrix.positions[s:e]
+            win_hap = matrix.haplotypes[:, s:e]
+            win_mat = HaplotypeMatrix(win_hap, win_pos)
+            try:
+                if zns_arr is not None:
+                    zns_arr[wi] = ld_statistics.zns(win_mat)
+                if omega_arr is not None:
+                    omega_arr[wi] = ld_statistics.omega(win_mat)
+                if mu_ld_arr is not None:
+                    mu_ld_arr[wi] = ld_statistics.mu_ld(win_mat)
+                if any(a is not None for a in [dvar_arr, dskew_arr, dkurt_arr]):
+                    v, sk, ku = distance_stats.dist_moments(win_mat)
+                    if dvar_arr is not None:
+                        dvar_arr[wi] = v
+                    if dskew_arr is not None:
+                        dskew_arr[wi] = sk
+                    if dkurt_arr is not None:
+                        dkurt_arr[wi] = ku
+            except Exception:
+                pass
+
+        if zns_arr is not None:
+            results['zns'] = zns_arr
+        if omega_arr is not None:
+            results['omega'] = omega_arr
+        if mu_ld_arr is not None:
+            results['mu_ld'] = mu_ld_arr
+        if dvar_arr is not None:
+            results['dist_var'] = dvar_arr
+        if dskew_arr is not None:
+            results['dist_skew'] = dskew_arr
+        if dkurt_arr is not None:
+            results['dist_kurt'] = dkurt_arr
 
     return results
 
@@ -1405,18 +1580,17 @@ def _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
     out_h12 = cp.empty(n_windows, dtype=cp.float64)
     out_h123 = cp.empty(n_windows, dtype=cp.float64)
     out_h2h1 = cp.empty(n_windows, dtype=cp.float64)
+    out_n_distinct = cp.empty(n_windows, dtype=cp.float64)
 
-    # Launch: one block per window, n_hap/2 threads (for odd-even sort pairs)
     block = max(1, (n_hap + 1) // 2)
-    # Round up to next power of 2 for warp efficiency
     block = 1 << (block - 1).bit_length()
     block = min(block, 1024)
-    shm_size = 2 * n_hap * 8  # two double arrays in shared memory
+    shm_size = 2 * n_hap * 8
 
     _fused_garud_h_kernel(
         (n_windows,), (block,),
         (all_h1, all_h2, np.int32(n_hap), np.int32(n_windows),
-         out_h1, out_h12, out_h123, out_h2h1),
+         out_h1, out_h12, out_h123, out_h2h1, out_n_distinct),
         shared_mem=shm_size)
 
     if 'garud_h1' in statistics:
@@ -1427,6 +1601,8 @@ def _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
         results['garud_h123'] = out_h123.get()
     if 'garud_h2h1' in statistics:
         results['garud_h2h1'] = out_h2h1.get()
+    if 'haplotype_count' in statistics:
+        results['haplotype_count'] = out_n_distinct.get().astype(int)
 
 
 # ---------------------------------------------------------------------------
