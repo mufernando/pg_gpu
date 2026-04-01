@@ -127,10 +127,15 @@ def main():
 
     # pi per-population
     for label, ac_pop, pop_name in [("pop1", ac1, "pop1"), ("pop2", ac2, "pop2")]:
+        t = time.time()
         mpd_pop = allel.mean_pairwise_difference(ac_pop, fill=0)
         pi_pop_allel = np.sum(mpd_pop) / n_var
+        ta = time.time() - t
+        t = time.time()
         pi_pop_pg = divergence.pi_within_population(hm, pop_name)
-        res.add("diversity", f"pi_within ({label})", pi_pop_allel, pi_pop_pg)
+        tp = time.time() - t
+        res.add("diversity", f"pi_within ({label})", pi_pop_allel, pi_pop_pg,
+                t_allel=ta, t_pg=tp)
 
     # theta_w (absolute)
     t = time.time()
@@ -155,14 +160,25 @@ def main():
     res.add("diversity", "tajima_d", td_allel, td_pg, t_allel=ta, t_pg=tp)
 
     # segregating sites
+    t = time.time()
+    _ = ac_all.count_segregating()  # allel computation
+    ta = time.time() - t
+    t = time.time()
     S_pg = diversity.segregating_sites(hm)
-    res.add("diversity", "segregating_sites", S_allel, S_pg)
+    tp = time.time() - t
+    res.add("diversity", "segregating_sites", S_allel, S_pg,
+            t_allel=ta, t_pg=tp)
 
     # singletons (manual from allel)
     dac_all = hap_np.sum(axis=1)
+    t = time.time()
     sing_allel = int(np.sum(dac_all == 1))
+    ta = time.time() - t
+    t = time.time()
     sing_pg = diversity.singleton_count(hm)
-    res.add("diversity", "singleton_count", sing_allel, sing_pg)
+    tp = time.time() - t
+    res.add("diversity", "singleton_count", sing_allel, sing_pg,
+            t_allel=ta, t_pg=tp)
 
     # haplotype_diversity (whole sample)
     t = time.time()
@@ -190,12 +206,16 @@ def main():
             is_array=True, t_allel=ta, t_pg=tp)
 
     # Folded SFS
+    t = time.time()
     sfs_f_allel = allel.sfs_folded(ac_all)
+    ta = time.time() - t
+    t = time.time()
     sfs_f_pg = sfs.sfs_folded(hm)
+    tp = time.time() - t
     sfs_f_pg_np = np.asarray(sfs_f_pg)
     min_len = min(len(sfs_f_allel), len(sfs_f_pg_np))
     res.add("sfs", "sfs (folded)", sfs_f_allel[:min_len], sfs_f_pg_np[:min_len],
-            is_array=True)
+            is_array=True, t_allel=ta, t_pg=tp)
 
     # Joint SFS
     t = time.time()
@@ -212,13 +232,17 @@ def main():
             is_array=True, t_allel=ta, t_pg=tp)
 
     # Joint SFS folded
+    t = time.time()
     jsfs_f_allel = allel.joint_sfs_folded(ac1, ac2)
+    ta = time.time() - t
+    t = time.time()
     jsfs_f_pg = sfs.joint_sfs_folded(hm, pop1="pop1", pop2="pop2")
+    tp = time.time() - t
     jsfs_f_pg_np = np.asarray(jsfs_f_pg)
     s0 = min(jsfs_f_allel.shape[0], jsfs_f_pg_np.shape[0])
     s1 = min(jsfs_f_allel.shape[1], jsfs_f_pg_np.shape[1])
     res.add("sfs", "joint_sfs_folded", jsfs_f_allel[:s0, :s1],
-            jsfs_f_pg_np[:s0, :s1], is_array=True)
+            jsfs_f_pg_np[:s0, :s1], is_array=True, t_allel=ta, t_pg=tp)
 
     # ── DIVERGENCE ─────────────────────────────────────────────────────────
     print("Computing divergence statistics ...")
@@ -234,13 +258,17 @@ def main():
     res.add("divergence", "dxy", dxy_allel, dxy_pg, t_allel=ta, t_pg=tp)
 
     # Da = Dxy - (pi1+pi2)/2
+    t = time.time()
     mpd1 = allel.mean_pairwise_difference(ac1, fill=0)
     mpd2 = allel.mean_pairwise_difference(ac2, fill=0)
     pi1_a = np.sum(mpd1) / n_var
     pi2_a = np.sum(mpd2) / n_var
     da_allel = dxy_allel - (pi1_a + pi2_a) / 2
+    ta = time.time() - t
+    t = time.time()
     da_pg = divergence.da(hm, "pop1", "pop2")
-    res.add("divergence", "da", da_allel, da_pg)
+    tp = time.time() - t
+    res.add("divergence", "da", da_allel, da_pg, t_allel=ta, t_pg=tp)
 
     # Hudson FST
     t = time.time()
