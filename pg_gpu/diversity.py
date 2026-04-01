@@ -1094,7 +1094,8 @@ def theta_h(haplotype_matrix: HaplotypeMatrix,
     hap_clean = cp.where(valid_mask, haplotypes, 0)
     dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
 
-    usable = n_valid > 1
+    # Only segregating sites: 0 < dac < n_valid
+    usable = (n_valid > 1) & (dac > 0) & (dac < n_valid)
     th = cp.sum(2.0 * dac[usable] ** 2 / (n_valid[usable] * (n_valid[usable] - 1)))
 
     if span_normalize:
@@ -1158,7 +1159,8 @@ def theta_l(haplotype_matrix: HaplotypeMatrix,
     hap_clean = cp.where(valid_mask, haplotypes, 0)
     dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
 
-    usable = n_valid > 1
+    # Only segregating sites: 0 < dac < n_valid
+    usable = (n_valid > 1) & (dac > 0) & (dac < n_valid)
     tl = cp.sum(dac[usable] / (n_valid[usable] - 1))
 
     if span_normalize:
