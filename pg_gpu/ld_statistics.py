@@ -376,7 +376,11 @@ def mu_ld(haplotype_matrix, missing_data='include'):
 
 
 def _resolve_r2_matrix(r2_matrix_or_matrix, missing_data='include'):
-    """Convert a matrix object to an r2 matrix, or pass through raw arrays."""
+    """Convert a matrix object to an r2 matrix, or pass through raw arrays.
+
+    Filters to segregating sites only (excludes monomorphic variants)
+    to match diploSHIC/allel convention for ZnS/Omega.
+    """
     from .haplotype_matrix import HaplotypeMatrix
     from .genotype_matrix import GenotypeMatrix
 
@@ -384,6 +388,8 @@ def _resolve_r2_matrix(r2_matrix_or_matrix, missing_data='include'):
         mat = r2_matrix_or_matrix
         if hasattr(mat, 'device') and mat.device == 'CPU':
             mat.transfer_to_gpu()
+
+        # Filter missing data sites
         if missing_data == 'exclude':
             hap = mat.haplotypes if isinstance(mat, HaplotypeMatrix) else mat.genotypes
             missing_per_var = cp.sum(hap < 0, axis=0)
@@ -395,10 +401,23 @@ def _resolve_r2_matrix(r2_matrix_or_matrix, missing_data='include'):
                 pos = mat.positions[valid]
                 from .genotype_matrix import GenotypeMatrix as GM
                 mat = GM(geno, pos)
-        if isinstance(mat, GenotypeMatrix):
-            return _r2_matrix_diploid(mat)
-        else:
+
+        # Haploid: filter monomorphic sites before r^2 computation.
+        # diploSHIC marks monomorphic pairs as -1 and skips them in ZnS/Omega.
+        # We match this by excluding monomorphic sites entirely.
+        if isinstance(mat, HaplotypeMatrix):
+            hap = mat.haplotypes
+            dac = cp.sum(cp.maximum(hap, 0).astype(cp.int32), axis=0)
+            n_valid = cp.sum((hap >= 0).astype(cp.int32), axis=0)
+            seg = (dac > 0) & (dac < n_valid)
+            seg_idx = cp.where(seg)[0]
+            if len(seg_idx) < mat.num_variants:
+                mat = mat.get_subset(seg_idx)
             return mat.pairwise_r2()
+        else:
+            # Diploid: keep monomorphic sites (as zero-r^2 rows/cols),
+            # matching diploSHIC's convention where ZnS denominator = n_snps^2
+            return _r2_matrix_diploid(mat)
     else:
         if not isinstance(r2_matrix_or_matrix, cp.ndarray):
             return cp.asarray(r2_matrix_or_matrix, dtype=cp.float64)
