@@ -1010,6 +1010,141 @@ def _ssl_hist_to_ihh(hist_row, n_pairs, variant_idx, gaps_cpu, min_ehh,
 
 
 # ---------------------------------------------------------------------------
+# GPU kernel for IHH integration from SSL histograms
+# ---------------------------------------------------------------------------
+
+_ihh_integrate_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void ihh_integrate_kernel(const int* hist,        // (chunk_len, hist_size)
+                          const double* gaps,      // (total_n_variants - 1,)
+                          const int* n_pairs_arr,  // (chunk_len,)
+                          int chunk_len,
+                          int chunk_start,         // offset into global variant index
+                          int hist_size,
+                          double min_ehh,
+                          int include_edges,
+                          double* out_ihh) {       // (chunk_len,)
+    int ci = blockDim.x * blockIdx.x + threadIdx.x;
+    if (ci >= chunk_len) return;
+
+    int n_pairs = n_pairs_arr[ci];
+    int variant_idx = chunk_start + ci;  // global variant index
+
+    if (n_pairs == 0) {
+        out_ihh[ci] = 0.0 / 0.0;  // NaN
+        return;
+    }
+
+    double inv_n = 1.0 / (double)n_pairs;
+
+    // pairs with ssl=0 are no longer homozygous at this site
+    int n_ident = n_pairs - hist[ci * hist_size + 0];
+    double ehh_prv = (double)n_ident * inv_n;
+
+    if (ehh_prv <= min_ehh) {
+        out_ihh[ci] = 0.0;
+        return;
+    }
+
+    double ihh = 0.0;
+    int max_steps = variant_idx < hist_size ? variant_idx : hist_size - 1;
+
+    for (int i = 1; i <= max_steps; i++) {
+        n_ident -= hist[ci * hist_size + i];
+        double ehh_cur = (double)n_ident * inv_n;
+
+        int gap_idx = variant_idx - i;
+        double gap = gaps[gap_idx];
+
+        if (gap < 0.0) {
+            out_ihh[ci] = 0.0 / 0.0;  // NaN
+            return;
+        }
+
+        ihh += gap * (ehh_cur + ehh_prv) * 0.5;
+
+        if (ehh_cur <= min_ehh) {
+            out_ihh[ci] = ihh;
+            return;
+        }
+        ehh_prv = ehh_cur;
+    }
+
+    // If we exhausted the histogram but variant_idx > hist_size,
+    // the remaining bins were clamped -- all those pairs have already
+    // been subtracted via the last bin. Continue with ehh_prv stable
+    // (no more pairs to subtract) until we either hit min_ehh via a
+    // gap or run out of variants.
+    for (int i = max_steps + 1; i <= variant_idx; i++) {
+        // n_ident unchanged (no more histogram bins)
+        double ehh_cur = (double)n_ident * inv_n;
+
+        int gap_idx = variant_idx - i;
+        double gap = gaps[gap_idx];
+
+        if (gap < 0.0) {
+            out_ihh[ci] = 0.0 / 0.0;  // NaN
+            return;
+        }
+
+        ihh += gap * (ehh_cur + ehh_prv) * 0.5;
+
+        if (ehh_cur <= min_ehh) {
+            out_ihh[ci] = ihh;
+            return;
+        }
+        ehh_prv = ehh_cur;
+    }
+
+    if (include_edges) {
+        out_ihh[ci] = ihh;
+    } else {
+        out_ihh[ci] = 0.0 / 0.0;  // NaN
+    }
+}
+''', 'ihh_integrate_kernel')
+
+
+def _integrate_ihh_gpu(hist, gaps, n_pairs_arr, chunk_start, min_ehh,
+                       include_edges):
+    """Integrate SSL histograms into IHH values on GPU.
+
+    Parameters
+    ----------
+    hist : cp.ndarray, int32, shape (chunk_len, hist_size)
+    gaps : cp.ndarray, float64, shape (total_n_variants - 1,)
+    n_pairs_arr : cp.ndarray, int32, shape (chunk_len,)
+        Number of pairs per variant (allele-class-specific or total).
+    chunk_start : int
+        Global variant index offset for this chunk.
+    min_ehh : float
+    include_edges : bool
+
+    Returns
+    -------
+    ihh : np.ndarray, float64, shape (chunk_len,)
+    """
+    chunk_len, hist_size = hist.shape
+    out_ihh = cp.empty(chunk_len, dtype=cp.float64)
+
+    # Ensure correct dtypes and contiguity for kernel
+    hist = cp.ascontiguousarray(hist.astype(cp.int32))
+    gaps = cp.ascontiguousarray(gaps)
+    n_pairs_arr = cp.ascontiguousarray(n_pairs_arr.astype(cp.int32))
+
+    block = 256
+    grid = (chunk_len + block - 1) // block
+
+    _ihh_integrate_kernel((grid,), (block,),
+                          (hist, gaps, n_pairs_arr,
+                           np.int32(chunk_len), np.int32(chunk_start),
+                           np.int32(hist_size), np.float64(min_ehh),
+                           np.int32(int(include_edges)), out_ihh))
+
+    return out_ihh.get()
+
+
+# ---------------------------------------------------------------------------
 # Private helpers: SSL-based scans for IHS
 # ---------------------------------------------------------------------------
 
@@ -1052,19 +1187,18 @@ def _ihh01_scan_gpu(h, gaps, min_ehh=0.05, min_maf=0.05,
     pair_j, pair_k = _get_pair_indices(n_haplotypes)
     h_contig = cp.ascontiguousarray(h.astype(cp.int8))
 
-    # Count alleles per variant (on GPU, transfer once)
-    h_cpu = h_contig.get()
-    c0 = np.sum(h_cpu == 0, axis=1)
-    c1 = np.sum(h_cpu == 1, axis=1)
-    gaps_cpu = gaps.get()
+    # Count alleles per variant on GPU
+    c0 = cp.sum(h_contig == 0, axis=1)
+    c1 = cp.sum(h_contig == 1, axis=1)
+    total_counts = c0 + c1
+    maf_arr = cp.minimum(c0, c1).astype(cp.float64) / cp.maximum(total_counts, 1).astype(cp.float64)
 
-    block = 256
-    grid = (n_pairs + block - 1) // block
+    block_ssl = 256
+    grid_ssl = (n_pairs + block_ssl - 1) // block_ssl
 
     vihh0 = np.full(n_variants, np.nan)
     vihh1 = np.full(n_variants, np.nan)
 
-    # SSL state carried across chunks
     ssl_state = cp.zeros(n_pairs, dtype=cp.int32)
 
     for chunk_start in range(0, n_variants, chunk_size):
@@ -1076,33 +1210,32 @@ def _ihh01_scan_gpu(h, gaps, min_ehh=0.05, min_maf=0.05,
 
         h_chunk = h_contig[chunk_start:chunk_end]
 
-        _ihh01_ssl_kernel((grid,), (block,),
+        _ihh01_ssl_kernel((grid_ssl,), (block_ssl,),
                           (h_chunk, np.int32(c_len), np.int32(n_haplotypes),
                            pair_j, pair_k, np.int32(n_pairs),
                            hist_00, hist_11,
                            ssl_state,
                            np.int32(hist_size)))
 
-        hist_00_cpu = hist_00.get()
-        hist_11_cpu = hist_11.get()
+        # Compute n_pairs per variant for each allele class (sum of histogram)
+        n00 = cp.sum(hist_00, axis=1)
+        n11 = cp.sum(hist_11, axis=1)
+
+        # Integrate on GPU
+        ihh0_chunk = _integrate_ihh_gpu(hist_00, gaps, n00, chunk_start,
+                                         min_ehh, include_edges)
+        ihh1_chunk = _integrate_ihh_gpu(hist_11, gaps, n11, chunk_start,
+                                         min_ehh, include_edges)
         del hist_00, hist_11
 
-        for ci in range(c_len):
-            i = chunk_start + ci
-            total = c0[i] + c1[i]
-            if total == 0:
-                continue
-            maf = min(c0[i], c1[i]) / total
-            if maf < min_maf:
-                continue
+        vihh0[chunk_start:chunk_end] = ihh0_chunk
+        vihh1[chunk_start:chunk_end] = ihh1_chunk
 
-            n00 = int(np.sum(hist_00_cpu[ci]))
-            n11 = int(np.sum(hist_11_cpu[ci]))
-
-            vihh0[i] = _ssl_hist_to_ihh(hist_00_cpu[ci], n00, i, gaps_cpu,
-                                         min_ehh, include_edges)
-            vihh1[i] = _ssl_hist_to_ihh(hist_11_cpu[ci], n11, i, gaps_cpu,
-                                         min_ehh, include_edges)
+    # Apply MAF filter: set scores to NaN where MAF < min_maf or no data
+    maf_cpu = maf_arr.get()
+    mask = (maf_cpu < min_maf) | (total_counts.get() == 0)
+    vihh0[mask] = np.nan
+    vihh1[mask] = np.nan
 
     return vihh0, vihh1
 
@@ -1142,10 +1275,9 @@ def _ihh_scan_gpu(h, gaps, min_ehh=0.05, include_edges=False,
 
     pair_j, pair_k = _get_pair_indices(n_haplotypes)
     h_contig = cp.ascontiguousarray(h.astype(cp.int8))
-    gaps_cpu = gaps.get()
 
-    block = 256
-    grid = (n_pairs + block - 1) // block
+    block_ssl = 256
+    grid_ssl = (n_pairs + block_ssl - 1) // block_ssl
 
     vihh = np.empty(n_variants, dtype=np.float64)
     ssl_state = cp.zeros(n_pairs, dtype=cp.int32)
@@ -1157,18 +1289,18 @@ def _ihh_scan_gpu(h, gaps, min_ehh=0.05, include_edges=False,
         hist = cp.zeros((c_len, hist_size), dtype=cp.int32)
         h_chunk = h_contig[chunk_start:chunk_end]
 
-        _ihh_ssl_kernel((grid,), (block,),
+        _ihh_ssl_kernel((grid_ssl,), (block_ssl,),
                         (h_chunk, np.int32(c_len), np.int32(n_haplotypes),
                          pair_j, pair_k, np.int32(n_pairs), hist,
                          ssl_state, np.int32(hist_size)))
 
-        hist_cpu = hist.get()
+        # All pairs contribute to EHH for cross-pop stats
+        n_pairs_arr = cp.full(c_len, n_pairs, dtype=cp.int32)
+        ihh_chunk = _integrate_ihh_gpu(hist, gaps, n_pairs_arr, chunk_start,
+                                        min_ehh, include_edges)
         del hist
 
-        for ci in range(c_len):
-            i = chunk_start + ci
-            vihh[i] = _ssl_hist_to_ihh(hist_cpu[ci], n_pairs, i, gaps_cpu,
-                                        min_ehh, include_edges)
+        vihh[chunk_start:chunk_end] = ihh_chunk
 
     return vihh
 
