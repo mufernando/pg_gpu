@@ -220,6 +220,7 @@ def moving_garud_h(haplotype_matrix: HaplotypeMatrix,
     # GPU fast path: precompute cumulative weighted sums on GPU,
     # compute per-window hashes on GPU, transfer only the small hash
     # arrays to CPU for sorting/counting.
+    # float64 for prefix-sum hashing to avoid accumulation error over long ranges
     n_hap = hap.shape[0]
     h_f64 = hap.astype(cp.float64)
 

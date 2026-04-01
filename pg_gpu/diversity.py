@@ -992,22 +992,18 @@ def haplotype_diversity(haplotype_matrix: HaplotypeMatrix,
         counts = Counter(cluster_id)
         frequencies = np.array(list(counts.values())) / n_haplotypes
     else:
-        # GPU fast path: compute two independent hash values per haplotype
-        # via dot product with random int32 weights. Binary data (0/1) makes
-        # this a simple sum of selected weights. Two hashes avoid collisions.
+        # GPU fast path: dot-product hashing with two random weight vectors
         n_var = haplotypes.shape[1]
         rng = cp.random.RandomState(seed=42)
-        w1 = rng.standard_normal(n_var, dtype=cp.float64)
-        w2 = rng.standard_normal(n_var, dtype=cp.float64)
-        h_f64 = haplotypes.astype(cp.float64)
-        hash1 = h_f64 @ w1  # (n_hap,)
-        hash2 = h_f64 @ w2  # (n_hap,)
-        # Sort by (hash1, hash2) to group identical haplotypes
+        w1 = rng.standard_normal(n_var, dtype=cp.float32)
+        w2 = rng.standard_normal(n_var, dtype=cp.float32)
+        h_f32 = haplotypes.astype(cp.float32)
+        hash1 = h_f32 @ w1
+        hash2 = h_f32 @ w2
         order = cp.lexsort(cp.stack([hash2, hash1]))
         s1 = hash1[order]
         s2 = hash2[order]
-        # Count runs of identical keys (use tolerance for float comparison)
-        diff = (cp.abs(s1[1:] - s1[:-1]) > 1e-6) | (cp.abs(s2[1:] - s2[:-1]) > 1e-6)
+        diff = (cp.abs(s1[1:] - s1[:-1]) > 1e-3) | (cp.abs(s2[1:] - s2[:-1]) > 1e-3)
         boundaries = cp.concatenate([cp.array([True]), diff])
         boundary_idx = cp.where(boundaries)[0]
         counts_gpu = cp.diff(cp.concatenate([boundary_idx,

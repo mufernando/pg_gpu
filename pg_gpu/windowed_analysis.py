@@ -1382,31 +1382,25 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                                results)
 
     # Per-site stats binned into windows via scatter_add
-    import cupyx
     bin_idx = cp.searchsorted(bp_bins_gpu[1:], positions)
+    in_range = (bin_idx >= 0) & (bin_idx < n_windows)
+
+    # Shared DAC computation (used by daf_hist and mu_sfs)
+    dac_gpu = None
+    if any(s in statistics for s in ('daf_hist', 'mu_sfs')):
+        dac_gpu = cp.sum(cp.maximum(matrix.haplotypes, 0).astype(cp.int32), axis=0)
 
     if 'mean_nsl' in statistics:
         from . import selection as sel
-        nsl_scores = sel.nsl(haplotype_matrix, population=population)
-        nsl_gpu = cp.asarray(nsl_scores)
-        valid = cp.isfinite(nsl_gpu)
-        nsl_sum = cp.zeros(n_windows, dtype=cp.float64)
-        nsl_count = cp.zeros(n_windows, dtype=cp.float64)
-        valid_idx = bin_idx[valid]
-        in_range = (valid_idx >= 0) & (valid_idx < n_windows)
-        cupyx.scatter_add(nsl_sum, valid_idx[in_range], nsl_gpu[valid][in_range])
-        cupyx.scatter_add(nsl_count, valid_idx[in_range],
-                          cp.ones_like(valid_idx[in_range], dtype=cp.float64))
-        nsl_mean = nsl_sum.get() / np.maximum(nsl_count.get(), 1)
-        nsl_mean[nsl_count.get() == 0] = np.nan
-        results['mean_nsl'] = nsl_mean
+        nsl_gpu = cp.asarray(sel.nsl(haplotype_matrix, population=population))
+        valid = cp.isfinite(nsl_gpu) & in_range
+        results['mean_nsl'] = _windowed_mean(nsl_gpu, bin_idx, valid, n_windows)
 
     # SNP distance stats per window
     snp_dist_stats = {'snp_dist_mean', 'snp_dist_var', 'snp_dist_min',
                       'snp_dist_max', 'mu_var'}
     if any(s in statistics for s in snp_dist_stats):
-        ws = win_start.get()
-        we = win_stop.get()
+        ws_np, we_np = win_start.get(), win_stop.get()
         pos_cpu = positions.get() if hasattr(positions, 'get') else np.asarray(positions)
         sd_mean = np.full(n_windows, np.nan)
         sd_var = np.full(n_windows, np.nan)
@@ -1415,7 +1409,7 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
         mu_var_arr = np.full(n_windows, np.nan)
 
         for wi in range(n_windows):
-            s, e = int(ws[wi]), int(we[wi])
+            s, e = int(ws_np[wi]), int(we_np[wi])
             if e - s < 2:
                 if e - s == 1:
                     mu_var_arr[wi] = 1.0 / window_bases[wi] if per_base and window_bases[wi] > 0 else 1.0
@@ -1426,115 +1420,84 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
             sd_var[wi] = np.var(gaps)
             sd_min[wi] = np.min(gaps)
             sd_max[wi] = np.max(gaps)
-            win_span = float(win_pos[-1] - win_pos[0]) if len(win_pos) > 1 else 1.0
             mu_var_arr[wi] = len(win_pos) / window_bases[wi] if per_base and window_bases[wi] > 0 else float(len(win_pos))
 
-        if 'snp_dist_mean' in statistics:
-            results['snp_dist_mean'] = sd_mean
-        if 'snp_dist_var' in statistics:
-            results['snp_dist_var'] = sd_var
-        if 'snp_dist_min' in statistics:
-            results['snp_dist_min'] = sd_min
-        if 'snp_dist_max' in statistics:
-            results['snp_dist_max'] = sd_max
-        if 'mu_var' in statistics:
-            results['mu_var'] = mu_var_arr
+        for stat, arr in [('snp_dist_mean', sd_mean), ('snp_dist_var', sd_var),
+                          ('snp_dist_min', sd_min), ('snp_dist_max', sd_max),
+                          ('mu_var', mu_var_arr)]:
+            if stat in statistics:
+                results[stat] = arr
 
-    # DAF histogram per window (binned derived allele frequencies)
+    # DAF histogram per window (GPU scatter)
     if 'daf_hist' in statistics:
         n_daf_bins = 20
-        # Compute per-site DAF on GPU
-        hap_raw = matrix.haplotypes
-        dac = cp.sum(cp.maximum(hap_raw, 0).astype(cp.int32), axis=0).astype(cp.float64)
-        daf = dac / n_hap
-        daf_cpu = daf.get()
-        bin_idx_cpu = bin_idx.get()
-
-        # Build histogram per window
-        daf_edges = np.linspace(0, 1, n_daf_bins + 1)
-        hist_matrix = np.zeros((n_windows, n_daf_bins), dtype=np.float64)
-        for vi in range(len(daf_cpu)):
-            wi = int(bin_idx_cpu[vi])
-            if 0 <= wi < n_windows:
-                b = min(int(daf_cpu[vi] * n_daf_bins), n_daf_bins - 1)
-                hist_matrix[wi, b] += 1
-        # Store each bin as a separate column
+        daf = dac_gpu.astype(cp.float64) / n_hap
+        daf_bin = cp.minimum((daf * n_daf_bins).astype(cp.int32), n_daf_bins - 1)
+        # Composite index: window * n_daf_bins + daf_bin
+        composite = bin_idx * n_daf_bins + daf_bin
+        valid_daf = in_range
+        flat = _scatter_sum(cp.ones_like(composite[valid_daf], dtype=cp.float64),
+                            composite[valid_daf], n_windows * n_daf_bins)
+        hist_matrix = flat.get().reshape(n_windows, n_daf_bins)
         for b in range(n_daf_bins):
             results[f'daf_bin_{b}'] = hist_matrix[:, b]
 
-    # muSFS: fraction of SNPs at SFS edges (singletons + near-fixed)
+    # muSFS: fraction of SNPs at SFS edges
     if 'mu_sfs' in statistics:
-        hap_raw = matrix.haplotypes
-        dac = cp.sum(cp.maximum(hap_raw, 0).astype(cp.int32), axis=0)
-        is_edge = ((dac == 1) | (dac == n_hap - 1)).astype(cp.float64)
-        edge_sum = cp.zeros(n_windows, dtype=cp.float64)
-        total_sum = cp.zeros(n_windows, dtype=cp.float64)
-        in_range = (bin_idx >= 0) & (bin_idx < n_windows)
-        cupyx.scatter_add(edge_sum, bin_idx[in_range], is_edge[in_range])
-        n_in_range = int(in_range.sum().get())
-        cupyx.scatter_add(total_sum, bin_idx[in_range],
-                          cp.ones(n_in_range, dtype=cp.float64))
-        mu_sfs = edge_sum.get() / np.maximum(total_sum.get(), 1)
-        mu_sfs[total_sum.get() == 0] = np.nan
+        is_edge = ((dac_gpu == 1) | (dac_gpu == n_hap - 1)).astype(cp.float64)
+        edge_sum = _scatter_sum(is_edge[in_range], bin_idx[in_range], n_windows)
+        total_count = _bin_counts(bin_idx[in_range], n_windows)
+        edge_cpu = edge_sum.get()
+        count_cpu = total_count.get()
+        mu_sfs = np.where(count_cpu > 0, edge_cpu / count_cpu, np.nan)
         results['mu_sfs'] = mu_sfs
 
-    # Per-window LD and haplotype pattern stats (require pairwise computation)
-    ld_stats = {'zns', 'omega', 'mu_ld'}
-    dist_stats = {'dist_var', 'dist_skew', 'dist_kurt'}
-    perwin_requested = any(s in statistics for s in (ld_stats | dist_stats))
+    # Per-window pairwise stats (LD, distance moments)
+    ld_pairwise = {'zns', 'omega', 'mu_ld'}
+    dist_pairwise = {'dist_var', 'dist_skew', 'dist_kurt'}
+    perwin_stats = {s for s in (ld_pairwise | dist_pairwise) if s in statistics}
 
-    if perwin_requested:
+    if perwin_stats:
         from . import ld_statistics
         from . import distance_stats
-        ws_np = win_start.get()
-        we_np = win_stop.get()
+        ws_np, we_np = win_start.get(), win_stop.get()
 
-        zns_arr = np.full(n_windows, np.nan) if 'zns' in statistics else None
-        omega_arr = np.full(n_windows, np.nan) if 'omega' in statistics else None
-        mu_ld_arr = np.full(n_windows, np.nan) if 'mu_ld' in statistics else None
-        dvar_arr = np.full(n_windows, np.nan) if 'dist_var' in statistics else None
-        dskew_arr = np.full(n_windows, np.nan) if 'dist_skew' in statistics else None
-        dkurt_arr = np.full(n_windows, np.nan) if 'dist_kurt' in statistics else None
+        stat_arrays = {s: np.full(n_windows, np.nan) for s in perwin_stats}
+        need_dist = bool(perwin_stats & dist_pairwise)
 
         for wi in range(n_windows):
             s, e = int(ws_np[wi]), int(we_np[wi])
             if e - s < 4:
                 continue
-            win_pos = matrix.positions[s:e]
-            win_hap = matrix.haplotypes[:, s:e]
-            win_mat = HaplotypeMatrix(win_hap, win_pos)
-            try:
-                if zns_arr is not None:
-                    zns_arr[wi] = ld_statistics.zns(win_mat)
-                if omega_arr is not None:
-                    omega_arr[wi] = ld_statistics.omega(win_mat)
-                if mu_ld_arr is not None:
-                    mu_ld_arr[wi] = ld_statistics.mu_ld(win_mat)
-                if any(a is not None for a in [dvar_arr, dskew_arr, dkurt_arr]):
-                    v, sk, ku = distance_stats.dist_moments(win_mat)
-                    if dvar_arr is not None:
-                        dvar_arr[wi] = v
-                    if dskew_arr is not None:
-                        dskew_arr[wi] = sk
-                    if dkurt_arr is not None:
-                        dkurt_arr[wi] = ku
-            except Exception:
-                pass
+            win_mat = HaplotypeMatrix(matrix.haplotypes[:, s:e],
+                                       matrix.positions[s:e])
+            if 'zns' in stat_arrays:
+                stat_arrays['zns'][wi] = ld_statistics.zns(win_mat)
+            if 'omega' in stat_arrays:
+                stat_arrays['omega'][wi] = ld_statistics.omega(win_mat)
+            if 'mu_ld' in stat_arrays:
+                stat_arrays['mu_ld'][wi] = ld_statistics.mu_ld(win_mat)
+            if need_dist:
+                v, sk, ku = distance_stats.dist_moments(win_mat)
+                if 'dist_var' in stat_arrays:
+                    stat_arrays['dist_var'][wi] = v
+                if 'dist_skew' in stat_arrays:
+                    stat_arrays['dist_skew'][wi] = sk
+                if 'dist_kurt' in stat_arrays:
+                    stat_arrays['dist_kurt'][wi] = ku
 
-        if zns_arr is not None:
-            results['zns'] = zns_arr
-        if omega_arr is not None:
-            results['omega'] = omega_arr
-        if mu_ld_arr is not None:
-            results['mu_ld'] = mu_ld_arr
-        if dvar_arr is not None:
-            results['dist_var'] = dvar_arr
-        if dskew_arr is not None:
-            results['dist_skew'] = dskew_arr
-        if dkurt_arr is not None:
-            results['dist_kurt'] = dkurt_arr
+        results.update(stat_arrays)
 
     return results
+
+
+def _windowed_mean(values, bin_idx, valid_mask, n_bins):
+    """Compute mean of values per window bin, returning NaN for empty bins."""
+    val_sum = _scatter_sum(values[valid_mask], bin_idx[valid_mask], n_bins)
+    val_count = _bin_counts(bin_idx[valid_mask], n_bins)
+    sum_cpu = val_sum.get()
+    count_cpu = val_count.get()
+    return np.where(count_cpu > 0, sum_cpu / count_cpu, np.nan)
 
 
 def _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
@@ -1554,6 +1517,7 @@ def _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
     n_hap, n_var = hap.shape
 
     # Prefix-sum hashing: cumsum of hap * random_weights along variant axis
+    # float64 for prefix sums to avoid accumulation error over long ranges
     h_f64 = hap.astype(cp.float64)
     rng = cp.random.RandomState(seed=42)
     w1 = rng.standard_normal(n_var, dtype=cp.float64)
