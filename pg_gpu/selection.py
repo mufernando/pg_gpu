@@ -926,16 +926,14 @@ def _compute_gaps(pos, map_pos=None, gap_scale=20000, max_gap=200000,
 
 
 # ---------------------------------------------------------------------------
-# Fused IHH kernels: one thread block per focal variant
+# CUDA kernels for IHH computation (iHS, xpEHH)
 # ---------------------------------------------------------------------------
 #
-# Each block handles one focal variant. Threads in the block cooperatively
-# scan backward, checking which haplotype pairs are still identical.
-# Block-level reductions compute EHH; the block leader integrates IHH.
+# iHS uses fused kernels: one thread block per focal variant, scanning
+# backward with block-level reductions. O(n_variants) memory.
 #
-# Memory: O(n_variants) for output -- no histogram storage needed.
-# Compute: O(n_variants * avg_EHH_steps * n_pairs / block_size).
-# Early-exits when EHH decays below min_ehh for both allele classes.
+# xpEHH uses chunked histogram kernels: one thread per pair builds SSL
+# histograms, then a separate kernel integrates IHH from histograms.
 
 _ihh01_fused_kernel = cp.RawKernel(r'''
 extern "C" __global__
@@ -1201,64 +1199,8 @@ void ihh_fused_kernel(
 
 
 # ---------------------------------------------------------------------------
-# CUDA RawKernels for IHH-based scans (iHS, XP-EHH) -- histogram fallback
+# Histogram-based IHH for xpEHH (one thread per pair, chunked)
 # ---------------------------------------------------------------------------
-
-def _auto_ssl_cap(n_variants, n_histograms=2):
-    """Choose the largest SSL histogram width that fits in GPU memory.
-
-    Uses up to 40% of free GPU memory for histograms, but since we
-    process in chunks (target ~2 GB per chunk), the cap is based on
-    the full variant count while chunk size adapts to memory.
-
-    For correctness, the cap should be large enough that EHH decays
-    below min_ehh within cap steps. In high-LD organisms this can be
-    50k+ variants, so we target n_variants (exact) when feasible, with
-    a minimum of 256.
-    """
-    # Since we chunk the variant axis, the cap doesn't need to fit
-    # all variants at once -- only the chunk does. So set cap as high
-    # as n_variants (exact) and let the chunking handle memory.
-    return n_variants
-
-
-_ihh01_ssl_kernel = cp.RawKernel(r'''
-extern "C" __global__
-void ihh01_ssl_kernel(const signed char* h, int n_variants, int n_haplotypes,
-                      const int* pair_j, const int* pair_k, int n_pairs,
-                      int* hist_00, int* hist_11,
-                      int* ssl_state,
-                      int hist_size) {
-    int pid = blockDim.x * blockIdx.x + threadIdx.x;
-    if (pid >= n_pairs) return;
-
-    int j = pair_j[pid];
-    int k = pair_k[pid];
-    int ssl = ssl_state[pid];
-
-    for (int i = 0; i < n_variants; i++) {
-        signed char a1 = h[i * n_haplotypes + j];
-        signed char a2 = h[i * n_haplotypes + k];
-
-        if (a1 < 0 || a2 < 0) {
-            ssl += 1;
-        } else if (a1 == a2) {
-            ssl += 1;
-            int bucket = ssl < hist_size ? ssl : hist_size - 1;
-            if (a1 == 0) {
-                atomicAdd(&hist_00[i * hist_size + bucket], 1);
-            } else {
-                atomicAdd(&hist_11[i * hist_size + bucket], 1);
-            }
-        } else {
-            ssl = 0;
-        }
-    }
-
-    ssl_state[pid] = ssl;
-}
-''', 'ihh01_ssl_kernel')
-
 
 _ihh_ssl_kernel = cp.RawKernel(r'''
 extern "C" __global__
@@ -1289,67 +1231,6 @@ void ihh_ssl_kernel(const signed char* h, int n_variants, int n_haplotypes,
 }
 ''', 'ihh_ssl_kernel')
 
-
-def _ssl_hist_to_ihh(hist_row, n_pairs, variant_idx, gaps_cpu, min_ehh,
-                     include_edges):
-    """Compute IHH from a single variant's SSL histogram (CPU).
-
-    Parameters
-    ----------
-    hist_row : ndarray, int32, shape (max_ssl+1,)
-        Histogram of SSL values for pairs at this variant.
-    n_pairs : int
-        Total number of pairs in this allele class.
-    variant_idx : int
-        Current variant index (scan position).
-    gaps_cpu : ndarray, float64
-        Gap array (CPU).
-    min_ehh : float
-    include_edges : bool
-
-    Returns
-    -------
-    ihh : float
-    """
-    if n_pairs == 0:
-        return np.nan
-
-    # pairs with ssl=0 are no longer homozygous
-    n_pairs_ident = n_pairs - int(hist_row[0])
-    ehh_prv = n_pairs_ident / n_pairs
-
-    if ehh_prv <= min_ehh:
-        return 0.0
-
-    ihh = 0.0
-
-    for i in range(1, variant_idx + 1):
-        if i < len(hist_row):
-            n_pairs_ident -= int(hist_row[i])
-        ehh_cur = n_pairs_ident / n_pairs
-
-        gap_idx = variant_idx - i
-        gap = gaps_cpu[gap_idx]
-
-        if gap < 0:
-            return np.nan
-
-        ihh += gap * (ehh_cur + ehh_prv) / 2
-
-        if ehh_cur <= min_ehh:
-            return ihh
-
-        ehh_prv = ehh_cur
-
-    if include_edges:
-        return ihh
-
-    return np.nan
-
-
-# ---------------------------------------------------------------------------
-# GPU kernel for IHH integration from SSL histograms
-# ---------------------------------------------------------------------------
 
 _ihh_integrate_kernel = cp.RawKernel(r'''
 extern "C" __global__

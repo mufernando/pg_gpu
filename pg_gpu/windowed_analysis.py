@@ -648,6 +648,56 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
     pd.DataFrame
         Windowed statistics results
     """
+    if step_size is None:
+        step_size = window_size
+
+    # Fast path: use fused CUDA kernels when possible.
+    # Requirements: non-overlapping windows, 'include' missing data,
+    # and all requested stats are supported by the fused kernel.
+    fused_single = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites', 'singletons'}
+    fused_two = {'fst', 'dxy'}
+    fused_all = fused_single | fused_two
+    requested = set(statistics)
+
+    can_fuse = (step_size == window_size
+                and missing_data == 'include'
+                and requested <= fused_all)
+
+    if can_fuse:
+        if haplotype_matrix.device == 'CPU':
+            haplotype_matrix.transfer_to_gpu()
+        positions = haplotype_matrix.positions
+        if hasattr(positions, 'get'):
+            positions = positions.get()
+        positions = np.asarray(positions)
+
+        chrom_start = haplotype_matrix.chrom_start
+        chrom_end = haplotype_matrix.chrom_end
+        if chrom_start is None:
+            chrom_start = int(positions[0])
+        if chrom_end is None:
+            chrom_end = int(positions[-1])
+        chrom_start = int(chrom_start)
+        chrom_end = int(chrom_end)
+        # Build non-overlapping bins covering [chrom_start, chrom_end].
+        span = chrom_end - chrom_start
+        n_windows = max(1, (span + window_size - 1) // window_size)
+        bp_bins = chrom_start + np.arange(n_windows + 1, dtype=np.float64) * window_size
+
+        pop1 = populations[0] if populations and len(populations) >= 1 else None
+        pop2 = populations[1] if populations and len(populations) >= 2 else None
+
+        result_dict = windowed_statistics_fused(
+            haplotype_matrix,
+            bp_bins=bp_bins,
+            statistics=tuple(statistics),
+            pop1=pop1,
+            pop2=pop2,
+            per_base=(span_denominator == 'total'),
+        )
+        return pd.DataFrame(result_dict)
+
+    # Fallback: per-window Python loop
     analyzer = WindowedAnalyzer(
         window_type='bp',
         window_size=window_size,
