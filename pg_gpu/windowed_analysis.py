@@ -652,8 +652,6 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
         step_size = window_size
 
     # Fast path: use fused CUDA kernels when possible.
-    # Requirements: non-overlapping windows, 'include' missing data,
-    # and all requested stats are supported by the fused kernel.
     fused_single = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites',
                     'singletons', 'theta_h', 'fay_wu_h', 'max_daf'}
     fused_two = {'fst', 'fst_hudson', 'fst_wc', 'dxy', 'da'}
@@ -668,9 +666,7 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
                  | fused_diploshic)
     requested = set(statistics)
 
-    can_fuse = (step_size == window_size
-                and missing_data == 'include'
-                and requested <= fused_all)
+    can_fuse = (missing_data == 'include' and requested <= fused_all)
 
     if can_fuse:
         if haplotype_matrix.device == 'CPU':
@@ -688,10 +684,13 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
             chrom_end = int(positions[-1])
         chrom_start = int(chrom_start)
         chrom_end = int(chrom_end)
-        # Build non-overlapping bins covering [chrom_start, chrom_end].
-        span = chrom_end - chrom_start
-        n_windows = max(1, (span + window_size - 1) // window_size)
-        bp_bins = chrom_start + np.arange(n_windows + 1, dtype=np.float64) * window_size
+
+        # Build window start/stop arrays (supports overlapping windows)
+        win_starts = np.arange(chrom_start, chrom_end, step_size,
+                               dtype=np.float64)
+        win_stops = win_starts + window_size
+        # Build equivalent bp_bins for _compute_window_ranges
+        bp_bins = np.concatenate([win_starts, [win_stops[-1]]])
 
         pop1 = populations[0] if populations and len(populations) >= 1 else None
         pop2 = populations[1] if populations and len(populations) >= 2 else None
@@ -703,6 +702,8 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
             pop1=pop1,
             pop2=pop2,
             per_base=(span_denominator == 'total'),
+            _win_starts=win_starts,
+            _win_stops=win_stops,
         )
         return pd.DataFrame(result_dict)
 
@@ -1137,7 +1138,9 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                               pop1=None,
                               pop2=None,
                               per_base: bool = True,
-                              is_accessible=None):
+                              is_accessible=None,
+                              _win_starts=None,
+                              _win_stops=None):
     """GPU-native windowed statistics using fused CUDA kernels.
 
     One kernel launch processes ALL windows in parallel. Each thread block
@@ -1190,28 +1193,36 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
     if not isinstance(positions, cp.ndarray):
         positions = cp.asarray(positions)
 
-    bp_bins_gpu = cp.asarray(bp_bins, dtype=cp.float64)
-    n_windows = len(bp_bins_gpu) - 1
-
-    # map windows to variant index ranges
-    win_start, win_stop = _compute_window_ranges(positions, bp_bins_gpu)
+    # Support overlapping windows via explicit start/stop arrays
+    if _win_starts is not None and _win_stops is not None:
+        ws_gpu = cp.asarray(_win_starts, dtype=cp.float64)
+        we_gpu = cp.asarray(_win_stops, dtype=cp.float64)
+        n_windows = len(ws_gpu)
+        win_start = cp.searchsorted(positions, ws_gpu, side='left').astype(cp.int64)
+        win_stop = cp.searchsorted(positions, we_gpu, side='left').astype(cp.int64)
+    else:
+        bp_bins_gpu = cp.asarray(bp_bins, dtype=cp.float64)
+        n_windows = len(bp_bins_gpu) - 1
+        win_start, win_stop = _compute_window_ranges(positions, bp_bins_gpu)
+        ws_gpu = bp_bins_gpu[:-1]
+        we_gpu = bp_bins_gpu[1:]
 
     results = {
-        'window_start': bp_bins_gpu[:-1].get(),
-        'window_stop': bp_bins_gpu[1:].get(),
+        'window_start': ws_gpu.get() if hasattr(ws_gpu, 'get') else ws_gpu,
+        'window_stop': we_gpu.get() if hasattr(we_gpu, 'get') else we_gpu,
     }
 
-    # window sizes for normalization
     if per_base:
         if is_accessible is not None:
             is_accessible = np.asarray(is_accessible, dtype=bool)
-            bp_edges = bp_bins_gpu.get()
+            ws_np = results['window_start']
+            we_np = results['window_stop']
             window_bases = np.array([
-                np.count_nonzero(is_accessible[max(0, int(bp_edges[i])):int(bp_edges[i+1])])
+                np.count_nonzero(is_accessible[max(0, int(ws_np[i])):int(we_np[i])])
                 for i in range(n_windows)
             ], dtype=np.float64)
         else:
-            window_bases = np.diff(bp_bins_gpu.get())
+            window_bases = results['window_stop'] - results['window_start']
 
     # single-pop stats via fused kernel
     single_pop_stats = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites',
@@ -1377,12 +1388,12 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                    'haplotype_count'}
     garud_requested = any(s in statistics for s in garud_stats)
     if garud_requested:
-        _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
+        _compute_fused_garud_h(haplotype_matrix, population,
                                win_start, win_stop, n_windows, statistics,
                                results)
 
     # Per-site stats binned into windows via scatter_add
-    bin_idx = cp.searchsorted(bp_bins_gpu[1:], positions)
+    bin_idx = cp.searchsorted(we_gpu, positions)
     in_range = (bin_idx >= 0) & (bin_idx < n_windows)
 
     # Shared DAC computation (used by daf_hist and mu_sfs)
@@ -1500,7 +1511,7 @@ def _windowed_mean(values, bin_idx, valid_mask, n_bins):
     return np.where(count_cpu > 0, sum_cpu / count_cpu, np.nan)
 
 
-def _compute_fused_garud_h(haplotype_matrix, population, bp_bins_gpu,
+def _compute_fused_garud_h(haplotype_matrix, population,
                             win_start, win_stop, n_windows, statistics,
                             results):
     """Compute windowed Garud's H using prefix-sum hashing + fused GPU kernel."""
