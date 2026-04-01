@@ -872,16 +872,19 @@ def _compute_gaps(pos, map_pos=None, gap_scale=20000, max_gap=200000,
 def _auto_ssl_cap(n_variants, n_histograms=2):
     """Choose the largest SSL histogram width that fits in GPU memory.
 
-    Targets using at most 40% of free GPU memory for histograms.
-    Falls back to n_variants (exact) if memory allows.
+    Uses up to 40% of free GPU memory for histograms, but since we
+    process in chunks (target ~2 GB per chunk), the cap is based on
+    the full variant count while chunk size adapts to memory.
+
+    For correctness, the cap should be large enough that EHH decays
+    below min_ehh within cap steps. In high-LD organisms this can be
+    50k+ variants, so we target n_variants (exact) when feasible, with
+    a minimum of 256.
     """
-    free_bytes = cp.cuda.Device().mem_info[0]
-    budget = int(free_bytes * 0.4)
-    # Each histogram cell is int32 (4 bytes). Total cells = n_variants * hist_size * n_histograms
-    max_hist_size = budget // (n_variants * 4 * n_histograms)
-    cap = min(max_hist_size, n_variants + 1) - 1
-    # Floor at a reasonable minimum
-    return max(cap, 256)
+    # Since we chunk the variant axis, the cap doesn't need to fit
+    # all variants at once -- only the chunk does. So set cap as high
+    # as n_variants (exact) and let the chunking handle memory.
+    return n_variants
 
 
 _ihh01_ssl_kernel = cp.RawKernel(r'''

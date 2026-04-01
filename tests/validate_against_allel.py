@@ -26,7 +26,7 @@ N_POP1 = 50          # first 50 diploid individuals -> pop1 (100 haplotypes)
 N_POP2 = 50          # next 50 -> pop2 (100 haplotypes)
 
 # Selection scan sub-region (keep tractable)
-SEL_START, SEL_END = 9_950_000, 10_000_000
+SEL_START, SEL_END = 9_000_000, 10_000_000
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
