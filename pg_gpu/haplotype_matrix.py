@@ -720,8 +720,12 @@ class HaplotypeMatrix:
         m = self.num_variants
         n_hap = self.num_haplotypes
 
-        # allele frequencies
-        p = cp.sum(self.haplotypes, axis=0).astype(cp.float64) / n_hap
+        # allele frequencies from valid data
+        hap = self.haplotypes
+        valid_mask = (hap >= 0).astype(cp.float64)
+        hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
+        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
+        p = cp.where(n_valid > 0, cp.sum(hap_clean, axis=0) / n_valid, 0.0)
 
         # pruning state kept on CPU to avoid per-scalar GPU transfers
         loc = np.ones(m, dtype=bool)
@@ -735,11 +739,14 @@ class HaplotypeMatrix:
 
             active_idx = np.where(active)[0] + w_start
             active_idx_gpu = cp.asarray(active_idx)
-            hap_window = self.haplotypes[:, active_idx_gpu]
+            hw = hap_clean[:, active_idx_gpu]
+            vm = valid_mask[:, active_idx_gpu]
             p_window = p[active_idx_gpu]
 
             # pairwise r² within window via matrix multiply
-            p_AB = (hap_window.T @ hap_window).astype(cp.float64) / n_hap
+            joint_n = vm.T @ vm
+            joint_11 = hw.T @ hw
+            p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
             p_Ap_B = cp.outer(p_window, p_window)
             D = p_AB - p_Ap_B
             denom = cp.outer(p_window * (1 - p_window),

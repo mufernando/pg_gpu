@@ -1191,24 +1191,29 @@ def _per_variant_is_singleton(hap, n_hap_int):
 def _per_variant_fst_hudson_components(hap1, hap2, n1, n2):
     """Per-variant Hudson FST numerator and denominator (GPU).
 
-    Returns (num, den) as CuPy arrays.
+    Returns (num, den) as CuPy arrays. Handles missing data (-1) by
+    using per-site valid counts.
     """
-    ac1_1 = cp.sum(hap1, axis=0).astype(cp.float64)
-    ac1_0 = n1 - ac1_1
-    ac2_1 = cp.sum(hap2, axis=0).astype(cp.float64)
-    ac2_0 = n2 - ac2_1
+    valid1 = (hap1 >= 0).astype(cp.float64)
+    valid2 = (hap2 >= 0).astype(cp.float64)
+    ac1_1 = cp.sum(cp.where(hap1 >= 0, hap1, 0), axis=0).astype(cp.float64)
+    n1_v = cp.sum(valid1, axis=0).astype(cp.float64)
+    ac1_0 = n1_v - ac1_1
+    ac2_1 = cp.sum(cp.where(hap2 >= 0, hap2, 0), axis=0).astype(cp.float64)
+    n2_v = cp.sum(valid2, axis=0).astype(cp.float64)
+    ac2_0 = n2_v - ac2_1
 
-    n1_pairs = n1 * (n1 - 1) / 2
+    n1_pairs = n1_v * (n1_v - 1) / 2
     n1_same = (ac1_0 * (ac1_0 - 1) + ac1_1 * (ac1_1 - 1)) / 2
     mpd1 = cp.where(n1_pairs > 0, (n1_pairs - n1_same) / n1_pairs, 0.0)
 
-    n2_pairs = n2 * (n2 - 1) / 2
+    n2_pairs = n2_v * (n2_v - 1) / 2
     n2_same = (ac2_0 * (ac2_0 - 1) + ac2_1 * (ac2_1 - 1)) / 2
     mpd2 = cp.where(n2_pairs > 0, (n2_pairs - n2_same) / n2_pairs, 0.0)
 
     within = (mpd1 + mpd2) / 2.0
 
-    n_between = n1 * n2
+    n_between = n1_v * n2_v
     n_between_same = ac1_0 * ac2_0 + ac1_1 * ac2_1
     between = cp.where(n_between > 0,
                        (n_between - n_between_same) / n_between, 0.0)
@@ -1218,12 +1223,16 @@ def _per_variant_fst_hudson_components(hap1, hap2, n1, n2):
 
 def _per_variant_dxy(hap1, hap2, n1, n2):
     """Per-variant mean pairwise difference between populations (GPU)."""
-    ac1_1 = cp.sum(hap1, axis=0).astype(cp.float64)
-    ac1_0 = n1 - ac1_1
-    ac2_1 = cp.sum(hap2, axis=0).astype(cp.float64)
-    ac2_0 = n2 - ac2_1
+    valid1 = (hap1 >= 0).astype(cp.float64)
+    valid2 = (hap2 >= 0).astype(cp.float64)
+    ac1_1 = cp.sum(cp.where(hap1 >= 0, hap1, 0), axis=0).astype(cp.float64)
+    n1_v = cp.sum(valid1, axis=0).astype(cp.float64)
+    ac1_0 = n1_v - ac1_1
+    ac2_1 = cp.sum(cp.where(hap2 >= 0, hap2, 0), axis=0).astype(cp.float64)
+    n2_v = cp.sum(valid2, axis=0).astype(cp.float64)
+    ac2_0 = n2_v - ac2_1
 
-    n_pairs = n1 * n2
+    n_pairs = n1_v * n2_v
     n_same = ac1_0 * ac2_0 + ac1_1 * ac2_1
     return cp.where(n_pairs > 0, (n_pairs - n_same) / n_pairs, 0.0)
 
