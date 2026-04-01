@@ -222,7 +222,7 @@ def zns(r2_matrix_or_matrix, missing_data='include'):
     float
         Mean r-squared (excluding diagonal).
     """
-    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix)
+    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix, missing_data)
 
     m = r2_matrix.shape[0]
     if m < 2:
@@ -248,13 +248,16 @@ def omega(r2_matrix_or_matrix, missing_data='include'):
     r2_matrix_or_matrix : ndarray, HaplotypeMatrix, or GenotypeMatrix
         Square r-squared matrix, or a matrix object (dispatches to
         haploid or diploid r-squared computation automatically).
+    missing_data : str
+        'include' - per-site valid data for frequency computation
+        'exclude' - filter to sites with no missing data
 
     Returns
     -------
     float
         Maximum omega value. Returns 0 if fewer than 5 SNPs.
     """
-    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix)
+    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix, missing_data)
 
     m = r2_matrix.shape[0]
     if m < 5:
@@ -372,17 +375,30 @@ def mu_ld(haplotype_matrix, missing_data='include'):
     return float((n_excl_left / n_left + n_excl_right / n_right) / 2.0)
 
 
-def _resolve_r2_matrix(r2_matrix_or_matrix):
+def _resolve_r2_matrix(r2_matrix_or_matrix, missing_data='include'):
     """Convert a matrix object to an r2 matrix, or pass through raw arrays."""
     from .haplotype_matrix import HaplotypeMatrix
     from .genotype_matrix import GenotypeMatrix
 
-    if isinstance(r2_matrix_or_matrix, GenotypeMatrix):
-        return _r2_matrix_diploid(r2_matrix_or_matrix)
-    elif isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
-        if r2_matrix_or_matrix.device == 'CPU':
-            r2_matrix_or_matrix.transfer_to_gpu()
-        return r2_matrix_or_matrix.pairwise_r2()
+    if isinstance(r2_matrix_or_matrix, (GenotypeMatrix, HaplotypeMatrix)):
+        mat = r2_matrix_or_matrix
+        if hasattr(mat, 'device') and mat.device == 'CPU':
+            mat.transfer_to_gpu()
+        if missing_data == 'exclude':
+            hap = mat.haplotypes if isinstance(mat, HaplotypeMatrix) else mat.genotypes
+            missing_per_var = cp.sum(hap < 0, axis=0)
+            valid = cp.where(missing_per_var == 0)[0]
+            if isinstance(mat, HaplotypeMatrix):
+                mat = mat.get_subset(valid)
+            else:
+                geno = mat.genotypes[:, valid]
+                pos = mat.positions[valid]
+                from .genotype_matrix import GenotypeMatrix as GM
+                mat = GM(geno, pos)
+        if isinstance(mat, GenotypeMatrix):
+            return _r2_matrix_diploid(mat)
+        else:
+            return mat.pairwise_r2()
     else:
         if not isinstance(r2_matrix_or_matrix, cp.ndarray):
             return cp.asarray(r2_matrix_or_matrix, dtype=cp.float64)

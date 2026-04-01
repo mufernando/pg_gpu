@@ -645,19 +645,22 @@ class HaplotypeMatrix:
         if self.device == 'CPU':
             self.transfer_to_gpu()
 
-        n_haplotypes = self.num_haplotypes
-        
-        # Compute allele frequencies for all variants
-        p = cp.sum(self.haplotypes, axis=0) / n_haplotypes  # (n_variants,)
-        
-        # Compute p_AB for all variant pairs using matrix multiplication
-        p_AB = (self.haplotypes.T @ self.haplotypes) / n_haplotypes  # (n_variants, n_variants)
-        
-        # Compute outer product of allele frequencies: p_A * p_B
-        p_Ap_B = cp.outer(p, p)  # (n_variants, n_variants)
-        # Compute D = p_AB - p_A * p_B
+        hap = self.haplotypes
+        valid_mask = (hap >= 0).astype(cp.float64)
+        hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
+        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)  # per-site
+
+        # Allele frequencies from valid data only
+        p = cp.where(n_valid > 0, cp.sum(hap_clean, axis=0) / n_valid, 0.0)
+
+        # p_AB: joint frequency of derived at both sites
+        # Only count haplotypes valid at both sites
+        joint_n = valid_mask.T @ valid_mask  # (n_var, n_var)
+        joint_11 = hap_clean.T @ hap_clean
+        p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
+
+        p_Ap_B = cp.outer(p, p)
         D = p_AB - p_Ap_B
-        # set the diagonal to 0
         cp.fill_diagonal(D, 0)
 
         return D
@@ -667,29 +670,26 @@ class HaplotypeMatrix:
         Calculate the pairwise r2 (correlation coefficient) for all pairs of variants
         in the haplotype matrix.
         """
-        # Ensure data is on GPU
         if self.device == 'CPU':
             self.transfer_to_gpu()
-        
-        n_haplotypes = self.num_haplotypes
-        
-        # Compute allele frequencies for all variants
-        p = cp.sum(self.haplotypes, axis=0) / n_haplotypes  # (n_variants,)
-        
-        # Compute p_AB for all variant pairs using matrix multiplication
-        p_AB = (self.haplotypes.T @ self.haplotypes) / n_haplotypes  # (n_variants, n_variants)
-        
-        # Compute outer product of allele frequencies: p_A * p_B
-        p_Ap_B = cp.outer(p, p)  # (n_variants, n_variants)
-        # Compute D = p_AB - p_A * p_B
+
+        hap = self.haplotypes
+        valid_mask = (hap >= 0).astype(cp.float64)
+        hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
+        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
+
+        p = cp.where(n_valid > 0, cp.sum(hap_clean, axis=0) / n_valid, 0.0)
+
+        joint_n = valid_mask.T @ valid_mask
+        joint_11 = hap_clean.T @ hap_clean
+        p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
+
+        p_Ap_B = cp.outer(p, p)
         D = p_AB - p_Ap_B
-       
-        # compute the denominator: p_A * (1 - p_A) * p_B * (1 - p_B)
-        denom_squared = cp.outer(p * (1 - p), p * (1 - p))  
-        # compute r2
+
+        denom_squared = cp.outer(p * (1 - p), p * (1 - p))
         r2 = cp.where(denom_squared > 0, (D ** 2) / denom_squared, 0)
-        
-        # set the diagonal to 0
+
         cp.fill_diagonal(r2, 0)
 
         return r2

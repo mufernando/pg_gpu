@@ -1558,14 +1558,14 @@ def diplotype_frequency_spectrum(genotype_matrix,
     if isinstance(geno, cp.ndarray):
         geno = geno.get()
 
-    geno = np.maximum(geno, 0).astype(np.int8)
+    geno = np.asarray(geno, dtype=np.int8)
     n_ind = geno.shape[0]
 
-    geno_bytes = np.array([row.tobytes() for row in geno])
-    _, counts = np.unique(geno_bytes, return_counts=True)
-
-    freqs = counts / n_ind
-    freqs = np.sort(freqs)[::-1]
+    # treat missing (-1) as wildcard for diplotype identity
+    labels = _cluster_haplotypes_with_missing(geno)
+    from collections import Counter
+    counts = Counter(labels)
+    freqs = np.array(sorted(counts.values(), reverse=True)) / n_ind
 
     return freqs, len(counts)
 
