@@ -30,7 +30,7 @@ pytest-xdist = ">=3.0"
 ipython = ">=8.0"
 ipykernel = ">=6.0"
 
-[feature.dev.pypi-dependencies]
+[feature.moments.pypi-dependencies]
 moments-popgen = "*"
 
 [feature.docs.dependencies]
@@ -39,6 +39,7 @@ sphinx-rtd-theme = ">=1.0"
 
 [environments]
 default = ["dev", "docs"]
+moments = ["dev", "docs", "moments"]
 
 [tasks]
 test = { cmd = "pytest tests/ -v" }
