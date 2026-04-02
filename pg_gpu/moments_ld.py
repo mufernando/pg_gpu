@@ -5,6 +5,8 @@ Drop-in replacement for moments.LD.Parsing.compute_ld_statistics() using
 pg_gpu's GPU kernels. Output format is identical to moments, so downstream
 inference (bootstrap_data, optimize_log_lbfgsb, Godambe) works unchanged.
 
+Supports 1-4 populations.
+
 Usage:
     from pg_gpu.moments_ld import compute_ld_statistics
 
@@ -23,19 +25,13 @@ from .haplotype_matrix import (
     _generate_pairs_within_distance,
     _compute_counts_for_pairs,
     _compute_two_pop_statistics_batch,
+    _compute_multi_pop_statistics_batch,
     _estimate_ld_chunk_size,
+    _ld_names,
+    _het_names,
+    _generate_stat_specs,
 )
 from . import ld_statistics
-
-_LD_NAMES = [
-    'DD_0_0', 'DD_0_1', 'DD_1_1',
-    'Dz_0_0_0', 'Dz_0_0_1', 'Dz_0_1_1',
-    'Dz_1_0_0', 'Dz_1_0_1', 'Dz_1_1_1',
-    'pi2_0_0_0_0', 'pi2_0_0_0_1', 'pi2_0_0_1_1',
-    'pi2_0_1_0_1', 'pi2_0_1_1_1', 'pi2_1_1_1_1',
-]
-_HET_NAMES = ['H_0_0', 'H_0_1', 'H_1_1']
-_N_LD = len(_LD_NAMES)
 
 
 def compute_ld_statistics(
@@ -43,7 +39,7 @@ def compute_ld_statistics(
     r_bins=None, bp_bins=None, use_genotypes=False,
     report=True, ac_filter=True,
 ):
-    """GPU-accelerated two-population LD statistics, moments-compatible.
+    """GPU-accelerated multi-population LD statistics, moments-compatible.
 
     Parameters
     ----------
@@ -54,7 +50,7 @@ def compute_ld_statistics(
     pop_file : str
         Population file (tab-delimited: sample, pop).
     pops : list of str
-        Two population names. Defaults to ['pop0', 'pop1'].
+        Population names (1-4). Defaults to ['pop0', 'pop1'].
     r_bins : array-like, optional
         Recombination rate bin edges (Morgans).
     bp_bins : array-like, optional
@@ -70,8 +66,9 @@ def compute_ld_statistics(
     """
     if pops is None:
         pops = ['pop0', 'pop1']
-    if len(pops) != 2:
-        raise ValueError("Only two-population LD is supported")
+    num_pops = len(pops)
+    if num_pops < 1 or num_pops > 4:
+        raise ValueError("1-4 populations supported")
     if r_bins is None and bp_bins is None:
         raise ValueError("Either r_bins or bp_bins must be provided")
     if pop_file is None:
@@ -86,7 +83,6 @@ def compute_ld_statistics(
         hm = hm.apply_biallelic_filter()
     hm.transfer_to_gpu()
 
-    pop1, pop2 = pops
     if report:
         print(f"  {hm.num_haplotypes} hap, {hm.num_variants:,} variants")
 
@@ -106,20 +102,23 @@ def compute_ld_statistics(
 
     n_bins = len(bins) - 1
     if report:
-        print(f"  Computing LD ({n_bins} bins) ...")
+        print(f"  Computing LD ({n_bins} bins, {num_pops} pops) ...")
 
-    ld_sums = _compute_ld_sums(hm, pop1, pop2, bins, gen_dists_gpu, max_bp_dist)
-    het = _compute_heterozygosity(hm, pop1, pop2)
+    ld_stat_names = _ld_names(num_pops)
+    het_stat_names = _het_names(num_pops)
+
+    ld_sums = _compute_ld_sums(hm, pops, bins, gen_dists_gpu, max_bp_dist)
+    het = _compute_heterozygosity(hm, pops)
 
     if report:
         print("  Done.")
 
     bin_tuples = [(float(bins[i]), float(bins[i + 1])) for i in range(n_bins)]
     sums_list = [ld_sums[i] for i in range(n_bins)]
-    sums_list.append(np.array([het['H_0_0'], het['H_0_1'], het['H_1_1']]))
+    sums_list.append(np.array([het[h] for h in het_stat_names]))
 
     return {'bins': bin_tuples, 'sums': sums_list,
-            'stats': (_LD_NAMES, _HET_NAMES), 'pops': pops}
+            'stats': (ld_stat_names, het_stat_names), 'pops': pops}
 
 
 # ---------------------------------------------------------------------------
@@ -164,25 +163,25 @@ def _max_bp_for_r_dist(positions, gen_dists, max_r):
     return min(result, chrom_len)
 
 
-def _compute_ld_sums(hm, pop1, pop2, bins, gen_dists_gpu, max_bp_dist):
-    """Compute LD statistic sums per bin on GPU.
-
-    Bins by recombination distance when gen_dists_gpu is provided,
-    otherwise by physical distance.
-    """
+def _compute_ld_sums(hm, pops, bins, gen_dists_gpu, max_bp_dist):
+    """Compute LD statistic sums per bin on GPU for N populations."""
+    num_pops = len(pops)
     pos = hm.positions
     if not isinstance(pos, cp.ndarray):
         pos = cp.array(pos)
 
     n_bins = len(bins) - 1
     bins_gpu = cp.asarray(bins)
-    pop1_idx = hm.sample_sets[pop1]
-    pop2_idx = hm.sample_sets[pop2]
-    chunk_size = _estimate_ld_chunk_size(max(len(pop1_idx), len(pop2_idx)))
+    pop_indices = [hm.sample_sets[p] for p in pops]
+    max_hap = max(len(pi) for pi in pop_indices)
+    chunk_size = _estimate_ld_chunk_size(max_hap, num_pops=num_pops)
+
+    ld_stat_names = _ld_names(num_pops)
+    n_ld = len(ld_stat_names)
 
     idx_i, idx_j = _generate_pairs_within_distance(pos, max_bp_dist)
     if len(idx_i) == 0:
-        return np.zeros((n_bins, _N_LD), dtype=np.float64)
+        return np.zeros((n_bins, n_ld), dtype=np.float64)
 
     # Bin by recombination or physical distance
     if gen_dists_gpu is not None:
@@ -192,47 +191,90 @@ def _compute_ld_sums(hm, pop1, pop2, bins, gen_dists_gpu, max_bp_dist):
     bin_inds = cp.digitize(distances, bins_gpu) - 1
     del distances
 
-    bin_sums = cp.zeros((n_bins, _N_LD), dtype=cp.float64)
+    bin_sums = cp.zeros((n_bins, n_ld), dtype=cp.float64)
     total_pairs = len(idx_i)
 
-    for chunk_start in range(0, total_pairs, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, total_pairs)
-        ci = idx_i[chunk_start:chunk_end]
-        cj = idx_j[chunk_start:chunk_end]
-        cb = bin_inds[chunk_start:chunk_end]
+    # Use the optimized two-pop path when possible
+    if num_pops == 2:
+        for chunk_start in range(0, total_pairs, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_pairs)
+            ci = idx_i[chunk_start:chunk_end]
+            cj = idx_j[chunk_start:chunk_end]
+            cb = bin_inds[chunk_start:chunk_end]
 
-        c1, nv1 = _compute_counts_for_pairs(hm.haplotypes, ci, cj, pop1_idx)
-        c2, nv2 = _compute_counts_for_pairs(hm.haplotypes, ci, cj, pop2_idx)
-        stats = _compute_two_pop_statistics_batch(c1, c2, nv1, nv2, ld_statistics)
+            c1, nv1 = _compute_counts_for_pairs(hm.haplotypes, ci, cj, pop_indices[0])
+            c2, nv2 = _compute_counts_for_pairs(hm.haplotypes, ci, cj, pop_indices[1])
+            stats = _compute_two_pop_statistics_batch(c1, c2, nv1, nv2, ld_statistics)
 
-        valid = (cb >= 0) & (cb < n_bins)
-        vb = cb[valid]
-        vs = stats[valid]
-        for k in range(_N_LD):
-            cp.add.at(bin_sums[:, k], vb, vs[:, k])
+            valid = (cb >= 0) & (cb < n_bins)
+            vb = cb[valid]
+            vs = stats[valid]
+            for k in range(n_ld):
+                cp.add.at(bin_sums[:, k], vb, vs[:, k])
 
-        del c1, c2, nv1, nv2, stats
+            del c1, c2, nv1, nv2, stats
+    else:
+        stat_specs = _generate_stat_specs(num_pops)
+        for chunk_start in range(0, total_pairs, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_pairs)
+            ci = idx_i[chunk_start:chunk_end]
+            cj = idx_j[chunk_start:chunk_end]
+            cb = bin_inds[chunk_start:chunk_end]
+
+            counts_list = []
+            n_valid_list = []
+            for pidx in pop_indices:
+                c, nv = _compute_counts_for_pairs(hm.haplotypes, ci, cj, pidx)
+                counts_list.append(c)
+                n_valid_list.append(nv)
+
+            stats = _compute_multi_pop_statistics_batch(
+                counts_list, n_valid_list, ld_statistics, stat_specs)
+
+            valid = (cb >= 0) & (cb < n_bins)
+            vb = cb[valid]
+            vs = stats[valid]
+            for k in range(n_ld):
+                cp.add.at(bin_sums[:, k], vb, vs[:, k])
+
+            del counts_list, n_valid_list, stats
 
     del idx_i, idx_j, bin_inds
     return bin_sums.get()
 
 
-def _compute_heterozygosity(hm, pop1, pop2):
-    """Compute H_0_0, H_0_1, H_1_1 on GPU (moments convention)."""
+def _compute_heterozygosity(hm, pops):
+    """Compute H_i_j statistics on GPU for N populations (moments convention)."""
     hap = hm.haplotypes
-    p1 = hm.sample_sets[pop1]
-    p2 = hm.sample_sets[pop2]
+    num_pops = len(pops)
 
-    alt1 = cp.sum(cp.maximum(hap[p1, :], 0).astype(cp.int32), axis=0).astype(cp.float64)
-    n1 = cp.float64(len(p1))
-    ref1 = n1 - alt1
+    # Pre-compute alt/ref counts and sample sizes per population
+    alt_counts = []
+    ref_counts = []
+    pop_sizes = []
+    for pop in pops:
+        pidx = hm.sample_sets[pop]
+        alt = cp.sum(cp.maximum(hap[pidx, :], 0).astype(cp.int32), axis=0).astype(cp.float64)
+        n = cp.float64(len(pidx))
+        alt_counts.append(alt)
+        ref_counts.append(n - alt)
+        pop_sizes.append(n)
 
-    alt2 = cp.sum(cp.maximum(hap[p2, :], 0).astype(cp.int32), axis=0).astype(cp.float64)
-    n2 = cp.float64(len(p2))
-    ref2 = n2 - alt2
+    result = {}
+    for ii in range(num_pops):
+        for jj in range(ii, num_pops):
+            if ii == jj:
+                # Within-population heterozygosity
+                val = float(cp.sum(
+                    2.0 * ref_counts[ii] * alt_counts[ii]
+                    / (pop_sizes[ii] * (pop_sizes[ii] - 1))
+                ).get())
+            else:
+                # Between-population heterozygosity
+                val = float(cp.sum(
+                    (ref_counts[ii] * alt_counts[jj] + alt_counts[ii] * ref_counts[jj])
+                    / (pop_sizes[ii] * pop_sizes[jj])
+                ).get())
+            result[f"H_{ii}_{jj}"] = val
 
-    H_0_0 = float(cp.sum(2.0 * ref1 * alt1 / (n1 * (n1 - 1))).get())
-    H_1_1 = float(cp.sum(2.0 * ref2 * alt2 / (n2 * (n2 - 1))).get())
-    H_0_1 = float(cp.sum((ref1 * alt2 + alt1 * ref2) / (n1 * n2)).get())
-
-    return {'H_0_0': H_0_0, 'H_0_1': H_0_1, 'H_1_1': H_1_1}
+    return result

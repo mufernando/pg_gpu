@@ -1941,17 +1941,18 @@ class HaplotypeMatrix:
 # Helper functions for memory-efficient LD computation with max distance filter
 # =============================================================================
 
-def _estimate_ld_chunk_size(n_haplotypes_per_pop, available_memory_bytes=None):
+def _estimate_ld_chunk_size(n_haplotypes_per_pop, available_memory_bytes=None,
+                            num_pops=2):
     """
     Estimate optimal chunk size for LD computation based on GPU memory.
 
-    Memory per pair (N pairs, H haplotypes per pop):
-    - hap_i, hap_j arrays (2 pops): 4 * H * N bytes
-    - counts arrays: 32 * N bytes
-    - statistics: 120 * N bytes
+    Memory per pair (N pairs, H haplotypes per pop, P populations):
+    - hap_i, hap_j arrays (P pops): 4 * H * P * N bytes
+    - counts arrays: 32 * P * N bytes
+    - statistics: 120 * P * N bytes
     - Overhead (~3x): accounts for intermediates, fragmentation
 
-    Formula: bytes_per_pair ≈ (4*H + 150) * 3
+    Formula: bytes_per_pair ≈ (4*H*P + 150*P) * 3
 
     Parameters
     ----------
@@ -1959,6 +1960,8 @@ def _estimate_ld_chunk_size(n_haplotypes_per_pop, available_memory_bytes=None):
         Number of haplotypes in the larger population
     available_memory_bytes : int, optional
         Available GPU memory in bytes. If None, queries the GPU.
+    num_pops : int
+        Number of populations (default 2)
 
     Returns
     -------
@@ -1969,7 +1972,7 @@ def _estimate_ld_chunk_size(n_haplotypes_per_pop, available_memory_bytes=None):
         # Use 50% of available GPU memory (conservative)
         available_memory_bytes = int(cp.cuda.Device().mem_info[0] * 0.5)
 
-    bytes_per_pair = (4 * n_haplotypes_per_pop + 150) * 3
+    bytes_per_pair = (4 * n_haplotypes_per_pop * num_pops + 150 * num_pops) * 3
     chunk_size = available_memory_bytes // bytes_per_pair
 
     # Bounds: min 100k, max 10M
@@ -2174,3 +2177,191 @@ def _compute_single_pop_statistics_batch(counts, n_valid, ld_statistics):
     Dz = ld_statistics.dz(counts, n_valid=n_valid)
     pi2 = ld_statistics.pi2(counts, n_valid=n_valid)
     return cp.stack([DD, Dz, pi2], axis=1)
+
+
+def _ld_names(num_pops):
+    """Generate LD statistic names matching moments.LD.Util.ld_names()."""
+    names = []
+    for ii in range(num_pops):
+        for jj in range(ii, num_pops):
+            names.append(f"DD_{ii}_{jj}")
+    for ii in range(num_pops):
+        for jj in range(num_pops):
+            for kk in range(jj, num_pops):
+                names.append(f"Dz_{ii}_{jj}_{kk}")
+    for ii in range(num_pops):
+        for jj in range(ii, num_pops):
+            for kk in range(ii, num_pops):
+                for ll in range(kk, num_pops):
+                    if kk == ii == ll and jj != ii:
+                        continue
+                    if ii == kk and ll < jj:
+                        continue
+                    names.append(f"pi2_{ii}_{jj}_{kk}_{ll}")
+    return names
+
+
+def _het_names(num_pops):
+    """Generate heterozygosity statistic names matching moments.LD.Util.het_names()."""
+    names = []
+    for ii in range(num_pops):
+        for jj in range(ii, num_pops):
+            names.append(f"H_{ii}_{jj}")
+    return names
+
+
+def _generate_stat_specs(num_pops):
+    """Generate computation specs for each LD statistic.
+
+    Each spec is (stat_name, [(weight, stat_type, pop_indices), ...])
+    encoding the exact averaging logic from moments' _call_sgc().
+
+    Returns
+    -------
+    list of (str, list of (float, str, tuple))
+    """
+    specs = []
+    names = _ld_names(num_pops)
+
+    for name in names:
+        parts = name.split("_")
+        stat_type = parts[0]
+        pop_nums = tuple(int(p) for p in parts[1:])
+
+        if stat_type == "DD":
+            specs.append((name, [(1.0, 'dd', pop_nums)]))
+
+        elif stat_type == "Dz":
+            ii, jj, kk = pop_nums
+            if jj == kk:
+                specs.append((name, [(1.0, 'dz', (ii, jj, kk))]))
+            else:
+                specs.append((name, [
+                    (0.5, 'dz', (ii, jj, kk)),
+                    (0.5, 'dz', (ii, kk, jj)),
+                ]))
+
+        elif stat_type == "pi2":
+            ii, jj, kk, ll = pop_nums
+            if ii == jj:
+                if kk == ll:
+                    if ii == kk:
+                        # All same
+                        specs.append((name, [(1.0, 'pi2', (ii, jj, kk, ll))]))
+                    else:
+                        # (i,i,k,k) i!=k
+                        specs.append((name, [
+                            (0.5, 'pi2', (ii, jj, kk, ll)),
+                            (0.5, 'pi2', (kk, ll, ii, jj)),
+                        ]))
+                else:
+                    # (i,i,k,l) k!=l
+                    specs.append((name, [
+                        (0.25, 'pi2', (ii, jj, kk, ll)),
+                        (0.25, 'pi2', (ii, jj, ll, kk)),
+                        (0.25, 'pi2', (kk, ll, ii, jj)),
+                        (0.25, 'pi2', (ll, kk, ii, jj)),
+                    ]))
+            else:
+                if kk == ll:
+                    # (i,j,k,k) i!=j
+                    specs.append((name, [
+                        (0.25, 'pi2', (ii, jj, kk, ll)),
+                        (0.25, 'pi2', (jj, ii, kk, ll)),
+                        (0.25, 'pi2', (kk, ll, ii, jj)),
+                        (0.25, 'pi2', (kk, ll, jj, ii)),
+                    ]))
+                else:
+                    # (i,j,k,l) i!=j, k!=l
+                    specs.append((name, [
+                        (0.125, 'pi2', (ii, jj, kk, ll)),
+                        (0.125, 'pi2', (ii, jj, ll, kk)),
+                        (0.125, 'pi2', (jj, ii, kk, ll)),
+                        (0.125, 'pi2', (jj, ii, ll, kk)),
+                        (0.125, 'pi2', (kk, ll, ii, jj)),
+                        (0.125, 'pi2', (ll, kk, ii, jj)),
+                        (0.125, 'pi2', (kk, ll, jj, ii)),
+                        (0.125, 'pi2', (ll, kk, jj, ii)),
+                    ]))
+
+    return specs
+
+
+def _compute_multi_pop_statistics_batch(counts_per_pop, n_valid_per_pop,
+                                        ld_statistics_module, stat_specs):
+    """Compute all LD statistics for N populations using pre-computed specs.
+
+    Parameters
+    ----------
+    counts_per_pop : list of cp.ndarray
+        List of P arrays, each shape (n_pairs, 4)
+    n_valid_per_pop : list of cp.ndarray or None
+        List of P arrays, each shape (n_pairs,), or None entries
+    ld_statistics_module : module
+        The ld_statistics module
+    stat_specs : list
+        From _generate_stat_specs()
+
+    Returns
+    -------
+    cp.ndarray, shape (n_pairs, n_stats)
+    """
+    n_pops = len(counts_per_pop)
+    n_pairs = counts_per_pop[0].shape[0]
+    n_stats = len(stat_specs)
+
+    # Concatenate all population counts
+    counts_all = cp.concatenate(counts_per_pop, axis=1)  # (N, 4*P)
+
+    # Build n_valid tuple
+    has_missing = any(nv is not None for nv in n_valid_per_pop)
+    if has_missing:
+        n_valid_tuple = tuple(n_valid_per_pop)
+    else:
+        n_valid_tuple = None
+
+    result = cp.zeros((n_pairs, n_stats), dtype=cp.float64)
+
+    for stat_idx, (name, calls) in enumerate(stat_specs):
+        stat_value = cp.zeros(n_pairs, dtype=cp.float64)
+
+        for weight, stat_type, pop_indices in calls:
+            if stat_type == 'dd':
+                pop1, pop2 = pop_indices
+                if pop1 == pop2:
+                    single_counts = counts_all[:, pop1*4:(pop1+1)*4]
+                    nv = n_valid_per_pop[pop1] if has_missing else None
+                    val = ld_statistics_module.dd(single_counts, n_valid=nv)
+                else:
+                    val = ld_statistics_module.dd(
+                        counts_all, populations=pop_indices,
+                        n_valid=n_valid_tuple)
+                stat_value += weight * val
+
+            elif stat_type == 'dz':
+                p1, p2, p3 = pop_indices
+                if p1 == p2 == p3:
+                    single_counts = counts_all[:, p1*4:(p1+1)*4]
+                    nv = n_valid_per_pop[p1] if has_missing else None
+                    val = ld_statistics_module.dz(single_counts, n_valid=nv)
+                else:
+                    val = ld_statistics_module.dz(
+                        counts_all, populations=pop_indices,
+                        n_valid=n_valid_tuple)
+                stat_value += weight * val
+
+            elif stat_type == 'pi2':
+                p1, p2, p3, p4 = pop_indices
+                if p1 == p2 == p3 == p4:
+                    single_counts = counts_all[:, p1*4:(p1+1)*4]
+                    nv = n_valid_per_pop[p1] if has_missing else None
+                    val = ld_statistics_module.pi2(single_counts, n_valid=nv)
+                else:
+                    val = ld_statistics_module.pi2(
+                        counts_all, populations=pop_indices,
+                        n_valid=n_valid_tuple)
+                stat_value += weight * val
+
+        result[:, stat_idx] = stat_value
+
+    return result

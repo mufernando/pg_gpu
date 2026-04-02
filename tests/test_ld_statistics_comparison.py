@@ -6,10 +6,7 @@ Each test uses a reference dataset and computes a specific LD statistic using bo
 implementations, checking that they agree within numerical tolerance.
 """
 
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'moments'))
-
 import numpy as np
 import pytest
 from pg_gpu.haplotype_matrix import HaplotypeMatrix
@@ -340,6 +337,123 @@ class TestLDStatisticsComparison:
 
                 assert np.allclose(pi2_gpu, pi2_moments, rtol=1e-2), \
                     f"pi2_0_0_1_1 mismatch for pair ({i},{j}): GPU={pi2_gpu}, moments={pi2_moments}"
+
+
+class TestMultiPopFormulas:
+    """Test all multi-population LD formulas against moments reference."""
+
+    @staticmethod
+    def make_random_counts(n_pops, n_hap=20, n_pairs=50, seed=42):
+        np.random.seed(seed)
+        counts_list = []
+        for _ in range(n_pops):
+            raw = np.random.dirichlet([1, 1, 1, 1], size=n_pairs) * n_hap
+            raw = np.maximum(np.round(raw), 0).astype(np.int32)
+            for p in range(n_pairs):
+                raw[p, 0] += n_hap - raw[p].sum()
+            counts_list.append(raw)
+        return counts_list
+
+    @staticmethod
+    def moments_pi2_averaged(pair_counts, pop_nums):
+        """Compute moments pi2 with the same averaging as _call_sgc."""
+        ii, jj, kk, ll = pop_nums
+        if ii == jj:
+            if kk == ll:
+                if ii == kk:
+                    return moments_shc.pi2(pair_counts, pop_nums)
+                else:
+                    return 0.5 * (
+                        moments_shc.pi2(pair_counts, [ii, jj, kk, ll]) +
+                        moments_shc.pi2(pair_counts, [kk, ll, ii, jj]))
+            else:
+                return 0.25 * (
+                    moments_shc.pi2(pair_counts, [ii, jj, kk, ll]) +
+                    moments_shc.pi2(pair_counts, [ii, jj, ll, kk]) +
+                    moments_shc.pi2(pair_counts, [kk, ll, ii, jj]) +
+                    moments_shc.pi2(pair_counts, [ll, kk, ii, jj]))
+        else:
+            if kk == ll:
+                return 0.25 * (
+                    moments_shc.pi2(pair_counts, [ii, jj, kk, ll]) +
+                    moments_shc.pi2(pair_counts, [jj, ii, kk, ll]) +
+                    moments_shc.pi2(pair_counts, [kk, ll, ii, jj]) +
+                    moments_shc.pi2(pair_counts, [kk, ll, jj, ii]))
+            else:
+                return 0.125 * sum(
+                    moments_shc.pi2(pair_counts, list(perm)) for perm in [
+                        (ii, jj, kk, ll), (ii, jj, ll, kk),
+                        (jj, ii, kk, ll), (jj, ii, ll, kk),
+                        (kk, ll, ii, jj), (ll, kk, ii, jj),
+                        (kk, ll, jj, ii), (ll, kk, jj, ii)])
+
+    def _validate_all_stats(self, n_pops, n_pairs=50):
+        import cupy as cp
+        from pg_gpu import ld_statistics as ld_mod
+        from pg_gpu.haplotype_matrix import (
+            _ld_names, _generate_stat_specs, _compute_multi_pop_statistics_batch)
+
+        counts_list = self.make_random_counts(n_pops, n_pairs=n_pairs)
+        ld_names = _ld_names(n_pops)
+        stat_specs = _generate_stat_specs(n_pops)
+        counts_gpu = [cp.array(c, dtype=cp.float64) for c in counts_list]
+
+        gpu_result = _compute_multi_pop_statistics_batch(
+            counts_gpu, [None]*n_pops, ld_mod, stat_specs)
+
+        for stat_idx, name in enumerate(ld_names):
+            parts = name.split("_")
+            stat_type = parts[0]
+            pop_nums = [int(p) for p in parts[1:]]
+
+            moments_vals = np.zeros(n_pairs)
+            for p in range(n_pairs):
+                pair_counts = [tuple(counts_list[pop][p]) for pop in range(n_pops)]
+                if stat_type == "DD":
+                    moments_vals[p] = moments_shc.DD(pair_counts, pop_nums)
+                elif stat_type == "Dz":
+                    ii, jj, kk = pop_nums
+                    if jj == kk:
+                        moments_vals[p] = moments_shc.Dz(pair_counts, pop_nums)
+                    else:
+                        moments_vals[p] = 0.5 * (
+                            moments_shc.Dz(pair_counts, [ii, jj, kk]) +
+                            moments_shc.Dz(pair_counts, [ii, kk, jj]))
+                elif stat_type == "pi2":
+                    moments_vals[p] = self.moments_pi2_averaged(pair_counts, pop_nums)
+
+            gpu_vals = gpu_result[:, stat_idx].get()
+            np.testing.assert_allclose(
+                gpu_vals, moments_vals, rtol=1e-12, atol=1e-15,
+                err_msg=f"{name} mismatch for {n_pops}-pop case")
+
+    def test_1pop_formulas(self):
+        self._validate_all_stats(1)
+
+    def test_2pop_formulas(self):
+        self._validate_all_stats(2)
+
+    def test_3pop_formulas(self):
+        self._validate_all_stats(3)
+
+    def test_4pop_formulas(self):
+        self._validate_all_stats(4)
+
+    def test_stat_names_match_moments(self):
+        import moments.LD.Util as moments_util
+        from pg_gpu.haplotype_matrix import _ld_names, _het_names
+        for n in [1, 2, 3, 4]:
+            assert _ld_names(n) == moments_util.ld_names(n)
+            assert _het_names(n) == moments_util.het_names(n)
+
+    def test_stat_specs_counts(self):
+        from pg_gpu.haplotype_matrix import _ld_names, _generate_stat_specs
+        for n in [1, 2, 3, 4]:
+            names = _ld_names(n)
+            specs = _generate_stat_specs(n)
+            assert len(specs) == len(names)
+            for (name, _), expected_name in zip(specs, names):
+                assert name == expected_name
 
 
 if __name__ == "__main__":

@@ -21,10 +21,8 @@ from pg_gpu.moments_ld import (
     compute_ld_statistics,
     _compute_heterozygosity,
     _interpolate_genetic_distances,
-    _LD_NAMES,
-    _HET_NAMES,
 )
-from pg_gpu.haplotype_matrix import HaplotypeMatrix
+from pg_gpu.haplotype_matrix import HaplotypeMatrix, _ld_names, _het_names
 
 
 VCF = "examples/data/im-parsing-example.vcf"
@@ -62,8 +60,8 @@ class TestOutputFormat:
 
     def test_stats_names(self, gpu_stats):
         ld_names, het_names = gpu_stats['stats']
-        assert ld_names == _LD_NAMES
-        assert het_names == _HET_NAMES
+        assert ld_names == _ld_names(2)
+        assert het_names == _het_names(2)
 
     def test_bins_count(self, gpu_stats):
         assert len(gpu_stats['bins']) == len(BP_BINS) - 1
@@ -141,3 +139,167 @@ class TestMomentsCompatibility:
             {0: gpu_stats}, gpu_stats['stats'])
         for mm, mg in zip(means_m, means_g):
             np.testing.assert_allclose(mg, mm, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Multi-population integration tests (3-pop, 4-pop)
+# ---------------------------------------------------------------------------
+
+import tempfile
+import os
+
+
+def _simulate_multipop_vcf(n_pops, n_samples=8, seq_len=30_000, seed=42):
+    """Simulate a multi-population VCF and pop file using msprime."""
+    import msprime
+
+    demography = msprime.Demography()
+    for i in range(n_pops):
+        demography.add_population(name=f"pop{i}", initial_size=1000)
+    # Chain of splits: pop{n-1} splits from pop{n-2} at time 500*(n-1-i)
+    if n_pops >= 2:
+        demography.add_population(name="anc01", initial_size=2000)
+        demography.add_population_split(
+            time=500, derived=["pop0", "pop1"], ancestral="anc01")
+    if n_pops >= 3:
+        demography.add_population(name="anc012", initial_size=2000)
+        demography.add_population_split(
+            time=1000, derived=["anc01", "pop2"], ancestral="anc012")
+    if n_pops >= 4:
+        demography.add_population(name="anc0123", initial_size=2000)
+        demography.add_population_split(
+            time=1500, derived=["anc012", "pop3"], ancestral="anc0123")
+
+    samples = {}
+    for i in range(n_pops):
+        samples[f"pop{i}"] = n_samples
+
+    ts = msprime.sim_ancestry(
+        samples=samples, demography=demography,
+        sequence_length=seq_len, recombination_rate=1e-8,
+        random_seed=seed)
+    ts = msprime.sim_mutations(ts, rate=1e-7, random_seed=seed)
+
+    vcf_file = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.vcf', delete=False)
+    pop_file = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', delete=False)
+
+    # Write VCF
+    with open(vcf_file.name, 'w') as f:
+        ts.write_vcf(f)
+
+    # Write pop file
+    pops_list = [f"pop{i}" for i in range(n_pops)]
+    with open(pop_file.name, 'w') as f:
+        f.write("sample\tpop\n")
+        for ind in ts.individuals():
+            pop_name = ts.population(ind.population).metadata.get(
+                'name', f"pop{ind.population}")
+            f.write(f"tsk_{ind.id}\t{pop_name}\n")
+
+    return vcf_file.name, pop_file.name, pops_list
+
+
+@pytest.fixture(scope="module")
+def three_pop_data():
+    """Simulate 3-population data and compute both moments and pg_gpu stats."""
+    vcf, pop_file, pops = _simulate_multipop_vcf(3)
+    bp_bins = np.array([0, 1000, 5000, 15000, 30000], dtype=np.float64)
+    try:
+        m_stats = moments.LD.Parsing.compute_ld_statistics(
+            vcf, pop_file=pop_file, pops=pops,
+            bp_bins=bp_bins, use_genotypes=False, report=False)
+        g_stats = compute_ld_statistics(
+            vcf, pop_file=pop_file, pops=pops,
+            bp_bins=bp_bins, report=False)
+        yield m_stats, g_stats, pops
+    finally:
+        os.unlink(vcf)
+        os.unlink(pop_file)
+
+
+@pytest.fixture(scope="module")
+def four_pop_data():
+    """Simulate 4-population data and compute both moments and pg_gpu stats."""
+    vcf, pop_file, pops = _simulate_multipop_vcf(4)
+    bp_bins = np.array([0, 1000, 5000, 15000, 30000], dtype=np.float64)
+    try:
+        m_stats = moments.LD.Parsing.compute_ld_statistics(
+            vcf, pop_file=pop_file, pops=pops,
+            bp_bins=bp_bins, use_genotypes=False, report=False)
+        g_stats = compute_ld_statistics(
+            vcf, pop_file=pop_file, pops=pops,
+            bp_bins=bp_bins, report=False)
+        yield m_stats, g_stats, pops
+    finally:
+        os.unlink(vcf)
+        os.unlink(pop_file)
+
+
+class TestThreePopLD:
+    """Verify 3-population LD statistics match moments."""
+
+    def test_output_format(self, three_pop_data):
+        _, g, pops = three_pop_data
+        assert g['pops'] == pops
+        ld_names, het_names = g['stats']
+        assert len(ld_names) == 45
+        assert len(het_names) == 6
+        assert ld_names == _ld_names(3)
+        assert het_names == _het_names(3)
+
+    def test_ld_sums_match(self, three_pop_data):
+        m, g, _ = three_pop_data
+        for i in range(len(m['bins'])):
+            np.testing.assert_allclose(
+                g['sums'][i], m['sums'][i], rtol=1e-6,
+                err_msg=f"3-pop LD sums mismatch in bin {i}")
+
+    def test_het_sums_match(self, three_pop_data):
+        m, g, _ = three_pop_data
+        np.testing.assert_allclose(
+            g['sums'][-1], m['sums'][-1], rtol=1e-6,
+            err_msg="3-pop heterozygosity mismatch")
+
+    def test_moments_compatibility(self, three_pop_data):
+        _, g, _ = three_pop_data
+        means = moments.LD.Parsing.means_from_region_data(
+            {0: g}, g['stats'])
+        assert len(means) == len(g['bins']) + 1
+        for m in means:
+            assert np.all(np.isfinite(m))
+
+
+class TestFourPopLD:
+    """Verify 4-population LD statistics match moments."""
+
+    def test_output_format(self, four_pop_data):
+        _, g, pops = four_pop_data
+        assert g['pops'] == pops
+        ld_names, het_names = g['stats']
+        assert len(ld_names) == 105
+        assert len(het_names) == 10
+        assert ld_names == _ld_names(4)
+        assert het_names == _het_names(4)
+
+    def test_ld_sums_match(self, four_pop_data):
+        m, g, _ = four_pop_data
+        for i in range(len(m['bins'])):
+            np.testing.assert_allclose(
+                g['sums'][i], m['sums'][i], rtol=1e-6,
+                err_msg=f"4-pop LD sums mismatch in bin {i}")
+
+    def test_het_sums_match(self, four_pop_data):
+        m, g, _ = four_pop_data
+        np.testing.assert_allclose(
+            g['sums'][-1], m['sums'][-1], rtol=1e-6,
+            err_msg="4-pop heterozygosity mismatch")
+
+    def test_moments_compatibility(self, four_pop_data):
+        _, g, _ = four_pop_data
+        means = moments.LD.Parsing.means_from_region_data(
+            {0: g}, g['stats'])
+        assert len(means) == len(g['bins']) + 1
+        for m in means:
+            assert np.all(np.isfinite(m))
