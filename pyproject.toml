@@ -19,6 +19,14 @@ Homepage = "https://github.com/andrewkern/pg_gpu"
 pythonpath = [
     "pg_gpu"
 ]
+filterwarnings = [
+    "ignore::DeprecationWarning:cupyx",
+    "ignore::DeprecationWarning:moments",
+    "ignore::DeprecationWarning:allel",
+    "ignore:No invariant site information:UserWarning",
+    "ignore:__array__ implementation:DeprecationWarning",
+    "ignore:.*FORMAT header not found:UserWarning",
+]
 
 [tool.ruff]
 line-length = 120
