@@ -314,11 +314,37 @@ def _compute_heterozygosity(hm, pops):
 
 
 def _compute_ld_sums_genotype(gm, pops, bins, gen_dists_gpu, max_bp_dist):
-    """Compute LD statistic sums per bin on GPU using genotype counts."""
+    """Compute LD statistic sums per bin on GPU using genotype counts.
+
+    Matches moments' behavior: only variants that are biallelic within
+    every specified population are included in pair generation.
+    """
     num_pops = len(pops)
-    pos = gm.positions
+
+    # Filter to variants biallelic across the union of specified populations
+    # (matches moments' behavior in _count_types_sparse lines 545-547)
+    geno = gm.genotypes
+    xp = cp if isinstance(geno, cp.ndarray) else np
+    all_pop_idx = []
+    for pop in pops:
+        all_pop_idx.extend(gm.sample_sets[pop])
+    if isinstance(geno, cp.ndarray):
+        all_pop_idx = cp.array(sorted(set(all_pop_idx)), dtype=cp.int32)
+    else:
+        all_pop_idx = np.array(sorted(set(all_pop_idx)))
+    union_geno = geno[all_pop_idx, :]
+    valid = union_geno >= 0
+    alt_sum = xp.sum(xp.where(valid, union_geno, 0), axis=0)
+    n_valid = xp.sum(valid, axis=0)
+    max_alt = 2 * n_valid
+    keep = (alt_sum > 0) & (alt_sum < max_alt) & (n_valid >= 2)
+    keep_idx = xp.where(keep)[0]
+    pos = gm.positions[keep_idx]
     if not isinstance(pos, cp.ndarray):
         pos = cp.array(pos)
+
+    # Work with filtered genotypes for pair counting
+    filtered_geno = gm.genotypes[:, keep_idx]
 
     n_bins = len(bins) - 1
     bins_gpu = cp.asarray(bins)
@@ -334,7 +360,8 @@ def _compute_ld_sums_genotype(gm, pops, bins, gen_dists_gpu, max_bp_dist):
         return np.zeros((n_bins, n_ld), dtype=np.float64)
 
     if gen_dists_gpu is not None:
-        distances = cp.abs(gen_dists_gpu[idx_j] - gen_dists_gpu[idx_i])
+        filtered_gen_dists = gen_dists_gpu[keep_idx]
+        distances = cp.abs(filtered_gen_dists[idx_j] - filtered_gen_dists[idx_i])
     else:
         distances = pos[idx_j] - pos[idx_i]
     bin_inds = cp.digitize(distances, bins_gpu) - 1
@@ -353,7 +380,7 @@ def _compute_ld_sums_genotype(gm, pops, bins, gen_dists_gpu, max_bp_dist):
         counts_list = []
         n_valid_list = []
         for pidx in pop_indices:
-            c, nv = _compute_genotype_counts_for_pairs(gm.genotypes, ci, cj, pidx)
+            c, nv = _compute_genotype_counts_for_pairs(filtered_geno, ci, cj, pidx)
             counts_list.append(c)
             n_valid_list.append(nv)
 
