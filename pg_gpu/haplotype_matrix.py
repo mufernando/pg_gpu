@@ -2354,11 +2354,16 @@ def _compute_multi_pop_statistics_batch(counts_per_pop, n_valid_per_pop,
         for pi, val in zip(dz_calls, dz_results):
             raw_cache[('dz', pi)] = val
 
+    # Batch-compute all pi2 values via einsum + advanced indexing
+    pi2_calls = [pi for st, pi in unique_calls if st == 'pi2']
+    if pi2_calls:
+        pi2_results = _compute_all_pi2(pops, pi2_calls)
+        for pi, val in zip(pi2_calls, pi2_results):
+            raw_cache[('pi2', pi)] = val
+
     for stat_type, pop_indices in unique_calls:
         if stat_type == 'dd':
             raw_cache[('dd', pop_indices)] = _dd_raw(pop_indices, pops)
-        elif stat_type == 'pi2':
-            raw_cache[('pi2', pop_indices)] = _pi2_raw(pop_indices, pops)
 
     # Assemble weighted sums from cached raw values
     result = cp.zeros((n_pairs, n_stats), dtype=cp.float64)
@@ -2396,6 +2401,269 @@ def _dd_raw(pop_indices, pops):
 def _safe_div(numer, denom, valid):
     """Divide numer/denom where valid, zero elsewhere. No intermediate copy."""
     return cp.where(valid, numer / cp.maximum(denom, 1), 0.0)
+
+
+def _compute_all_pi2(pops, pi2_calls):
+    """Batch-compute all raw pi2 values using einsum-derived matrices.
+
+    Precomputes cross-population heterozygosity matrices H_A and H_B via
+    einsum, then serves multiple pi2 formula cases from them. Remaining
+    complex cases (shared-pop, ijij, single-pop) use per-call computation
+    with advanced indexing where possible.
+
+    Parameters
+    ----------
+    pops : list of _PopData
+    pi2_calls : list of (i, j, k, l) tuples
+
+    Returns
+    -------
+    list of cp.ndarray, one per call in pi2_calls order
+    """
+    P = len(pops)
+    n_pairs = pops[0].n.shape[0]
+
+    # Stack per-pop arrays: shape (P, N)
+    pA = cp.stack([p.pA for p in pops])
+    qA = cp.stack([p.qA for p in pops])
+    pB = cp.stack([p.pB for p in pops])
+    qB = cp.stack([p.qB for p in pops])
+    n = cp.stack([p.n for p in pops])
+    c1 = cp.stack([p.c1 for p in pops])
+    c2 = cp.stack([p.c2 for p in pops])
+    c3 = cp.stack([p.c3 for p in pops])
+    c4 = cp.stack([p.c4 for p in pops])
+
+    # Precompute H_A[i,j,n] = pA_i*qA_j + qA_i*pA_j via einsum: shape (P, P, N)
+    pq_A = cp.einsum('in,jn->ijn', pA, qA)
+    H_A = pq_A + pq_A.transpose(1, 0, 2)
+    del pq_A
+
+    # Precompute H_B[k,l,n] = pB_k*qB_l + qB_k*pB_l via einsum: shape (P, P, N)
+    pq_B = cp.einsum('in,jn->ijn', pB, qB)
+    H_B = pq_B + pq_B.transpose(1, 0, 2)
+    del pq_B
+
+    # Diagonal: within-pop heterozygosity
+    fA = cp.stack([pops[p].pA * pops[p].qA for p in range(P)])  # (P, N)
+    fB = cp.stack([pops[p].pB * pops[p].qB for p in range(P)])  # (P, N)
+
+    # Group calls by case type
+    groups = {
+        'same': [], 'triple': [], 'iikk': [], 'iikl': [],
+        'ijkk': [], 'ijij': [], 'shared': [], 'alldiff': [],
+    }
+    call_order = {}
+
+    for idx, (i, j, k, l) in enumerate(pi2_calls):
+        cnt = {}
+        for p in (i, j, k, l):
+            cnt[p] = cnt.get(p, 0) + 1
+        nu = len(cnt)
+        mc = max(cnt.values())
+
+        if nu == 1:
+            key = 'same'
+        elif mc == 3:
+            key = 'triple'
+        elif i == j and k == l:
+            key = 'iikk'
+        elif i == j:
+            key = 'iikl'
+        elif k == l:
+            key = 'ijkk'
+        elif (i == k and j == l) or (i == l and j == k):
+            key = 'ijij'
+        elif nu == 3:
+            key = 'shared'
+        else:
+            key = 'alldiff'
+
+        call_order[idx] = (key, len(groups[key]))
+        groups[key].append((i, j, k, l))
+
+    group_results = {}
+
+    # --- Cases served by precomputed H_A, H_B, fA, fB ---
+
+    # All different: numer = H_A[i,j] * H_B[k,l] / 4
+    if groups['alldiff']:
+        ii = [t[0] for t in groups['alldiff']]
+        jj = [t[1] for t in groups['alldiff']]
+        kk = [t[2] for t in groups['alldiff']]
+        ll = [t[3] for t in groups['alldiff']]
+        numer = H_A[ii, jj] * H_B[kk, ll] / 4.0
+        denom = n[ii] * n[jj] * n[kk] * n[ll]
+        valid = (n[ii] >= 1) & (n[jj] >= 1) & (n[kk] >= 1) & (n[ll] >= 1)
+        batch = cp.where(valid, numer / cp.maximum(denom, 1), 0.0)
+        group_results['alldiff'] = [batch[r] for r in range(len(groups['alldiff']))]
+
+    # pi2(i,i,k,k): numer = fA[i] * fB[k]
+    if groups['iikk']:
+        ii = [t[0] for t in groups['iikk']]
+        kk = [t[2] for t in groups['iikk']]
+        numer = fA[ii] * fB[kk]
+        denom = n[ii] * (n[ii] - 1) * n[kk] * (n[kk] - 1)
+        valid = (n[ii] >= 2) & (n[kk] >= 2)
+        batch = cp.where(valid, numer / cp.maximum(denom, 1), 0.0)
+        group_results['iikk'] = [batch[r] for r in range(len(groups['iikk']))]
+
+    # pi2(i,i,k,l): numer = fA[i] * H_B[k,l] / 2
+    if groups['iikl']:
+        ii = [t[0] for t in groups['iikl']]
+        kk = [t[2] for t in groups['iikl']]
+        ll = [t[3] for t in groups['iikl']]
+        numer = fA[ii] * H_B[kk, ll] / 2.0
+        denom = n[ii] * (n[ii] - 1) * n[kk] * n[ll]
+        valid = (n[ii] >= 2) & (n[kk] >= 1) & (n[ll] >= 1)
+        batch = cp.where(valid, numer / cp.maximum(denom, 1), 0.0)
+        group_results['iikl'] = [batch[r] for r in range(len(groups['iikl']))]
+
+    # pi2(i,j,k,k): numer = fB[k] * H_A[i,j] / 2
+    if groups['ijkk']:
+        ii = [t[0] for t in groups['ijkk']]
+        jj = [t[1] for t in groups['ijkk']]
+        kk = [t[2] for t in groups['ijkk']]
+        numer = fB[kk] * H_A[ii, jj] / 2.0
+        denom = n[kk] * (n[kk] - 1) * n[ii] * n[jj]
+        valid = (n[kk] >= 2) & (n[ii] >= 1) & (n[jj] >= 1)
+        batch = cp.where(valid, numer / cp.maximum(denom, 1), 0.0)
+        group_results['ijkk'] = [batch[r] for r in range(len(groups['ijkk']))]
+
+    # --- Cases computed via batched advanced indexing ---
+
+    # Triple (3 same, 1 different): batch by (triple_pop, single_pop)
+    if groups['triple']:
+        trip_cache = {}
+        results = []
+        for i, j, k, l in groups['triple']:
+            cnt = {}
+            for p in (i, j, k, l):
+                cnt[p] = cnt.get(p, 0) + 1
+            tp = [p for p, c in cnt.items() if c == 3][0]
+            sp = [p for p, c in cnt.items() if c == 1][0]
+            cache_key = (tp, sp)
+            if cache_key not in trip_cache:
+                t, s = pops[tp], pops[sp]
+                numer = (
+                    -(t.pA * t.c4 * s.pB)
+                    - (t.c2 * t.qA * s.pB)
+                    + (t.pA * (t.c2 + t.c4) * t.qA * s.pB)
+                    + (t.pA * t.qA * (-2*s.c2 - 2*s.c4))
+                    + (t.pA * t.c4 * s.qB)
+                    + (t.c2 * t.qA * s.qB)
+                    + (t.pA * t.pB * t.qA * s.qB)
+                ) / 2.0
+                denom = s.n * t.n * (t.n - 1) * (t.n - 2)
+                valid = (t.n >= 3) & (s.n >= 1)
+                trip_cache[cache_key] = _safe_div(numer, denom, valid)
+            results.append(trip_cache[cache_key])
+        group_results['triple'] = results
+
+    # Shared pop: batch by (shared, other1, other2)
+    if groups['shared']:
+        shared_cache = {}
+        results = []
+        for i, j, k, l in groups['shared']:
+            if i == k:
+                si, ai, bi = i, j, l
+            elif i == l:
+                si, ai, bi = i, j, k
+            elif j == k:
+                si, ai, bi = j, i, l
+            elif j == l:
+                si, ai, bi = j, i, k
+            else:
+                results.append(cp.zeros(n_pairs, dtype=cp.float64))
+                continue
+            cache_key = (si, ai, bi)
+            if cache_key not in shared_cache:
+                s, a, b = pops[si], pops[ai], pops[bi]
+                numer = (
+                    s.c4 ** 2 * a.pA * b.pB
+                    + s.c2 ** 2 * a.qA * b.pB
+                    + (-1 + s.c1 + s.c3) * (s.c3 * a.pA + s.c1 * a.qA) * b.qB
+                    + s.c4 * (
+                        s.c1 * a.qA * b.pB
+                        + a.c1 * ((-1 + s.c3) * b.c1 + s.c3 * b.c2 - b.c3
+                                  + s.c3 * b.c3 + s.c3 * b.c4 + s.c1 * b.qB)
+                        + a.c2 * ((-1 + s.c3) * b.c1 + s.c3 * b.c2 - b.c3
+                                  + s.c3 * b.c3 + s.c3 * b.c4 + s.c1 * b.qB)
+                    )
+                    + s.c2 * (
+                        s.c4 * (a.pA + a.qA) * b.pB
+                        + s.c3 * (a.c1 * b.pB + a.c2 * b.pB + a.qA * b.qB)
+                        + a.qA * ((-1 + s.c1) * b.c1 - b.c3 + s.c1 * (b.c2 + b.c3 + b.c4))
+                    )
+                ) / 4.0
+                denom = s.n * (s.n - 1) * a.n * b.n
+                valid = (s.n >= 2) & (a.n >= 1) & (b.n >= 1)
+                shared_cache[cache_key] = _safe_div(numer, denom, valid)
+            results.append(shared_cache[cache_key])
+        group_results['shared'] = results
+
+    # pi2(i,j,i,j) / pi2(i,j,j,i): batch by (a, b) pair
+    if groups['ijij']:
+        ijij_cache = {}
+        results = []
+        for i, j, k, l in groups['ijij']:
+            cache_key = (i, j)
+            if cache_key not in ijij_cache:
+                a, b = pops[i], pops[j]
+                numer = (
+                    (a.qB * a.qA * b.pA * b.pB) / 4.0
+                    + (a.pB * a.qA * b.pA * b.qB) / 4.0
+                    + (a.pA * a.qB * b.pB * b.qA) / 4.0
+                    + (a.pA * a.pB * b.qB * b.qA) / 4.0
+                    + (
+                        -(a.c2 * a.c3 * b.c1)
+                        + a.c4 * b.c1 - a.c2 * a.c4 * b.c1
+                        - a.c3 * a.c4 * b.c1 - a.c4 ** 2 * b.c1
+                        - a.c4 * b.c1 ** 2 + a.c3 * b.c2
+                        - a.c1 * a.c3 * b.c2 - a.c3 ** 2 * b.c2
+                        - a.c1 * a.c4 * b.c2 - a.c3 * a.c4 * b.c2
+                        - a.c3 * b.c1 * b.c2 - a.c4 * b.c1 * b.c2
+                        - a.c3 * b.c2 ** 2 + a.c2 * b.c3
+                        - a.c1 * a.c2 * b.c3 - a.c2 ** 2 * b.c3
+                        - a.c1 * a.c4 * b.c3 - a.c2 * a.c4 * b.c3
+                        - a.c2 * b.c1 * b.c3 - a.c4 * b.c1 * b.c3
+                        - a.c1 * b.c2 * b.c3 - a.c4 * b.c2 * b.c3
+                        - a.c2 * b.c3 ** 2 + a.c1 * b.c4
+                        - a.c1 ** 2 * b.c4 - a.c1 * a.c2 * b.c4
+                        - a.c1 * a.c3 * b.c4 - a.c2 * a.c3 * b.c4
+                        - a.c2 * b.c1 * b.c4 - a.c3 * b.c1 * b.c4
+                        - a.c1 * b.c2 * b.c4 - a.c3 * b.c2 * b.c4
+                        - a.c1 * b.c3 * b.c4 - a.c2 * b.c3 * b.c4
+                        - a.c1 * b.c4 ** 2
+                    ) / 4.0
+                )
+                denom = a.n * (a.n - 1) * b.n * (b.n - 1)
+                valid = (a.n >= 2) & (b.n >= 2)
+                ijij_cache[cache_key] = _safe_div(numer, denom, valid)
+            results.append(ijij_cache[cache_key])
+        group_results['ijij'] = results
+
+    # Single pop: per-call
+    if groups['same']:
+        results = []
+        for i, j, k, l in groups['same']:
+            p = pops[i]
+            numer = (
+                p.pA * p.pB * p.qB * p.qA
+                - p.c1 * p.c4 * (-1 + p.c1 + 3*p.c2 + 3*p.c3 + p.c4)
+                - p.c2 * p.c3 * (-1 + 3*p.c1 + p.c2 + p.c3 + 3*p.c4)
+            )
+            denom = p.n * (p.n - 1) * (p.n - 2) * (p.n - 3)
+            valid = p.n >= 4
+            results.append(_safe_div(numer, denom, valid))
+        group_results['same'] = results
+
+    # Reassemble in original call order
+    output = [None] * len(pi2_calls)
+    for idx in range(len(pi2_calls)):
+        grp, pos = call_order[idx]
+        output[idx] = group_results[grp][pos]
+    return output
 
 
 def _compute_all_dz(pops, dz_calls):
