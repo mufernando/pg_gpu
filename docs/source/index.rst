@@ -12,6 +12,7 @@ GPU-accelerated population genetics statistics for Python.
    api
    missing_data
    examples
+   moments_integration
    changelog
 
 Overview
