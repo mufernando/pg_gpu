@@ -24,6 +24,25 @@ Correctness Fixes
   - ``tajimas_d()``: fixed harmonic mean float-to-int truncation (199.999 -> 199 instead of 200)
   - Same fix in ``normalized_fay_wus_h()`` and ``zeng_e()`` via ``_effective_n_and_S()``
 
+Data Loading and I/O
+~~~~~~~~~~~~~~~~~~~~
+
+* **Sample names stored** in ``HaplotypeMatrix`` -- ``from_vcf()`` now preserves
+  VCF sample names as ``self.samples``, eliminating the need to re-read VCFs
+  for population assignment.
+
+* **Region queries** -- ``from_vcf(region='chr1:1M-2M')`` loads a genomic subset
+  via tabix. ``from_vcf(samples=[...])`` loads a sample subset.
+
+* **Zarr support** -- ``to_zarr()`` / ``from_zarr()`` for fast columnar data
+  storage. **15x faster** than VCF loading for subsequent reads.
+
+* **Population file loading** -- ``load_pop_file('pops.txt')`` assigns populations
+  from a tab-delimited file using stored sample names.
+
+* **API consistency** -- all public functions now return NumPy arrays (not CuPy).
+  Users no longer need to call ``.get()`` on results.
+
 Performance Improvements
 ~~~~~~~~~~~~~~~~~~~~~~~~
 

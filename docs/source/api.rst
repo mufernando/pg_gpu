@@ -9,6 +9,15 @@ HaplotypeMatrix
    :undoc-members:
    :show-inheritance:
 
+Data Loading
+~~~~~~~~~~~~
+
+.. automethod:: pg_gpu.HaplotypeMatrix.from_vcf
+.. automethod:: pg_gpu.HaplotypeMatrix.from_zarr
+.. automethod:: pg_gpu.HaplotypeMatrix.from_ts
+.. automethod:: pg_gpu.HaplotypeMatrix.to_zarr
+.. automethod:: pg_gpu.HaplotypeMatrix.load_pop_file
+
 Missing Data Methods
 ~~~~~~~~~~~~~~~~~~~~
 

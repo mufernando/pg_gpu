@@ -11,8 +11,14 @@ Loading Data
 
    from pg_gpu import HaplotypeMatrix
 
-   # From VCF file
-   h = HaplotypeMatrix.from_vcf("data.vcf")
+   # From VCF file (sample names are stored automatically)
+   h = HaplotypeMatrix.from_vcf("data.vcf.gz")
+
+   # Load a specific genomic region (requires tabix index)
+   h = HaplotypeMatrix.from_vcf("data.vcf.gz", region="chr1:1000000-2000000")
+
+   # Load a subset of samples
+   h = HaplotypeMatrix.from_vcf("data.vcf.gz", samples=["ind1", "ind2", "ind3"])
 
    # From NumPy array (n_haplotypes, n_variants)
    import numpy as np
@@ -20,11 +26,37 @@ Loading Data
    positions = np.array([100, 200, 300])
    h = HaplotypeMatrix(hap, positions, chrom_start=0, chrom_end=400)
 
-   # Define populations
+Populations can be assigned from a tab-delimited file (sample, pop) or
+manually via ``sample_sets``:
+
+.. code-block:: python
+
+   # From a population file (uses stored sample names)
+   h.load_pop_file("pops.txt")
+
+   # Or manually
    h.sample_sets = {
        "pop1": [0, 1, 2, 3],
        "pop2": [4, 5, 6, 7]
    }
+
+Fast Reloading with Zarr
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For large datasets, save to Zarr format after the first VCF load. Subsequent
+loads are ~15x faster.
+
+.. code-block:: python
+
+   # First time: load from VCF, save as Zarr
+   h = HaplotypeMatrix.from_vcf("data.vcf.gz")
+   h.to_zarr("data.zarr")
+
+   # Subsequent runs: 15x faster
+   h = HaplotypeMatrix.from_zarr("data.zarr")
+
+   # Region queries work on Zarr too
+   h = HaplotypeMatrix.from_zarr("data.zarr", region="chr1:1000000-2000000")
 
 LD Statistics
 ~~~~~~~~~~~~~
