@@ -17,4 +17,10 @@ pixi.lock
 reference_code/*
 docs/build/
 data/
+cache/
+moments/
+simulations/
+commit_message.txt
+*.png
+*.csv
 CLAUDE.md
