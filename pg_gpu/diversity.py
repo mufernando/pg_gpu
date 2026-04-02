@@ -20,6 +20,24 @@ PairwiseResult = namedtuple(
     ['value', 'total_diffs', 'total_comps', 'total_missing', 'n_sites'])
 
 
+def _dac_and_n(haplotypes):
+    """Shared helper: derived allele counts and valid sample counts per site.
+
+    Uses adaptive chunking from _memutil for memory safety on large matrices.
+
+    Parameters
+    ----------
+    haplotypes : cupy.ndarray, int8, shape (n_hap, n_var)
+
+    Returns
+    -------
+    dac : cupy.ndarray, int64, shape (n_var,)
+    n_valid : cupy.ndarray, int64, shape (n_var,)
+    """
+    from ._memutil import chunked_dac_and_n
+    return chunked_dac_and_n(haplotypes)
+
+
 def _pairwise_pi_components(haplotypes, n_total_sites=None, n_haplotypes_full=None):
     """Compute pairwise differences and comparisons across all sites.
 
@@ -41,11 +59,9 @@ def _pairwise_pi_components(haplotypes, n_total_sites=None, n_haplotypes_full=No
     total_missing : float
     n_sites : int
     """
-    valid_mask = haplotypes >= 0
-    n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)  # per site
-
-    hap_clean = cp.where(valid_mask, haplotypes, 0)
-    derived = cp.sum(hap_clean, axis=0).astype(cp.float64)
+    dac, n_valid_i = _dac_and_n(haplotypes)
+    n_valid = n_valid_i.astype(cp.float64)
+    derived = dac.astype(cp.float64)
     ancestral = n_valid - derived
 
     # Per-site: diffs = derived * ancestral (number of mismatched pairs)
@@ -158,29 +174,14 @@ def pi(haplotype_matrix: HaplotypeMatrix,
                                  total_missing, n_sites)
         return pi_value
 
-    # Default: 'include' mode - calculate pi per site using only non-missing data (vectorized)
-    haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
+    # Default: 'include' mode - calculate pi per site using only non-missing data
+    derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
 
-    # Create mask for valid (non-missing) data
-    valid_mask = haplotypes >= 0  # shape: (n_haplotypes, n_variants)
-
-    # Count valid samples per site
-    n_valid_per_site = cp.sum(valid_mask, axis=0)  # shape: (n_variants,)
-
-    # Only consider sites with at least 2 valid samples
     sites_with_data = n_valid_per_site >= 2
 
     if not cp.any(sites_with_data):
         pi_value = cp.float64(0.0)
     else:
-        # For each site, count derived alleles among valid samples
-        # Set missing data to 0 for counting, but use valid_mask to exclude from counts
-        hap_clean = cp.where(valid_mask, haplotypes, 0)
-
-        # Count derived alleles per site (only among valid samples)
-        derived_counts = cp.sum(hap_clean, axis=0)  # shape: (n_variants,)
-
-        # Only compute for sites with valid data
         valid_sites = cp.where(sites_with_data)[0]
         n_valid = n_valid_per_site[valid_sites].astype(cp.float64)
         derived = derived_counts[valid_sites].astype(cp.float64)
@@ -1115,10 +1116,9 @@ def theta_h(haplotype_matrix: HaplotypeMatrix,
 
     # 'include' / 'pairwise' mode (default fallback)
     haplotypes = matrix.haplotypes
-    valid_mask = haplotypes >= 0
-    n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-    hap_clean = cp.where(valid_mask, haplotypes, 0)
-    dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
+    dac_i, n_valid_i = _dac_and_n(haplotypes)
+    n_valid = n_valid_i.astype(cp.float64)
+    dac = dac_i.astype(cp.float64)
 
     # Only segregating sites: 0 < dac < n_valid
     usable = (n_valid > 1) & (dac > 0) & (dac < n_valid)
@@ -1180,10 +1180,9 @@ def theta_l(haplotype_matrix: HaplotypeMatrix,
 
     # 'include' / 'pairwise' mode (default fallback)
     haplotypes = matrix.haplotypes
-    valid_mask = haplotypes >= 0
-    n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-    hap_clean = cp.where(valid_mask, haplotypes, 0)
-    dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
+    dac_i, n_valid_i = _dac_and_n(haplotypes)
+    n_valid = n_valid_i.astype(cp.float64)
+    dac = dac_i.astype(cp.float64)
 
     # Only segregating sites: 0 < dac < n_valid
     usable = (n_valid > 1) & (dac > 0) & (dac < n_valid)
