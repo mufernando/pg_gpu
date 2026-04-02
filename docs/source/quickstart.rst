@@ -44,7 +44,7 @@ Fast Reloading with Zarr
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For large datasets, save to Zarr format after the first VCF load. Subsequent
-loads are ~15x faster.
+loads are significantly faster.
 
 .. code-block:: python
 
@@ -52,7 +52,7 @@ loads are ~15x faster.
    h = HaplotypeMatrix.from_vcf("data.vcf.gz")
    h.to_zarr("data.zarr")
 
-   # Subsequent runs: 15x faster
+   # Subsequent runs: much faster
    h = HaplotypeMatrix.from_zarr("data.zarr")
 
    # Region queries work on Zarr too

@@ -35,7 +35,7 @@ Data Loading and I/O
   via tabix. ``from_vcf(samples=[...])`` loads a sample subset.
 
 * **Zarr support** -- ``to_zarr()`` / ``from_zarr()`` for fast columnar data
-  storage. **15x faster** than VCF loading for subsequent reads.
+  storage. Significantly faster than VCF for repeated loading.
 
 * **Population file loading** -- ``load_pop_file('pops.txt')`` assigns populations
   from a tab-delimited file using stored sample names.
