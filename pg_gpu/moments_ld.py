@@ -17,7 +17,6 @@ Usage:
 
 import numpy as np
 import cupy as cp
-import allel
 
 from .haplotype_matrix import HaplotypeMatrix
 from .haplotype_matrix import (
@@ -81,10 +80,7 @@ def compute_ld_statistics(
     if report:
         print(f"Loading {vcf_file} ...")
     hm = HaplotypeMatrix.from_vcf(vcf_file)
-
-    # Parse populations (reads VCF sample names for index mapping)
-    samples = allel.read_vcf(vcf_file, fields=['samples'])['samples']
-    _assign_populations(hm, samples, pop_file, pops)
+    hm.load_pop_file(pop_file, pops=pops)
 
     if ac_filter:
         hm = hm.apply_biallelic_filter()
@@ -129,24 +125,6 @@ def compute_ld_statistics(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
-
-def _assign_populations(hm, samples, pop_file, pops):
-    """Set sample_sets from population file and VCF sample order."""
-    n_samples = len(samples)
-    pop_map = {}
-    with open(pop_file) as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[0] != 'sample':
-                pop_map[parts[0]] = parts[1]
-
-    pop_sets = {p: [] for p in pops}
-    for i, name in enumerate(samples):
-        pop = pop_map.get(name)
-        if pop in pop_sets:
-            pop_sets[pop].append(i)
-            pop_sets[pop].append(i + n_samples)
-    hm.sample_sets = pop_sets
 
 
 def _interpolate_genetic_distances(positions, rec_map_file):

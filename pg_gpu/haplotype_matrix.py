@@ -22,27 +22,23 @@ class HaplotypeMatrix:
         chrom_end (int): Chromosome end position.
     """
     def __init__(self,
-                 genotypes, # either a numpy array or a cupy array
-                 positions, # either a numpy array or a cupy array
+                 genotypes,
+                 positions,
                  chrom_start: int = None,
                  chrom_end: int = None,
-                 sample_sets: dict = None,  # new optional parameter for population sample sets
-                 n_total_sites: int = None  # total callable sites (variant + invariant)
+                 sample_sets: dict = None,
+                 n_total_sites: int = None,
+                 samples: list = None,
                 ):
-        # test for empty genotypes
         if genotypes.size == 0:
             raise ValueError("genotypes cannot be empty")
-        # test for empty positions
         if positions.size == 0:
             raise ValueError("positions cannot be empty")
-        # make sure genotypes and positions are either numpy or cupy arrays
-        if not isinstance(genotypes, np.ndarray) and not isinstance(genotypes, cp.ndarray):
+        if not isinstance(genotypes, (np.ndarray, cp.ndarray)):
             raise ValueError("genotypes must be a numpy or cupy array")
-        if not isinstance(positions, np.ndarray) and not isinstance(positions, cp.ndarray):
+        if not isinstance(positions, (np.ndarray, cp.ndarray)):
             raise ValueError("positions must be a numpy or cupy array")
 
-        # Determine device based on genotypes.
-        # transfer positions if necessary
         if isinstance(genotypes, cp.ndarray):
             self._device = 'GPU'
             if isinstance(positions, np.ndarray):
@@ -52,13 +48,13 @@ class HaplotypeMatrix:
             if isinstance(positions, cp.ndarray):
                 positions = positions.get()
 
-        # set attributes
         self.haplotypes = genotypes
         self.positions = positions
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
-        self._sample_sets = sample_sets  # store the sample set info (optional)
-        self.n_total_sites = n_total_sites  # total callable sites for pairwise mode
+        self._sample_sets = sample_sets
+        self.n_total_sites = n_total_sites
+        self.samples = samples  # diploid sample names from VCF
 
     @property
     def device(self):
@@ -134,46 +130,163 @@ class HaplotypeMatrix:
             self._device = 'CPU'
 
     @classmethod
-    def from_vcf(cls, path: str, include_invariant: bool = False):
-        """
-        Construct a HaplotypeMatrix from a VCF file.
+    def from_vcf(cls, path: str, region: str = None,
+                 samples: list = None, include_invariant: bool = False):
+        """Construct a HaplotypeMatrix from a VCF file.
 
-        Parameters:
-            path (str): The file path to the VCF file.
-            include_invariant (bool): If True, include invariant (monomorphic)
-                sites from the VCF. The resulting matrix will have n_total_sites
-                set to the total number of loaded sites. Requires the VCF to
-                contain invariant sites (ALT=".").
+        Parameters
+        ----------
+        path : str
+            Path to VCF/BCF file (optionally gzipped + tabix-indexed).
+        region : str, optional
+            Genomic region to load, e.g. 'chr1:1000000-2000000'.
+            Requires the VCF to be bgzipped and tabix-indexed.
+        samples : list of str, optional
+            Subset of samples to load. If None, loads all samples.
+        include_invariant : bool
+            If True, set n_total_sites from the loaded variant count.
 
-        Returns:
-            HaplotypeMatrix: An instance created from the VCF data.
-            Assumes that the VCF is phased.
-            Sets the chromosome start and end to the first and last variant positions.
+        Returns
+        -------
+        HaplotypeMatrix
+            Phased haplotype data with sample names stored.
         """
-        vcf = allel.read_vcf(path)
+        vcf = allel.read_vcf(path, region=region, samples=samples)
+        if vcf is None:
+            raise ValueError(f"No variants found in {path}"
+                             + (f" for region {region}" if region else ""))
+
         genotypes = allel.GenotypeArray(vcf['calldata/GT'])
         num_variants, num_samples, ploidy = genotypes.shape
-
-        # assert that the ploidy is 2
         assert ploidy == 2
 
-        # convert to haplotype matrix
-        haplotypes = np.empty((num_variants, 2*num_samples), dtype=genotypes.dtype)
-        # fill the haplotypes array
-        haplotypes[:, 0:num_samples] = genotypes[:, :, 0]  # First allele for all variants
-        haplotypes[:, num_samples:2*num_samples] = genotypes[:, :, 1]  # Second allele for all variants
-
-        # transpose the haplotypes array
+        haplotypes = np.empty((num_variants, 2 * num_samples), dtype=genotypes.dtype)
+        haplotypes[:, :num_samples] = genotypes[:, :, 0]
+        haplotypes[:, num_samples:] = genotypes[:, :, 1]
         haplotypes = haplotypes.T
-        positions = np.array(vcf['variants/POS'])
 
-        # get the chromosome start and end
-        chrom_start = positions[0]
-        chrom_end = positions[-1]
+        positions = np.array(vcf['variants/POS'])
+        sample_names = list(vcf['samples'])
 
         n_total_sites = num_variants if include_invariant else None
-        return cls(haplotypes, positions, chrom_start, chrom_end,
-                   n_total_sites=n_total_sites)
+        return cls(haplotypes, positions, positions[0], positions[-1],
+                   n_total_sites=n_total_sites, samples=sample_names)
+
+    @classmethod
+    def from_zarr(cls, path: str, region: str = None):
+        """Construct a HaplotypeMatrix from a Zarr store.
+
+        Zarr provides fast columnar access, especially for large datasets.
+        Create a Zarr store from VCF using allel.vcf_to_zarr() or
+        HaplotypeMatrix.vcf_to_zarr().
+
+        Parameters
+        ----------
+        path : str
+            Path to Zarr store directory.
+        region : str, optional
+            Genomic region 'chrom:start-end' to load a subset.
+
+        Returns
+        -------
+        HaplotypeMatrix
+        """
+        import zarr
+        store = zarr.open(path, mode='r')
+
+        positions = np.array(store['variants/POS'])
+        gt = np.array(store['calldata/GT'])
+        sample_names = list(store['samples']) if 'samples' in store else None
+
+        # Apply region filter if specified
+        if region is not None:
+            chrom_str, coords = region.split(':')
+            start, end = [int(x) for x in coords.split('-')]
+            mask = (positions >= start) & (positions < end)
+            positions = positions[mask]
+            gt = gt[mask]
+            if len(positions) == 0:
+                raise ValueError(f"No variants in region {region}")
+
+        num_variants, num_samples, ploidy = gt.shape
+        assert ploidy == 2
+
+        haplotypes = np.empty((num_variants, 2 * num_samples), dtype=gt.dtype)
+        haplotypes[:, :num_samples] = gt[:, :, 0]
+        haplotypes[:, num_samples:] = gt[:, :, 1]
+        haplotypes = haplotypes.T
+
+        return cls(haplotypes, positions, positions[0], positions[-1],
+                   samples=sample_names)
+
+    def to_zarr(self, zarr_path: str):
+        """Save haplotype data to Zarr format for fast reloading.
+
+        Parameters
+        ----------
+        zarr_path : str
+            Output Zarr store path.
+        """
+        import zarr
+        store = zarr.open(zarr_path, mode='w')
+        hap = self.haplotypes if isinstance(self.haplotypes, np.ndarray) else self.haplotypes.get()
+        pos = self.positions if isinstance(self.positions, np.ndarray) else self.positions.get()
+
+        gt = self._haplotypes_to_gt(hap)
+        store.create_dataset('calldata/GT', shape=gt.shape, dtype=gt.dtype, data=gt)
+        store.create_dataset('variants/POS', shape=pos.shape, dtype=pos.dtype, data=pos)
+        if self.samples is not None:
+            s = np.array(self.samples, dtype='U')
+            store.create_dataset('samples', shape=s.shape, dtype=s.dtype, data=s)
+
+    @staticmethod
+    def _haplotypes_to_gt(hap):
+        """Convert (n_hap, n_var) haplotype matrix back to (n_var, n_samples, 2) GT array."""
+        n_hap, n_var = hap.shape
+        n_samples = n_hap // 2
+        gt = np.empty((n_var, n_samples, 2), dtype=hap.dtype)
+        gt[:, :, 0] = hap[:n_samples, :].T
+        gt[:, :, 1] = hap[n_samples:, :].T
+        return gt
+
+    def load_pop_file(self, pop_file: str, pops: list = None):
+        """Load population assignments from a tab-delimited file.
+
+        Sets sample_sets from a file mapping sample names to populations.
+        Requires that sample names were stored during from_vcf().
+
+        Parameters
+        ----------
+        pop_file : str
+            Tab-delimited file with columns: sample, pop.
+            Header line starting with 'sample' is skipped.
+        pops : list of str, optional
+            Populations to include. If None, includes all found populations.
+        """
+        if self.samples is None:
+            raise ValueError("No sample names stored. Use from_vcf() to load data.")
+
+        n_samples = len(self.samples)
+        pop_map = {}
+        with open(pop_file) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0] != 'sample':
+                    pop_map[parts[0]] = parts[1]
+
+        # Build sample_sets
+        found_pops = set(pop_map.values())
+        if pops is None:
+            pops = sorted(found_pops)
+
+        pop_sets = {p: [] for p in pops}
+        for i, name in enumerate(self.samples):
+            pop = pop_map.get(name)
+            if pop in pop_sets:
+                pop_sets[pop].append(i)
+                pop_sets[pop].append(i + n_samples)
+
+        self.sample_sets = pop_sets
 
     @classmethod
     def from_ts(cls, ts: tskit.TreeSequence, device: str = 'CPU',
