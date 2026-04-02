@@ -222,6 +222,14 @@ class GenotypeMatrix:
         pos = callset['variants/POS']
         samples = list(callset['samples'])
 
+        # Filter to biallelic sites (max allele index <= 1)
+        is_biallelic = np.all(gt <= 1, axis=(1, 2)) | np.all(gt < 0, axis=(1, 2))
+        gt_array = allel.GenotypeArray(gt)
+        ac = gt_array.count_alleles()
+        is_biallelic = ac.is_biallelic_01()
+        gt = gt[is_biallelic]
+        pos = pos[is_biallelic]
+
         # sum alleles to get alt count (0/1/2)
         geno = np.sum(gt, axis=2).astype(np.int8)  # (n_variants, n_samples)
         # handle missing (-1 in either allele)
