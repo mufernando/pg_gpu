@@ -57,8 +57,8 @@ def chunked_sum_int32(hap, axis=0):
 def chunked_dac_and_n(hap):
     """Compute derived allele counts and valid counts, memory-safe.
 
-    For each variant: dac = sum of alleles (treating -1 as 0),
-    n_valid = count of non-missing haplotypes.
+    Uses the fast inline path when the matrix fits in memory, falling
+    back to chunked processing for large matrices.
 
     Parameters
     ----------
@@ -70,6 +70,17 @@ def chunked_dac_and_n(hap):
     n_valid : cupy.ndarray, int64, shape (n_var,)
     """
     n_hap, n_var = hap.shape
+
+    # Fast path: if int32 intermediates fit in ~40% of free memory, no chunking
+    free = cp.cuda.Device().mem_info[0]
+    needed = n_hap * n_var * 4 * 2  # two int32 intermediates
+    if needed < free * 0.4:
+        valid_mask = hap >= 0
+        n_valid = cp.sum(valid_mask.astype(cp.int32), axis=0).astype(cp.int64)
+        dac = cp.sum((hap * valid_mask).astype(cp.int32), axis=0).astype(cp.int64)
+        return dac, n_valid
+
+    # Chunked path for large matrices
     chunk_size = estimate_variant_chunk_size(n_hap, bytes_per_element=4,
                                              n_intermediates=2)
     dac = cp.empty(n_var, dtype=cp.int64)
