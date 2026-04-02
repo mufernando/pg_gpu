@@ -28,7 +28,7 @@ class GenotypeMatrix:
     """
 
     def __init__(self, genotypes, positions, chrom_start=None, chrom_end=None,
-                 sample_sets=None, n_total_sites=None):
+                 sample_sets=None, n_total_sites=None, samples=None):
         if genotypes.size == 0:
             raise ValueError("genotypes cannot be empty")
         if positions.size == 0:
@@ -49,6 +49,7 @@ class GenotypeMatrix:
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
         self.n_total_sites = n_total_sites
+        self.samples = samples
 
     @property
     def device(self):
@@ -219,6 +220,7 @@ class GenotypeMatrix:
         callset = allel.read_vcf(path)
         gt = callset['calldata/GT']  # (n_variants, n_samples, 2)
         pos = callset['variants/POS']
+        samples = list(callset['samples'])
 
         # sum alleles to get alt count (0/1/2)
         geno = np.sum(gt, axis=2).astype(np.int8)  # (n_variants, n_samples)
@@ -231,4 +233,69 @@ class GenotypeMatrix:
 
         n_total_sites = geno.shape[1] if include_invariant else None
         return cls(geno, pos, chrom_start=pos[0], chrom_end=pos[-1],
-                   n_total_sites=n_total_sites)
+                   n_total_sites=n_total_sites, samples=samples)
+
+    def load_pop_file(self, pop_file, pops=None):
+        """Load population assignments from a tab-delimited file.
+
+        Parameters
+        ----------
+        pop_file : str
+            Tab-delimited file with columns: sample, pop.
+        pops : list of str, optional
+            Populations to include. If None, includes all found.
+        """
+        if self.samples is None:
+            raise ValueError("No sample names stored. Use from_vcf() to load data.")
+
+        pop_map = {}
+        with open(pop_file) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0] != 'sample':
+                    pop_map[parts[0]] = parts[1]
+
+        if pops is None:
+            pops = sorted(set(pop_map.values()))
+
+        pop_sets = {p: [] for p in pops}
+        for i, name in enumerate(self.samples):
+            pop = pop_map.get(name)
+            if pop in pop_sets:
+                pop_sets[pop].append(i)
+
+        self.sample_sets = pop_sets
+
+    def apply_biallelic_filter(self):
+        """Filter to biallelic variant sites.
+
+        Keeps variants where both ref and alt alleles are present
+        among non-missing individuals.
+
+        Returns
+        -------
+        GenotypeMatrix
+        """
+        xp = cp if self._device == 'GPU' else np
+        geno = self.genotypes
+        valid = geno >= 0
+        geno_clean = xp.where(valid, geno, 0)
+        alt_counts = xp.sum(geno_clean, axis=0)
+        n_valid = xp.sum(valid, axis=0)
+        max_alt = 2 * n_valid
+        keep = (alt_counts > 0) & (alt_counts < max_alt) & (n_valid >= 2)
+
+        if self._device == 'GPU':
+            keep_idx = cp.where(keep)[0]
+            new_geno = self.genotypes[:, keep_idx]
+            new_pos = self.positions[keep_idx]
+        else:
+            keep_np = keep if isinstance(keep, np.ndarray) else keep.get()
+            new_geno = self.genotypes[:, keep_np]
+            new_pos = self.positions[keep_np]
+
+        return GenotypeMatrix(new_geno, new_pos,
+                              self.chrom_start, self.chrom_end,
+                              sample_sets=self._sample_sets,
+                              n_total_sites=self.n_total_sites,
+                              samples=self.samples)

@@ -2094,6 +2094,65 @@ def _compute_counts_for_pairs(haplotypes, idx_i, idx_j, pop_indices=None):
     return counts, n_valid
 
 
+def _compute_genotype_counts_for_pairs(genotypes, idx_i, idx_j, pop_indices=None):
+    """Compute 9-way genotype counts for variant pairs.
+
+    For each pair (locus_i, locus_j), counts all 3x3 combinations of
+    genotype values (0/1/2) at the two loci.
+
+    Parameters
+    ----------
+    genotypes : cp.ndarray
+        Shape (n_individuals, n_variants), values 0, 1, 2, or -1 (missing)
+    idx_i, idx_j : cp.ndarray
+        Pair indices, shape (n_pairs,)
+    pop_indices : list or cp.ndarray, optional
+        Indices of individuals to include
+
+    Returns
+    -------
+    counts : cp.ndarray
+        Shape (n_pairs, 9), ordering: (n00, n10, n20, n01, n11, n21, n02, n12, n22)
+    n_valid : cp.ndarray or None
+        Shape (n_pairs,), valid individual counts per pair. None if no missing data.
+    """
+    if pop_indices is not None:
+        if isinstance(pop_indices, list):
+            pop_indices = cp.array(pop_indices, dtype=cp.int32)
+        genotypes = genotypes[pop_indices, :]
+
+    n_pairs = len(idx_i)
+
+    geno_i = genotypes[:, idx_i]  # (n_ind, n_pairs)
+    geno_j = genotypes[:, idx_j]
+
+    has_missing = cp.any(genotypes == -1)
+
+    if has_missing:
+        valid_mask = (geno_i >= 0) & (geno_j >= 0)
+        n_valid = cp.sum(valid_mask, axis=0, dtype=cp.int32)
+        gi = cp.where(valid_mask, geno_i, 0)
+        gj = cp.where(valid_mask, geno_j, 0)
+    else:
+        n_valid = None
+        valid_mask = None
+        gi = geno_i
+        gj = geno_j
+
+    # Combined index: geno_i * 3 + geno_j gives values 0-8
+    combo = gi * 3 + gj  # (n_ind, n_pairs)
+
+    cols = []
+    for k in range(9):
+        mask = combo == k
+        if valid_mask is not None:
+            mask = mask & valid_mask
+        cols.append(cp.sum(mask, axis=0, dtype=cp.int32))
+
+    counts = cp.stack(cols, axis=1)  # (n_pairs, 9)
+    return counts, n_valid
+
+
 def _compute_two_pop_statistics_batch(counts_pop1, counts_pop2, n_valid1, n_valid2, ld_statistics):
     """
     Compute all 15 two-population LD statistics for a batch of pairs.
@@ -2786,6 +2845,355 @@ def _compute_all_dz(pops, dz_calls):
     # Reassemble in original call order
     output = [None] * len(dz_calls)
     for idx in range(len(dz_calls)):
+        grp, pos = call_order[idx]
+        output[idx] = group_results[grp][pos]
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Genotype (diploid) batch computation -- parallels haplotype path above
+# ---------------------------------------------------------------------------
+
+
+class _PopDataGeno:
+    """Precomputed per-population arrays for genotype-based LD computation.
+
+    Stores 9 genotype configuration counts and derived frequency quantities.
+    """
+    __slots__ = ('g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8', 'g9',
+                 'n', 'D_geno', 'pA', 'qA', 'pB', 'qB', 'fdA', 'fdB')
+
+    def __init__(self, counts, n_valid):
+        # Map from our counting order (n00,n10,n20,n01,n11,n21,n02,n12,n22)
+        # to moments convention (g1=n22,g2=n21,g3=n20,...,g9=n00)
+        self.g1 = counts[:, 8].astype(cp.float64)  # n22
+        self.g2 = counts[:, 5].astype(cp.float64)  # n21
+        self.g3 = counts[:, 2].astype(cp.float64)  # n20
+        self.g4 = counts[:, 7].astype(cp.float64)  # n12
+        self.g5 = counts[:, 4].astype(cp.float64)  # n11
+        self.g6 = counts[:, 1].astype(cp.float64)  # n10
+        self.g7 = counts[:, 6].astype(cp.float64)  # n02
+        self.g8 = counts[:, 3].astype(cp.float64)  # n01
+        self.g9 = counts[:, 0].astype(cp.float64)  # n00
+        if n_valid is not None:
+            self.n = n_valid.astype(cp.float64)
+        else:
+            self.n = (self.g1 + self.g2 + self.g3 + self.g4 + self.g5
+                      + self.g6 + self.g7 + self.g8 + self.g9)
+        # D from genotype frequencies (used in between-pop DD, Dz all-diff)
+        self.D_geno = (
+            -(self.g2 / 2 + self.g3 + self.g5 / 4 + self.g6 / 2)
+            * (self.g4 / 2 + self.g5 / 4 + self.g7 + self.g8 / 2)
+            + (self.g1 + self.g2 / 2 + self.g4 / 2 + self.g5 / 4)
+            * (self.g5 / 4 + self.g6 / 2 + self.g8 / 2 + self.g9)
+        )
+        # Allele frequency terms for between-pop formulas
+        self.pA = self.g1 + self.g2 + self.g3 + self.g4 / 2 + self.g5 / 2 + self.g6 / 2
+        self.qA = self.g4 / 2 + self.g5 / 2 + self.g6 / 2 + self.g7 + self.g8 + self.g9
+        self.pB = self.g1 + self.g2 / 2 + self.g4 + self.g5 / 2 + self.g7 + self.g8 / 2
+        self.qB = self.g2 / 2 + self.g3 + self.g5 / 2 + self.g6 + self.g8 / 2 + self.g9
+        self.fdA = -self.g1 + self.g3 - self.g4 + self.g6 - self.g7 + self.g9
+        self.fdB = -self.g1 - self.g2 - self.g3 + self.g7 + self.g8 + self.g9
+
+
+def _compute_multi_pop_statistics_batch_geno(counts_per_pop, n_valid_per_pop,
+                                             _, stat_specs):
+    """Compute all LD statistics for N populations using genotype counts.
+
+    Parallel to _compute_multi_pop_statistics_batch but uses 9-way genotype
+    counts and genotype-specific formulas from ld_statistics_genotype.
+    """
+    from . import ld_statistics_genotype as ldg
+
+    n_pairs = counts_per_pop[0].shape[0]
+    n_stats = len(stat_specs)
+
+    pops = [_PopDataGeno(counts_per_pop[p], n_valid_per_pop[p])
+            for p in range(len(counts_per_pop))]
+
+    # Compute all unique raw calls with caches
+    unique_calls = set()
+    for _, calls in stat_specs:
+        for _, stat_type, pop_indices in calls:
+            unique_calls.add((stat_type, pop_indices))
+
+    raw_cache = {}
+
+    # DD -- few calls, compute individually
+    for st, pi in unique_calls:
+        if st == 'dd':
+            i, j = pi
+            if i == j:
+                raw_cache[('dd', pi)] = ldg.dd_geno_single(pops[i])
+            else:
+                raw_cache[('dd', pi)] = ldg.dd_geno_between(pops[i], pops[j])
+
+    # Dz -- batch via einsum (same pattern as haplotype _compute_all_dz)
+    dz_calls = [pi for st, pi in unique_calls if st == 'dz']
+    if dz_calls:
+        dz_results = _compute_all_dz_geno(pops, dz_calls)
+        for pi, val in zip(dz_calls, dz_results):
+            raw_cache[('dz', pi)] = val
+
+    # pi2 -- batch via einsum + semantic dedup
+    pi2_calls = [pi for st, pi in unique_calls if st == 'pi2']
+    if pi2_calls:
+        pi2_results = _compute_all_pi2_geno(pops, pi2_calls)
+        for pi, val in zip(pi2_calls, pi2_results):
+            raw_cache[('pi2', pi)] = val
+
+    # Assemble weighted sums
+    result = cp.zeros((n_pairs, n_stats), dtype=cp.float64)
+    for stat_idx, (_, calls) in enumerate(stat_specs):
+        if len(calls) == 1:
+            w, st, pi = calls[0]
+            if w == 1.0:
+                result[:, stat_idx] = raw_cache[(st, pi)]
+            else:
+                result[:, stat_idx] = w * raw_cache[(st, pi)]
+        else:
+            val = sum(w * raw_cache[(st, pi)] for w, st, pi in calls)
+            result[:, stat_idx] = val
+
+    return result
+
+
+def _compute_all_dz_geno(pops, dz_calls):
+    """Batch-compute all raw Dz values for genotype data."""
+    from . import ld_statistics_genotype as ldg
+
+    P = len(pops)
+    # Stack for einsum
+    D_stack = cp.stack([p.D_geno for p in pops])
+    fdA_stack = cp.stack([p.fdA for p in pops])
+    fdB_stack = cp.stack([p.fdB for p in pops])
+    n_stack = cp.stack([p.n for p in pops])
+
+    groups = {'same': [], 'p1p2': [], 'p1p3': [], 'p2p3': [], 'diff': []}
+    call_order = {}
+    for idx, (p1, p2, p3) in enumerate(dz_calls):
+        if p1 == p2 == p3:
+            key = 'same'
+        elif p1 == p2:
+            key = 'p1p2'
+        elif p1 == p3:
+            key = 'p1p3'
+        elif p2 == p3:
+            key = 'p2p3'
+        else:
+            key = 'diff'
+        call_order[idx] = (key, len(groups[key]))
+        groups[key].append((p1, p2, p3))
+
+    group_results = {}
+
+    # All-different: D_geno_i * fdB_j * fdA_k (einsum)
+    if groups['diff']:
+        if P <= 4:
+            numer_tensor = cp.einsum('in,jn,kn->ijkn', D_stack, fdB_stack, fdA_stack)
+            denom_tensor = (n_stack[:, None, None, :]
+                            * (n_stack[:, None, None, :] - 1)
+                            * n_stack[None, :, None, :]
+                            * n_stack[None, None, :, :])
+            valid_tensor = ((n_stack[:, None, None, :] >= 2)
+                            & (n_stack[None, :, None, :] >= 1)
+                            & (n_stack[None, None, :, :] >= 1))
+            full = 2.0 * _safe_div(numer_tensor, denom_tensor, valid_tensor)
+            results = [full[p1, p2, p3] for p1, p2, p3 in groups['diff']]
+            del numer_tensor, denom_tensor, valid_tensor, full
+        else:
+            ii = cp.array([t[0] for t in groups['diff']])
+            jj = cp.array([t[1] for t in groups['diff']])
+            kk = cp.array([t[2] for t in groups['diff']])
+            numer = D_stack[ii] * fdB_stack[jj] * fdA_stack[kk]
+            denom = n_stack[ii] * (n_stack[ii] - 1) * n_stack[jj] * n_stack[kk]
+            valid = (n_stack[ii] >= 2) & (n_stack[jj] >= 1) & (n_stack[kk] >= 1)
+            batch = 2.0 * _safe_div(numer, denom, valid)
+            results = [batch[r] for r in range(len(groups['diff']))]
+        group_results['diff'] = results
+
+    # p1==p2 (Dz(i,i,j)): batch with advanced indexing
+    if groups['p1p2']:
+        results = []
+        for p1, p2, p3 in groups['p1p2']:
+            results.append(ldg.dz_geno_p1p2(pops[p1], pops[p3]))
+        group_results['p1p2'] = results
+
+    # p1==p3 (Dz(i,j,i))
+    if groups['p1p3']:
+        results = []
+        for p1, p2, p3 in groups['p1p3']:
+            results.append(ldg.dz_geno_p1p3(pops[p1], pops[p2]))
+        group_results['p1p3'] = results
+
+    # p2==p3 (Dz(i,j,j))
+    if groups['p2p3']:
+        results = []
+        for p1, p2, p3 in groups['p2p3']:
+            results.append(ldg.dz_geno_p2p3(pops[p1], pops[p2]))
+        group_results['p2p3'] = results
+
+    # All same (Dz(i,i,i))
+    if groups['same']:
+        results = []
+        for p1, _, _ in groups['same']:
+            results.append(ldg.dz_geno_single(pops[p1]))
+        group_results['same'] = results
+
+    output = [None] * len(dz_calls)
+    for idx in range(len(dz_calls)):
+        grp, pos = call_order[idx]
+        output[idx] = group_results[grp][pos]
+    return output
+
+
+def _compute_all_pi2_geno(pops, pi2_calls):
+    """Batch-compute all raw pi2 values for genotype data."""
+    from . import ld_statistics_genotype as ldg
+
+    P = len(pops)
+    n_pairs = pops[0].n.shape[0]
+
+    # Genotype pi2 formulas have finite-sample corrections that prevent
+    # the H_A/H_B einsum factorization used in the haplotype path.
+    # All cases use the full formula functions with semantic dedup caches.
+
+    groups = {
+        'same': [], 'triple': [], 'iikk': [], 'iikl': [],
+        'ijkk': [], 'ijij': [], 'shared': [], 'alldiff': [],
+    }
+    call_order = {}
+    for idx, (i, j, k, l) in enumerate(pi2_calls):
+        cnt = {}
+        for p in (i, j, k, l):
+            cnt[p] = cnt.get(p, 0) + 1
+        nu = len(cnt)
+        mc = max(cnt.values())
+        if nu == 1:
+            key = 'same'
+        elif mc == 3:
+            key = 'triple'
+        elif i == j and k == l:
+            key = 'iikk'
+        elif i == j:
+            key = 'iikl'
+        elif k == l:
+            key = 'ijkk'
+        elif (i == k and j == l) or (i == l and j == k):
+            key = 'ijij'
+        elif nu == 3:
+            key = 'shared'
+        else:
+            key = 'alldiff'
+        call_order[idx] = (key, len(groups[key]))
+        groups[key].append((i, j, k, l))
+
+    group_results = {}
+
+    # All-different
+    if groups['alldiff']:
+        alldiff_cache = {}
+        results = []
+        for i, j, k, l in groups['alldiff']:
+            cache_key = (i, j, k, l)
+            if cache_key not in alldiff_cache:
+                alldiff_cache[cache_key] = ldg.pi2_geno_alldiff(
+                    pops[i], pops[j], pops[k], pops[l])
+            results.append(alldiff_cache[cache_key])
+        group_results['alldiff'] = results
+
+    # pi2(i,i,k,k)
+    if groups['iikk']:
+        iikk_cache = {}
+        results = []
+        for i, j, k, l in groups['iikk']:
+            cache_key = (i, k)
+            if cache_key not in iikk_cache:
+                iikk_cache[cache_key] = ldg.pi2_geno_iikk(pops[i], pops[k])
+            results.append(iikk_cache[cache_key])
+        group_results['iikk'] = results
+
+    # pi2(i,i,k,l)
+    if groups['iikl']:
+        iikl_cache = {}
+        results = []
+        for i, j, k, l in groups['iikl']:
+            cache_key = (i, k, l)
+            if cache_key not in iikl_cache:
+                iikl_cache[cache_key] = ldg.pi2_geno_iikl(pops[i], pops[k], pops[l])
+            results.append(iikl_cache[cache_key])
+        group_results['iikl'] = results
+
+    # pi2(i,j,k,k)
+    if groups['ijkk']:
+        ijkk_cache = {}
+        results = []
+        for i, j, k, l in groups['ijkk']:
+            cache_key = (i, j, k)
+            if cache_key not in ijkk_cache:
+                ijkk_cache[cache_key] = ldg.pi2_geno_ijkk(pops[k], pops[i], pops[j])
+            results.append(ijkk_cache[cache_key])
+        group_results['ijkk'] = results
+
+    if groups['triple']:
+        trip_cache = {}
+        results = []
+        for i, j, k, l in groups['triple']:
+            cnt = {}
+            for p in (i, j, k, l):
+                cnt[p] = cnt.get(p, 0) + 1
+            tp = [p for p, c in cnt.items() if c == 3][0]
+            sp = [p for p, c in cnt.items() if c == 1][0]
+            # Check if triple pop occupies both positions in the first pair
+            first_pair_triple = (i == tp and j == tp)
+            cache_key = (tp, sp, first_pair_triple)
+            if cache_key not in trip_cache:
+                if first_pair_triple:
+                    trip_cache[cache_key] = ldg.pi2_geno_triple_123(pops[tp], pops[sp])
+                else:
+                    trip_cache[cache_key] = ldg.pi2_geno_triple_134(pops[tp], pops[sp])
+            results.append(trip_cache[cache_key])
+        group_results['triple'] = results
+
+    if groups['shared']:
+        shared_cache = {}
+        results = []
+        for i, j, k, l in groups['shared']:
+            if i == k:
+                si, ai, bi = i, j, l
+            elif i == l:
+                si, ai, bi = i, j, k
+            elif j == k:
+                si, ai, bi = j, i, l
+            elif j == l:
+                si, ai, bi = j, i, k
+            else:
+                results.append(cp.zeros(n_pairs, dtype=cp.float64))
+                continue
+            cache_key = (si, ai, bi)
+            if cache_key not in shared_cache:
+                shared_cache[cache_key] = ldg.pi2_geno_shared(pops[si], pops[ai], pops[bi])
+            results.append(shared_cache[cache_key])
+        group_results['shared'] = results
+
+    if groups['ijij']:
+        ijij_cache = {}
+        results = []
+        for i, j, k, l in groups['ijij']:
+            cache_key = (i, j)
+            if cache_key not in ijij_cache:
+                ijij_cache[cache_key] = ldg.pi2_geno_ijij(pops[i], pops[j])
+            results.append(ijij_cache[cache_key])
+        group_results['ijij'] = results
+
+    if groups['same']:
+        results = []
+        for i, j, k, l in groups['same']:
+            results.append(ldg.pi2_geno_single(pops[i]))
+        group_results['same'] = results
+
+    output = [None] * len(pi2_calls)
+    for idx in range(len(pi2_calls)):
         grp, pos = call_order[idx]
         output[idx] = group_results[grp][pos]
     return output
