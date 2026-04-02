@@ -106,8 +106,8 @@ def plot_joint_sfs(s, ax=None, log_scale=True, cmap='YlOrRd',
     plt.colorbar(im, ax=ax, label='Count')
 
     offset = 1 if clip_endpoints else 0
-    ax.set_xlabel(f'Derived allele count (pop 2)')
-    ax.set_ylabel(f'Derived allele count (pop 1)')
+    ax.set_xlabel('Derived allele count (pop 2)')
+    ax.set_ylabel('Derived allele count (pop 1)')
     sns.despine(ax=ax)
 
     return ax

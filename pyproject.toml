@@ -19,3 +19,21 @@ Homepage = "https://github.com/andrewkern/pg_gpu"
 pythonpath = [
     "pg_gpu"
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E711",   # comparison to None (existing codebase style)
+    "E712",   # comparison to True/False (existing codebase style)
+    "E721",   # type comparison (existing codebase style)
+    "E741",   # ambiguous variable name (common in pop gen: l, n, p)
+    "F401",   # unused import (some re-exports are intentional)
+    "F811",   # redefined unused name (test fixtures)
+    "F841",   # unused variable (sometimes used for GPU sync)
+    "W605",   # invalid escape sequence (in CUDA kernel strings)
+]

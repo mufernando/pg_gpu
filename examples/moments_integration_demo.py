@@ -4,7 +4,7 @@ Demographic inference from LD statistics using pg_gpu + moments.
 
 Simulates 50 replicate 1Mb regions under an isolation-with-migration model
 using msprime, computes two-population LD statistics with pg_gpu,
-then fits the demographic model using moments' inference engine. 
+then fits the demographic model using moments' inference engine.
 Compares timing of the LD parsing step: pg_gpu vs moments.
 
 The demographic model:
@@ -209,7 +209,7 @@ def main():
             print(f"{name:<20s} {true:>10.0f} {est:>10.0f} {ci}")
     print("=" * 66)
 
-    print(f"\nTiming summary:")
+    print("\nTiming summary:")
     print(f"  LD parsing (pg_gpu):  {t_gpu:>8.1f}s  ({NUM_REPS} replicates)")
     if t_moments is not None:
         print(f"  LD parsing (moments): {t_moments:>8.1f}s  ({t_moments/t_gpu:.0f}x slower)")

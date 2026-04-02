@@ -64,7 +64,7 @@ def run_moments(use_cache=True):
     if use_cache and cache_file.exists():
         with open(cache_file, 'rb') as f:
             result = pickle.load(f)
-        print(f"  moments: loaded from cache")
+        print("  moments: loaded from cache")
         return result['stats'], result['time']
 
     t0 = time.time()
@@ -188,7 +188,7 @@ def plot_results(mom, gpu, labels, stat_names, t_moments, t_pg):
                  fontsize=13, y=1.02)
     plt.tight_layout()
     fig.savefig("examples/two_pop_ld_benchmark.png", dpi=150, bbox_inches="tight")
-    print(f"\nFigure saved to examples/two_pop_ld_benchmark.png")
+    print("\nFigure saved to examples/two_pop_ld_benchmark.png")
 
 
 def main():
@@ -202,14 +202,14 @@ def main():
     print(f"  Distance bins: {len(BP_BINS)-1} bins from "
           f"{BP_BINS[0]:.0f} to {BP_BINS[-1]:.0f} bp")
 
-    print(f"\nComputing LD statistics ...")
+    print("\nComputing LD statistics ...")
     moments_stats, t_moments = run_moments()
     gpu_stats, t_pg = run_pg_gpu(hm)
 
-    print(f"\nValidation:")
+    print("\nValidation:")
     mom, gpu, labels, stat_names = compare(moments_stats, gpu_stats)
 
-    print(f"\nTiming:")
+    print("\nTiming:")
     print(f"  moments: {t_moments:.2f}s")
     print(f"  pg_gpu:  {t_pg:.3f}s")
     print(f"  Speedup: {t_moments/t_pg:.0f}x")

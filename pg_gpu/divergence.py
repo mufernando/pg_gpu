@@ -78,7 +78,7 @@ def fst(haplotype_matrix: HaplotypeMatrix,
         missing_data: str = 'include') -> float:
     """
     Compute FST between two populations.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -114,7 +114,7 @@ def fst_hudson(haplotype_matrix: HaplotypeMatrix,
                missing_data: str = 'include') -> float:
     """
     Compute Hudson's FST estimator between two populations.
-    
+
     Hudson (1992) estimator:
     FST = 1 - (Hw / Hb)
     where Hw is within-population diversity and Hb is between-population diversity
@@ -237,9 +237,9 @@ def fst_weir_cockerham(haplotype_matrix: HaplotypeMatrix,
                        missing_data: str = 'include') -> float:
     """
     Compute Weir & Cockerham's (1984) FST estimator.
-    
+
     This is the method of moments estimator that accounts for sampling variance.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -344,7 +344,7 @@ def fst_weir_cockerham(haplotype_matrix: HaplotypeMatrix,
     valid_mask = ((a + b + c) > 0) & (n1 > 0) & (n2 > 0)
     fst_per_snp = cp.zeros_like(a)
     fst_per_snp[valid_mask] = a[valid_mask] / (a[valid_mask] + b[valid_mask] + c[valid_mask])
-    
+
     # Global FST estimate (ratio of averages)
     if cp.any(valid_mask):
         global_fst = float(cp.sum(a[valid_mask]).get() /
@@ -360,10 +360,10 @@ def fst_nei(haplotype_matrix: HaplotypeMatrix,
             missing_data: str = 'include') -> float:
     """
     Compute Nei's GST (1973).
-    
+
     GST = (HT - HS) / HT
     where HT is total heterozygosity and HS is within-subpopulation heterozygosity
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -385,11 +385,11 @@ def fst_nei(haplotype_matrix: HaplotypeMatrix,
     # Get population indices
     pop1_idx = _get_population_indices(haplotype_matrix, pop1)
     pop2_idx = _get_population_indices(haplotype_matrix, pop2)
-    
+
     # Ensure data is on GPU if available
     if haplotype_matrix.device == 'CPU':
         haplotype_matrix.transfer_to_gpu()
-    
+
     # Get haplotype data
     pop1_haps = haplotype_matrix.haplotypes[pop1_idx, :]
     pop2_haps = haplotype_matrix.haplotypes[pop2_idx, :]
@@ -579,10 +579,10 @@ def da(haplotype_matrix: HaplotypeMatrix,
        span_denominator: bool = False) -> float:
     """
     Compute net divergence (Da) between two populations.
-    
+
     Da = Dxy - (pi1 + pi2) / 2
     where pi1 and pi2 are within-population diversities
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -603,18 +603,18 @@ def da(haplotype_matrix: HaplotypeMatrix,
         Net divergence (Da)
     """
     # Get Dxy
-    dxy_value = dxy(haplotype_matrix, pop1, pop2, missing_data=missing_data, 
+    dxy_value = dxy(haplotype_matrix, pop1, pop2, missing_data=missing_data,
                    span_denominator=span_denominator)
-    
+
     # Get within-population diversities
     pi1 = pi_within_population(haplotype_matrix, pop1, missing_data=missing_data,
                               span_denominator=span_denominator)
     pi2 = pi_within_population(haplotype_matrix, pop2, missing_data=missing_data,
                               span_denominator=span_denominator)
-    
+
     # Calculate Da
     da_value = dxy_value - (pi1 + pi2) / 2.0
-    
+
     return da_value
 
 
@@ -624,7 +624,7 @@ def pi_within_population(haplotype_matrix: HaplotypeMatrix,
                         span_denominator: bool = False) -> float:
     """
     Compute nucleotide diversity (pi) within a population.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -660,7 +660,7 @@ def pi_within_population(haplotype_matrix: HaplotypeMatrix,
     # Extract population haplotypes
     pop_haplotypes = haplotype_matrix.haplotypes[pop_idx, :]
     total_sites = pop_haplotypes.shape[1]
-    
+
     # Handle missing data
     if missing_data == 'exclude':
         # Only use sites with no missing data
@@ -707,7 +707,7 @@ def divergence_stats(haplotype_matrix: HaplotypeMatrix,
                     span_denominator: bool = False) -> Dict[str, float]:
     """
     Compute multiple divergence statistics between two populations.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -724,14 +724,14 @@ def divergence_stats(haplotype_matrix: HaplotypeMatrix,
     span_denominator : bool
         If True, normalize by total sites; if False, normalize by sites with data
         (only applies to dxy, da, pi1, pi2)
-        
+
     Returns
     -------
     dict
         Dictionary of statistic names to values
     """
     results = {}
-    
+
     for stat in statistics:
         if stat == 'fst':
             results['fst'] = fst(haplotype_matrix, pop1, pop2, missing_data=missing_data)
@@ -742,7 +742,7 @@ def divergence_stats(haplotype_matrix: HaplotypeMatrix,
         elif stat == 'fst_nei':
             results['fst_nei'] = fst_nei(haplotype_matrix, pop1, pop2, missing_data=missing_data)
         elif stat == 'dxy':
-            results['dxy'] = dxy(haplotype_matrix, pop1, pop2, missing_data=missing_data, 
+            results['dxy'] = dxy(haplotype_matrix, pop1, pop2, missing_data=missing_data,
                                span_denominator=span_denominator)
         elif stat == 'da':
             results['da'] = da(haplotype_matrix, pop1, pop2, missing_data=missing_data,
@@ -755,7 +755,7 @@ def divergence_stats(haplotype_matrix: HaplotypeMatrix,
                                                 span_denominator=span_denominator)
         else:
             raise ValueError(f"Unknown statistic: {stat}")
-    
+
     return results
 
 
@@ -765,7 +765,7 @@ def pairwise_fst(haplotype_matrix: HaplotypeMatrix,
                  missing_data: str = 'include') -> Tuple[cp.ndarray, list]:
     """
     Compute pairwise FST matrix for multiple populations.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
@@ -789,16 +789,16 @@ def pairwise_fst(haplotype_matrix: HaplotypeMatrix,
         if haplotype_matrix.sample_sets is None:
             raise ValueError("No populations defined in haplotype matrix")
         populations = list(haplotype_matrix.sample_sets.keys())
-    
+
     n_pops = len(populations)
     fst_matrix = cp.zeros((n_pops, n_pops))
-    
+
     for i in range(n_pops):
         for j in range(i + 1, n_pops):
             fst_value = fst(haplotype_matrix, populations[i], populations[j], method, missing_data)
             fst_matrix[i, j] = fst_value
             fst_matrix[j, i] = fst_value
-    
+
     return fst_matrix, populations
 
 
@@ -806,14 +806,14 @@ def _get_population_indices(haplotype_matrix: HaplotypeMatrix,
                            pop: Union[str, list]) -> list:
     """
     Get population indices from name or list.
-    
+
     Parameters
     ----------
     haplotype_matrix : HaplotypeMatrix
         The haplotype data
     pop : str or list
         Population name or list of indices
-        
+
     Returns
     -------
     list

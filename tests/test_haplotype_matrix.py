@@ -26,10 +26,10 @@ def sample_vcf():
         with open(tmp.name, 'w') as f:
             ts.write_vcf(f, allow_position_zero=True)
         yield tmp.name
-    
+
     # Clean up the temporary file
     os.unlink(tmp.name)
-    
+
 @pytest.fixture
 def sample_ts():
     """Create a sample tskit.TreeSequence for testing."""
@@ -61,13 +61,13 @@ def test_from_ts(sample_ts):
     assert hap_matrix.device == 'CPU'
     assert isinstance(hap_matrix.get_matrix(), np.ndarray)  # Now expecting CuPy array
     assert isinstance(hap_matrix.get_positions(), np.ndarray)  # Now expecting CuPy array
-    
+
     # make a GPU version
     hap_matrix_gpu = HaplotypeMatrix.from_ts(sample_ts, device='GPU')
     assert hap_matrix_gpu.device == 'GPU'
     assert isinstance(hap_matrix_gpu.get_matrix(), cp.ndarray)
     assert isinstance(hap_matrix_gpu.get_positions(), cp.ndarray)
-    
+
     # Add test for pairwise_LD
     D = hap_matrix.pairwise_LD_v()
     assert isinstance(D, cp.ndarray)
@@ -119,8 +119,8 @@ def test_empty_haplotype_matrix():
     """Test handling of empty data."""
     with pytest.raises(Exception):
         # Create HaplotypeMatrix with empty arrays
-        HaplotypeMatrix(cp.array([]), cp.array([])) 
-        
+        HaplotypeMatrix(cp.array([]), cp.array([]))
+
 def test_bad_genotypes_bad_positions():
     """Test handling of bad genotypes."""
     with pytest.raises(Exception):
@@ -133,7 +133,7 @@ def test_bad_genotypes_bad_positions():
                       [1, 0, 1, 0]]),
             (100, 200) #tuple input
         )
-        
+
 def test_mixed_device_genotypes_positions():
     """Test handling of mixed device genotypes and positions."""
     hap_matrix = HaplotypeMatrix(
@@ -157,7 +157,7 @@ def test_mixed_device_genotypes_positions():
     hap_matrix.transfer_to_gpu()
     assert hap_matrix.device == 'GPU'
     assert isinstance(hap_matrix.positions, cp.ndarray)
-    
+
 def test_get_subset_from_range(sample_vcf):
     """Test get_subset_from_range method."""
     hap_matrix = HaplotypeMatrix.from_vcf(sample_vcf)
@@ -186,20 +186,20 @@ def test_transfer_to_gpu():
                           [1, 0, 1, 0]], dtype=np.int32)
     positions = np.array([100, 200], dtype=np.int32)
     hm = HaplotypeMatrix(genotypes.copy(), positions.copy())
-    
+
     # Verify initial device is CPU and arrays are NumPy arrays.
     assert hm.device == 'CPU'
     assert isinstance(hm.haplotypes, np.ndarray)
     assert isinstance(hm.positions, np.ndarray)
-    
+
     # Transfer to GPU
     hm.transfer_to_gpu()
-    
+
     # Verify that the device updates and the underlying arrays are now CuPy arrays.
     assert hm.device == 'GPU'
     assert isinstance(hm.haplotypes, cp.ndarray)
     assert isinstance(hm.positions, cp.ndarray)
-    
+
     # Verify that the content remains identical (using cp.asnumpy for comparison)
     np.testing.assert_array_equal(cp.asnumpy(hm.haplotypes), genotypes)
     np.testing.assert_array_equal(cp.asnumpy(hm.positions), positions)
@@ -211,19 +211,19 @@ def test_transfer_to_cpu():
                           [1, 0, 1, 0]], dtype=np.int32)
     positions = np.array([100, 200], dtype=np.int32)
     hm = HaplotypeMatrix(genotypes.copy(), positions.copy())
-    
+
     # Move to GPU first.
     hm.transfer_to_gpu()
     assert hm.device == 'GPU'
-    
+
     # Transfer back to CPU
     hm.transfer_to_cpu()
-    
+
     # Verify that the device is back to CPU and arrays are NumPy arrays.
     assert hm.device == 'CPU'
     assert isinstance(hm.haplotypes, np.ndarray)
     assert isinstance(hm.positions, np.ndarray)
-    
+
     # Ensure that the data is identical to the original.
     np.testing.assert_array_equal(hm.haplotypes, genotypes)
     np.testing.assert_array_equal(hm.positions, positions)
@@ -237,7 +237,7 @@ def test_allele_frequency_spectrum(sample_vcf):
     assert afs.ndim == 1
     # AFS has n+1 bins for frequencies 0 to n
     assert afs.size == hap_matrix.num_haplotypes + 1
-    
+
 def test_diversity(sample_vcf):
     """Test calculation of pi."""
     hap_matrix = HaplotypeMatrix.from_vcf(sample_vcf)
@@ -254,7 +254,7 @@ def test_diversity_tskit(sample_ts):
     pi_tskit = sample_ts.diversity(mode="site")
     assert isinstance(pi, float)
     assert cp.allclose(pi, pi_tskit)
-    
+
 def test_pairwise_LD_v_transfers():
     """
     Test that calling pairwise_LD_v on a CPU-based HaplotypeMatrix
@@ -273,13 +273,13 @@ def test_pairwise_LD_v_transfers():
                           ], dtype=np.int32)
     positions = np.array([50, 150, 250, 350, 450, 550, 650, 750], dtype=np.int32)
     hm = HaplotypeMatrix(genotypes.copy(), positions.copy())
-    
+
     # Initially, data should be on the CPU.
     assert hm.device == 'CPU'
-    
+
     # Call the pairwise LD function. It should check and transfer data to the GPU.
     D = hm.pairwise_LD_v()
-    
+
     # Verify that the device is now GPU.
     assert hm.device == 'GPU'
     # Verify that D is a CuPy array.

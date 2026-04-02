@@ -218,7 +218,7 @@ def main():
                  fontsize=13, y=1.02)
     plt.tight_layout()
     fig.savefig("examples/windowed_benchmark.png", dpi=150, bbox_inches="tight")
-    print(f"\nFigure saved to examples/windowed_benchmark.png")
+    print("\nFigure saved to examples/windowed_benchmark.png")
     plt.show()
 
 

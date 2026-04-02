@@ -29,6 +29,7 @@ pytest = ">=7.0"
 pytest-xdist = ">=3.0"
 ipython = ">=8.0"
 ipykernel = ">=6.0"
+ruff = ">=0.4"
 
 [feature.moments.pypi-dependencies]
 moments-popgen = "*"
@@ -44,4 +45,5 @@ moments = ["dev", "docs", "moments"]
 [tasks]
 test = { cmd = "pytest tests/ -v" }
 test-parallel = { cmd = "pytest tests/ -v -n 10" }
+lint = { cmd = "ruff check pg_gpu/ tests/ examples/" }
 docs = { cmd = "make html", cwd = "docs" }
