@@ -262,14 +262,9 @@ def theta_w(haplotype_matrix: HaplotypeMatrix,
                 "No invariant site information available (n_total_sites not set). "
                 "Pairwise-mode theta_w will be computed from variant sites only.",
                 stacklevel=2)
-        haplotypes = matrix.haplotypes
-        valid_mask = haplotypes >= 0
-        n_valid_per_site = cp.sum(valid_mask, axis=0)
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
         sites_with_data = n_valid_per_site >= 2
-        hap_clean = cp.where(valid_mask, haplotypes, 0)
-        derived_counts = cp.sum(hap_clean, axis=0)
 
-        # Identify segregating sites
         seg_mask = sites_with_data & (derived_counts > 0) & (derived_counts < n_valid_per_site)
         if not cp.any(seg_mask):
             raw_theta = 0.0
@@ -308,25 +303,12 @@ def theta_w(haplotype_matrix: HaplotypeMatrix,
         seg_sites = segregating_sites(matrix, missing_data='exclude')
 
     else:  # missing_data == 'include'
-        # Calculate theta using site-specific sample sizes (vectorized)
-        haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
-
-        # Create mask for valid (non-missing) data
-        valid_mask = haplotypes >= 0  # shape: (n_haplotypes, n_variants)
-
-        # Count valid samples per site
-        n_valid_per_site = cp.sum(valid_mask, axis=0)  # shape: (n_variants,)
-
-        # Only consider sites with at least 2 valid samples
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
         sites_with_data = n_valid_per_site >= 2
 
         if not cp.any(sites_with_data):
             theta = cp.float64(0.0)
         else:
-            # For each site, check if it's segregating among valid samples
-            # Count derived alleles among valid samples
-            hap_clean = cp.where(valid_mask, haplotypes, 0)
-            derived_counts = cp.sum(hap_clean, axis=0)
 
             # A site is segregating if 0 < derived_count < n_valid
             valid_sites = cp.where(sites_with_data)[0]
@@ -411,33 +393,16 @@ def tajimas_d(haplotype_matrix: HaplotypeMatrix,
         matrix.transfer_to_gpu()
 
     if missing_data == 'pairwise':
-        # Pairwise Tajima's D: use raw pairwise pi and per-site theta_w
-        # with harmonic mean of sample sizes for variance terms
-        haplotypes = matrix.haplotypes
-        valid_mask = haplotypes >= 0
-        n_valid_per_site = cp.sum(valid_mask, axis=0)
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
         sites_with_data = n_valid_per_site >= 2
         if not cp.any(sites_with_data):
             return float("nan")
 
-        # Raw pairwise pi (sum of diffs / sum of comps, then multiply by comps
-        # to get raw count-equivalent; or just use raw diffs directly)
-        total_diffs, total_comps, _, _ = _pairwise_pi_components(
-            haplotypes, n_total_sites=None)  # no invariant correction for D
-        if total_comps == 0:
-            return float("nan")
-        # pi in "number of differences" scale: diffs/comps * C(n_mean, 2)
-        # But Tajima's D uses raw pi = sum of per-site heterozygosity
-        # Use the 'include'-style raw pi for consistency with theta_w
         pi_value = pi(matrix, span_normalize=False, missing_data='include')
 
-        # Harmonic mean of sample sizes for variance terms
         valid_n = n_valid_per_site[sites_with_data]
         n_haplotypes = round(float(len(valid_n) / cp.sum(1.0 / valid_n).get()))
 
-        # Segregating sites
-        hap_clean = cp.where(valid_mask, haplotypes, 0)
-        derived_counts = cp.sum(hap_clean, axis=0)
         seg_mask = sites_with_data & (derived_counts > 0) & (derived_counts < n_valid_per_site)
         S = int(cp.sum(seg_mask).get())
         if S == 0:
@@ -496,28 +461,14 @@ def tajimas_d(haplotype_matrix: HaplotypeMatrix,
         n_haplotypes = round(float(len(n_valid_per_site[valid_site_mask]) /
                            cp.sum(1.0 / n_valid_per_site[valid_site_mask]).get()))
 
-        # Count segregating sites considering missing data (vectorized)
-        haplotypes = matrix.haplotypes
-        valid_mask = haplotypes >= 0
-        n_valid_per_site = cp.sum(valid_mask, axis=0)
-
-        # Only consider sites with at least 2 valid samples
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
         sites_with_data = n_valid_per_site >= 2
 
         if not cp.any(sites_with_data):
             S = 0
         else:
-            # Check which sites are segregating among valid samples
-            hap_clean = cp.where(valid_mask, haplotypes, 0)
-            derived_counts = cp.sum(hap_clean, axis=0)
-
-            # Filter to sites with valid data
             valid_sites = cp.where(sites_with_data)[0]
-            n_valid_sites = n_valid_per_site[valid_sites]
-            derived_sites = derived_counts[valid_sites]
-
-            # A site is segregating if 0 < derived_count < n_valid
-            segregating_mask = (derived_sites > 0) & (derived_sites < n_valid_sites)
+            segregating_mask = (derived_counts[valid_sites] > 0) & (derived_counts[valid_sites] < n_valid_per_site[valid_sites])
             S = int(cp.sum(segregating_mask).get())
     else:
         # For 'exclude' mode
@@ -606,28 +557,12 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
         freqs = cp.sum(valid_haplotypes, axis=0)
 
     else:  # missing_data == 'include'
-        # Build AFS considering variable sample sizes per site (vectorized)
-        haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
         max_n = matrix.num_haplotypes
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
 
-        # Create mask for valid (non-missing) data
-        valid_mask = haplotypes >= 0  # shape: (n_haplotypes, n_variants)
-
-        # Count valid samples per site
-        n_valid_per_site = cp.sum(valid_mask, axis=0)  # shape: (n_variants,)
-
-        # Only consider sites with valid data
         sites_with_data = n_valid_per_site > 0
-
         if not cp.any(sites_with_data):
             return np.zeros(max_n + 1, dtype=np.int64)
-
-        # For sites with valid data, count derived alleles among valid samples
-        # Set missing data to 0 for counting, but only count where valid
-        hap_clean = cp.where(valid_mask, haplotypes, 0)
-
-        # Count derived alleles per site (only among valid samples)
-        derived_counts = cp.sum(hap_clean, axis=0)  # shape: (n_variants,)
 
         # Filter to sites with valid data and check they're biallelic
         valid_sites = cp.where(sites_with_data)[0]
@@ -712,34 +647,14 @@ def segregating_sites(haplotype_matrix: HaplotypeMatrix,
         segregating = (allele_counts > 0) & (allele_counts < n_haplotypes)
 
     else:  # missing_data == 'include'
-        # Count segregating sites based on non-missing data only (vectorized)
-        haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
-
-        # Create mask for valid (non-missing) data
-        valid_mask = haplotypes >= 0  # shape: (n_haplotypes, n_variants)
-
-        # Count valid samples per site
-        n_valid_per_site = cp.sum(valid_mask, axis=0)  # shape: (n_variants,)
-
-        # Only consider sites with at least 2 valid samples
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
         sites_with_data = n_valid_per_site >= 2
 
         if not cp.any(sites_with_data):
             return 0
 
-        # For each site, check if it's segregating among valid samples
-        # Count derived alleles among valid samples
-        hap_clean = cp.where(valid_mask, haplotypes, 0)
-        derived_counts = cp.sum(hap_clean, axis=0)
-
-        # Filter to sites with valid data
         valid_sites = cp.where(sites_with_data)[0]
-        n_valid_sites = n_valid_per_site[valid_sites]
-        derived_sites = derived_counts[valid_sites]
-
-        # A site is segregating if 0 < derived_count < n_valid
-        segregating_mask = (derived_sites > 0) & (derived_sites < n_valid_sites)
-
+        segregating_mask = (derived_counts[valid_sites] > 0) & (derived_counts[valid_sites] < n_valid_per_site[valid_sites])
         return int(cp.sum(segregating_mask).get())
 
     return int(cp.sum(segregating).get())
@@ -796,33 +711,14 @@ def singleton_count(haplotype_matrix: HaplotypeMatrix,
         allele_counts = cp.sum(valid_haplotypes, axis=0)
 
     else:  # missing_data == 'include'
-        # Count singletons based on non-missing data at each site (vectorized)
-        haplotypes = matrix.haplotypes  # shape: (n_haplotypes, n_variants)
-
-        # Create mask for valid (non-missing) data
-        valid_mask = haplotypes >= 0  # shape: (n_haplotypes, n_variants)
-
-        # Count valid samples per site
-        n_valid_per_site = cp.sum(valid_mask, axis=0)  # shape: (n_variants,)
-
-        # Only consider sites with at least 1 valid sample
+        derived_counts, n_valid_per_site = _dac_and_n(matrix.haplotypes)
         sites_with_data = n_valid_per_site >= 1
 
         if not cp.any(sites_with_data):
             return 0
 
-        # For each site, count derived alleles among valid samples
-        hap_clean = cp.where(valid_mask, haplotypes, 0)
-        derived_counts = cp.sum(hap_clean, axis=0)
-
-        # Filter to sites with valid data
         valid_sites = cp.where(sites_with_data)[0]
-        derived_at_valid = derived_counts[valid_sites]
-
-        # Count sites where exactly 1 derived allele is present
-        singleton_mask = derived_at_valid == 1
-
-        return int(cp.sum(singleton_mask).get())
+        return int(cp.sum(derived_counts[valid_sites] == 1).get())
 
     # For exclude mode
     return int(cp.sum(allele_counts == 1).get())
@@ -1212,16 +1108,13 @@ def _effective_n_and_S(matrix, missing_data):
             return 0.0, 0.0, matrix
         matrix = matrix.get_subset(valid_idx)
 
-    # 'include' / 'pairwise' mode (default fallback)
-    haplotypes = matrix.haplotypes
-    valid_mask = haplotypes >= 0
-    n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
+    dac_i, n_valid_i = _dac_and_n(matrix.haplotypes)
+    n_valid = n_valid_i.astype(cp.float64)
+    dac = dac_i.astype(cp.float64)
     usable = n_valid >= 2
     if not cp.any(usable):
         return 0.0, 0.0, matrix
 
-    hap_clean = cp.where(valid_mask, haplotypes, 0)
-    dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
     seg_mask = usable & (dac > 0) & (dac < n_valid)
     S = float(cp.sum(seg_mask).get())
 
@@ -1442,20 +1335,14 @@ def max_daf(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    hap = matrix.haplotypes
+    dac_i, n_valid_i = _dac_and_n(matrix.haplotypes)
+    dac = dac_i.astype(cp.float64)
+    n_valid = n_valid_i.astype(cp.float64)
 
     if missing_data == 'exclude':
-        missing_per_var = cp.sum(hap < 0, axis=0)
-        complete = missing_per_var == 0
-        hap_clean = cp.where(hap >= 0, hap, 0)
-        n = hap.shape[0]
-        dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
-        freqs = cp.where(complete, dac / n, -1.0)  # -1 so excluded sites aren't max
+        complete = n_valid_i == matrix.haplotypes.shape[0]
+        freqs = cp.where(complete, dac / n_valid, -1.0)
     else:
-        # 'include' mode (default fallback)
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0).astype(cp.float64)
         usable = n_valid > 0
         freqs = cp.where(usable, dac / n_valid, 0.0)
 
@@ -1538,21 +1425,14 @@ def daf_histogram(matrix, n_bins: int = 20,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    hap = matrix.haplotypes
+    dac_i, n_valid_i = _dac_and_n(matrix.haplotypes)
+    dac = dac_i.astype(cp.float64)
+    n_valid = n_valid_i.astype(cp.float64)
 
     if missing_data == 'exclude':
-        missing_per_var = cp.sum(hap < 0, axis=0)
-        complete = missing_per_var == 0
-        hap_clean = cp.where(hap >= 0, hap, 0)
-        n = hap.shape[0]
-        dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
-        dafs = dac / n
-        dafs = dafs[complete]  # filter to complete sites
+        complete = n_valid_i == matrix.haplotypes.shape[0]
+        dafs = (dac / n_valid)[complete]
     else:
-        # 'include' mode (default fallback)
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0).astype(cp.float64)
         usable = n_valid > 0
         dafs = cp.where(usable, dac / n_valid, 0.0)
 
@@ -1703,27 +1583,22 @@ def heterozygosity_expected(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    hap = matrix.haplotypes  # (n_haplotypes, n_variants)
-    has_missing = cp.any(hap < 0)
+    dac_i, n_valid_i = _dac_and_n(matrix.haplotypes)
+    dac = dac_i.astype(cp.float64)
+    n_valid = n_valid_i.astype(cp.float64)
+    n = matrix.haplotypes.shape[0]
 
-    if missing_data == 'include' and has_missing:
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-        hap_clean = cp.where(valid_mask, hap, 0)
-        dac = cp.sum(hap_clean, axis=0).astype(cp.float64)
+    if missing_data == 'include':
         p = cp.where(n_valid > 0, dac / n_valid, 0.0)
         he = 2.0 * p * (1.0 - p)
         he = cp.where(n_valid >= 2, he, cp.nan)
     else:
-        n = hap.shape[0]
-        hap_for_sum = cp.where(hap >= 0, hap, 0) if has_missing else hap
-        dac = cp.sum(hap_for_sum, axis=0).astype(cp.float64)
         p = dac / n
         he = 2.0 * p * (1.0 - p)
 
-        if missing_data == 'exclude' and has_missing:
-            missing_per_var = cp.sum(hap < 0, axis=0)
-            he[missing_per_var > 0] = cp.nan
+        if missing_data == 'exclude':
+            incomplete = n_valid_i < n
+            he[incomplete] = cp.nan
 
     return he.get()
 
@@ -1911,21 +1786,14 @@ def mu_sfs(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    hap = matrix.haplotypes
+    dac, n_valid = _dac_and_n(matrix.haplotypes)
 
     if missing_data == 'exclude':
-        missing_per_var = cp.sum(hap < 0, axis=0)
-        complete = missing_per_var == 0
-        hap_clean = cp.where(hap >= 0, hap, 0)
-        n = hap.shape[0]
-        dac = cp.sum(hap_clean, axis=0)
+        n = matrix.haplotypes.shape[0]
+        complete = n_valid == n
         is_seg = complete & (dac > 0) & (dac < n)
         is_edge = complete & ((dac == 1) | (dac == n - 1))
     else:
-        # 'include' mode (default fallback)
-        valid_mask = hap >= 0
-        n_valid = cp.sum(valid_mask, axis=0)
-        dac = cp.sum(cp.where(valid_mask, hap, 0), axis=0)
         usable = n_valid >= 2
         is_seg = usable & (dac > 0) & (dac < n_valid)
         is_edge = usable & ((dac == 1) | (dac == n_valid - 1))
