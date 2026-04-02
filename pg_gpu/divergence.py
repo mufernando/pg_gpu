@@ -555,12 +555,11 @@ def dxy(haplotype_matrix: HaplotypeMatrix,
 
     if per_site:
         if missing_data == 'exclude':
-            # Return values for valid sites only
             result = cp.zeros(total_sites)
             result[valid_sites] = dxy_per_site
-            return result
+            return result.get()
         else:
-            return dxy_per_site
+            return dxy_per_site.get()
     else:
         if span_denominator:
             # Normalize by total sites

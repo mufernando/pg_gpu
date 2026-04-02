@@ -217,8 +217,8 @@ class TestAlleleFrequencySpectrum:
 
         afs = diversity.allele_frequency_spectrum(matrix)
 
-        if isinstance(afs, cp.ndarray):
-            afs = afs.get()
+        if isinstance(afs, np.ndarray):
+            afs = np.asarray(afs)
 
         # Should have 25 sites with 0 copies and 25 with n_samples copies
         assert afs[0] == 25  # Sites with 0 derived alleles
@@ -241,8 +241,8 @@ class TestAlleleFrequencySpectrum:
 
         afs = diversity.allele_frequency_spectrum(matrix)
 
-        if isinstance(afs, cp.ndarray):
-            afs = afs.get()
+        if isinstance(afs, np.ndarray):
+            afs = np.asarray(afs)
 
         # Should have n_variants singletons
         assert afs[1] == n_variants
@@ -451,7 +451,7 @@ class TestGPUCalculations:
 
         # AFS should return GPU array
         afs = diversity.allele_frequency_spectrum(matrix)
-        assert isinstance(afs, cp.ndarray)
+        assert isinstance(afs, np.ndarray)
 
 
 class TestBackwardCompatibility:

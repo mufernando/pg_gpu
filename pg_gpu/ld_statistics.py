@@ -413,10 +413,9 @@ def _resolve_r2_matrix(r2_matrix_or_matrix, missing_data='include'):
             seg_idx = cp.where(seg)[0]
             if len(seg_idx) < mat.num_variants:
                 mat = mat.get_subset(seg_idx)
-            return mat.pairwise_r2()
+            # pairwise_r2 returns numpy; convert back for internal GPU ops
+            return cp.asarray(mat.pairwise_r2(), dtype=cp.float64)
         else:
-            # Diploid: keep monomorphic sites (as zero-r^2 rows/cols),
-            # matching diploSHIC's convention where ZnS denominator = n_snps^2
             return _r2_matrix_diploid(mat)
     else:
         if not isinstance(r2_matrix_or_matrix, cp.ndarray):

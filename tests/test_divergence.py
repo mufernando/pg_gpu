@@ -175,8 +175,7 @@ class TestDxyCalculations:
 
         dxy_per_site = divergence.dxy(matrix, 'pop1', 'pop2', per_site=True)
 
-        if matrix.device == 'GPU':
-            dxy_per_site = dxy_per_site.get()
+        dxy_per_site = np.asarray(dxy_per_site)
 
         # First 5 sites should have Dxy = 1
         assert np.all(dxy_per_site[:5] == 1.0)
@@ -366,7 +365,7 @@ class TestGPUCalculations:
 
         # Per-site calculation
         dxy_per_site = divergence.dxy(matrix, 'pop1', 'pop2', per_site=True)
-        assert isinstance(dxy_per_site, cp.ndarray)
+        assert isinstance(dxy_per_site, np.ndarray)
         assert dxy_per_site.shape == (n_variants,)
 
 

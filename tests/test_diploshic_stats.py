@@ -88,7 +88,7 @@ class TestDistanceStats:
         hap = np.zeros((4, 10), dtype=np.int8)
         matrix = HaplotypeMatrix(hap, np.arange(10) * 100, 0, 1000)
         diffs = distance_stats.pairwise_diffs_haploid(matrix)
-        np.testing.assert_array_almost_equal(diffs.get(), 0.0)
+        np.testing.assert_array_almost_equal(np.asarray(diffs), 0.0)
 
     def test_dist_var(self, hap_data):
         v = distance_stats.dist_var(hap_data)

@@ -14,10 +14,11 @@ from ._utils import get_population_matrix
 
 
 def _extract_upper_triangle(mat):
-    """Extract upper triangle of a square matrix as condensed vector."""
+    """Extract upper triangle of a square matrix as condensed numpy vector."""
     n = mat.shape[0]
     idx_i, idx_j = cp.triu_indices(n, k=1)
-    return mat[idx_i, idx_j]
+    result = mat[idx_i, idx_j]
+    return result.get() if hasattr(result, 'get') else result
 
 
 def pairwise_diffs_haploid(haplotype_matrix, population=None,
@@ -37,7 +38,7 @@ def pairwise_diffs_haploid(haplotype_matrix, population=None,
 
     Returns
     -------
-    diffs : cupy.ndarray, float64, condensed form (n_pairs,)
+    diffs : ndarray, float64, condensed form (n_pairs,)
         For 'include'/'pairwise', values are per-site average differences.
     """
     if missing_data == 'pairwise':
@@ -89,7 +90,7 @@ def pairwise_diffs_diploid(genotype_matrix, population=None,
 
     Returns
     -------
-    diffs : cupy.ndarray, float64, condensed form (n_pairs,)
+    diffs : ndarray, float64, condensed form (n_pairs,)
     """
     if missing_data == 'pairwise':
         missing_data = 'include'
@@ -144,30 +145,30 @@ def dist_moments(matrix, population=None, missing_data='include'):
     skew : float
     kurt : float
     """
-    diffs = _get_diffs(matrix, population, missing_data)
+    diffs = np.asarray(_get_diffs(matrix, population, missing_data))
     n = diffs.shape[0]
 
     if n < 2:
         return 0.0, 0.0, 0.0
 
-    mean = cp.mean(diffs)
+    mean = np.mean(diffs)
     centered = diffs - mean
     c2 = centered ** 2
-    m2 = cp.mean(c2)
+    m2 = np.mean(c2)
 
-    var_val = float((cp.sum(c2) / (n - 1)).get())
+    var_val = float(np.sum(c2) / (n - 1))
 
-    if n < 3 or float(m2.get()) == 0:
+    if n < 3 or m2 == 0:
         return var_val, 0.0, 0.0
 
-    m3 = cp.mean(centered ** 3)
-    skew_val = float((m3 / (m2 ** 1.5)).get())
+    m3 = np.mean(centered ** 3)
+    skew_val = float(m3 / (m2 ** 1.5))
 
     if n < 4:
         return var_val, skew_val, 0.0
 
-    m4 = cp.mean(centered ** 4)
-    kurt_val = float((m4 / (m2 ** 2) - 3.0).get())
+    m4 = np.mean(centered ** 4)
+    kurt_val = float(m4 / (m2 ** 2) - 3.0)
 
     return var_val, skew_val, kurt_val
 
@@ -202,7 +203,7 @@ def pairwise_diffs(matrix, population=None, missing_data='include'):
 
     Returns
     -------
-    diffs : cupy.ndarray, float64, condensed form (n_pairs,)
+    diffs : ndarray, float64, condensed form (n_pairs,)
     """
     if isinstance(matrix, GenotypeMatrix):
         return pairwise_diffs_diploid(matrix, population, missing_data)

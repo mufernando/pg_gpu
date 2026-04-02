@@ -233,7 +233,7 @@ def test_allele_frequency_spectrum(sample_vcf):
     """Test calculation of allele frequency spectrum."""
     hap_matrix = HaplotypeMatrix.from_vcf(sample_vcf)
     afs = hap_matrix.allele_frequency_spectrum()
-    assert isinstance(afs, cp.ndarray)
+    assert isinstance(afs, np.ndarray)
     assert afs.ndim == 1
     # AFS has n+1 bins for frequencies 0 to n
     assert afs.size == hap_matrix.num_haplotypes + 1

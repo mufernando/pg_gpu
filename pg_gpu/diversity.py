@@ -571,7 +571,7 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
 
     Returns
     -------
-    cp.ndarray
+    ndarray
         Array where element i contains the number of sites with i derived alleles
     """
     # pairwise mode uses same per-site logic as include for AFS
@@ -595,7 +595,7 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
 
         if not cp.any(valid_sites):
             # No valid sites, return empty AFS
-            return cp.zeros(matrix.num_haplotypes + 1, dtype=cp.int64)
+            return np.zeros(matrix.num_haplotypes + 1, dtype=np.int64)
 
         # Use only valid sites
         valid_haplotypes = matrix.haplotypes[:, valid_sites]
@@ -619,7 +619,7 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
         sites_with_data = n_valid_per_site > 0
 
         if not cp.any(sites_with_data):
-            return cp.zeros(max_n + 1, dtype=cp.int64)
+            return np.zeros(max_n + 1, dtype=np.int64)
 
         # For sites with valid data, count derived alleles among valid samples
         # Set missing data to 0 for counting, but only count where valid
@@ -651,12 +651,12 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
             else:
                 afs = afs[:max_n + 1].astype(cp.int64)
         else:
-            afs = cp.zeros(max_n + 1, dtype=cp.int64)
+            return np.zeros(max_n + 1, dtype=np.int64)
 
-        return afs
+        return afs.get()
 
     # For exclude mode, create standard histogram
-    return cp.histogram(freqs, bins=cp.arange(n_haplotypes + 2))[0]
+    return cp.histogram(freqs, bins=cp.arange(n_haplotypes + 2))[0].get()
 
 
 def segregating_sites(haplotype_matrix: HaplotypeMatrix,

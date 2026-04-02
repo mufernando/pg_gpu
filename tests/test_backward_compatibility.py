@@ -118,9 +118,9 @@ class TestHaplotypeMatrixCompatibility:
 
         # Convert to numpy if needed
         if hasattr(afs_old, 'get'):
-            afs_old = afs_old.get()
+            afs_old = np.asarray(afs_old)
         if hasattr(afs_new, 'get'):
-            afs_new = afs_new.get()
+            afs_new = np.asarray(afs_new)
 
         # Should be identical
         np.testing.assert_array_equal(afs_old, afs_new)
@@ -161,7 +161,7 @@ class TestHaplotypeMatrixCompatibility:
         assert abs(pi_gpu_old - pi_gpu_new) < 1e-15
         assert abs(theta_gpu_old - theta_gpu_new) < 1e-15
         assert abs(tajd_gpu_old - tajd_gpu_new) < 1e-15
-        np.testing.assert_array_equal(afs_gpu_old.get(), afs_gpu_new.get())
+        np.testing.assert_array_equal(np.asarray(afs_gpu_old), np.asarray(afs_gpu_new))
 
         # CPU version should match
         matrix_cpu = HaplotypeMatrix(haplotypes, positions, positions[0], positions[-1])
@@ -315,12 +315,12 @@ class TestDocumentationExamples:
 
         # AFS arrays should be identical
         if hasattr(old_results['afs'], 'get'):
-            old_afs = old_results['afs'].get()
+            old_afs = np.asarray(old_results['afs'])
         else:
             old_afs = old_results['afs']
 
         if hasattr(new_results['afs'], 'get'):
-            new_afs = new_results['afs'].get()
+            new_afs = np.asarray(new_results['afs'])
         else:
             new_afs = new_results['afs']
 

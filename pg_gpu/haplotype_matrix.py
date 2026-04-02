@@ -665,10 +665,14 @@ class HaplotypeMatrix:
 
         return D
 
-    def pairwise_r2(self) -> cp.ndarray:
+    def pairwise_r2(self) -> np.ndarray:
         """
         Calculate the pairwise r2 (correlation coefficient) for all pairs of variants
         in the haplotype matrix.
+
+        Returns
+        -------
+        ndarray, float64, shape (n_variants, n_variants)
         """
         if self.device == 'CPU':
             self.transfer_to_gpu()
@@ -692,7 +696,7 @@ class HaplotypeMatrix:
 
         cp.fill_diagonal(r2, 0)
 
-        return r2
+        return r2.get()
 
     def locate_unlinked(self, size=100, step=20, threshold=0.1):
         """Locate variants in approximate linkage equilibrium.

@@ -132,7 +132,7 @@ class TestDiversityComparison:
         matrix = HaplotypeMatrix(haplotypes, positions, test_data['start'], test_data['end'])
         afs_pg = diversity.allele_frequency_spectrum(matrix)
         if hasattr(afs_pg, 'get'):
-            afs_pg = afs_pg.get()
+            afs_pg = np.asarray(afs_pg)
 
         # scikit-allel
         h = allel.HaplotypeArray(haplotypes.T)
