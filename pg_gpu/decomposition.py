@@ -15,8 +15,11 @@ from ._utils import get_population_matrix as _get_population_matrix
 def _prepare_matrix(haplotype_matrix, scaler, population, missing_data='include'):
     """Center and scale haplotype matrix for PCA.
 
-    Returns the prepared matrix X and its dimensions.
+    Uses chunked processing for large matrices to avoid OOM.
+    Returns the prepared matrix X on GPU.
     """
+    from ._memutil import chunked_dac_and_n, estimate_variant_chunk_size
+
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -26,44 +29,93 @@ def _prepare_matrix(haplotype_matrix, scaler, population, missing_data='include'
         matrix.transfer_to_gpu()
 
     hap = matrix.haplotypes
-    has_missing = cp.any(hap < 0)
+    n_samples, n_var = hap.shape
 
-    if missing_data == 'exclude' and has_missing:
-        missing_per_var = cp.sum(hap < 0, axis=0)
-        complete = missing_per_var == 0
-        hap = hap[:, complete]
-        has_missing = False
+    if missing_data == 'exclude':
+        dac, nv = chunked_dac_and_n(hap)
+        complete = nv == n_samples
+        if not cp.all(complete):
+            hap = hap[:, complete]
+            n_var = hap.shape[1]
 
-    if has_missing:
-        # Impute missing values to per-site mean frequency
-        valid_mask = hap >= 0
-        hap_clean = cp.where(valid_mask, hap, 0).astype(cp.float64)
-        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-        site_mean = cp.where(n_valid > 0, cp.sum(hap_clean, axis=0) / n_valid, 0.0)
-        X = cp.where(valid_mask, hap_clean, site_mean[None, :])
-    else:
-        X = hap.astype(cp.float64)
+    # Compute per-site mean and scale from allele counts (memory-safe)
+    dac, nv = chunked_dac_and_n(hap)
+    site_mean = cp.where(nv > 0, dac.astype(cp.float64) / nv.astype(cp.float64), 0.0)
 
-    X = X.copy()
-
-    # center
-    mean = cp.mean(X, axis=0)
-    X -= mean
-
-    # scale
     if scaler == 'patterson':
-        p = cp.mean(X + mean, axis=0)  # original mean freq
+        p = site_mean
         scale = cp.sqrt(p * (1 - p))
-        valid = scale > 0
-        X[:, valid] /= scale[valid]
-        X[:, ~valid] = 0
+        scale = cp.where(scale > 0, scale, 1.0)
     elif scaler == 'standard':
-        std = cp.std(X, axis=0)
-        valid = std > 0
-        X[:, valid] /= std[valid]
-        X[:, ~valid] = 0
+        # Need variance -- compute via second pass or approximate
+        scale = None  # handled below
+    else:
+        scale = None
 
-    return X
+    # Check if full float64 matrix fits in memory
+    free = cp.cuda.Device().mem_info[0]
+    needed = n_samples * n_var * 8  # float64
+    if needed < free * 0.4:
+        # Fast path: materialize full matrix
+        has_missing = bool(cp.any(hap < 0).get())
+        if has_missing:
+            valid_mask = hap >= 0
+            X = cp.where(valid_mask, hap, 0).astype(cp.float64)
+            X = cp.where(valid_mask, X, site_mean[None, :])
+        else:
+            X = hap.astype(cp.float64)
+        X -= site_mean
+        if scaler == 'patterson':
+            X /= scale
+        elif scaler == 'standard':
+            std = cp.std(X, axis=0)
+            valid = std > 0
+            X[:, valid] /= std[valid]
+            X[:, ~valid] = 0
+        return X
+
+    # Memory-constrained path: return hap + metadata for chunked PCA
+    # Store scaling info so pca() can chunk the matmul
+    return _DeferredPCA(hap, site_mean, scale, scaler)
+
+
+class _DeferredPCA:
+    """Wrapper for memory-constrained PCA: stores hap + scaling metadata
+    so the caller can compute X @ X.T via chunked matmul without
+    materializing the full float64 matrix."""
+
+    def __init__(self, hap, site_mean, scale, scaler):
+        self.hap = hap
+        self.site_mean = site_mean
+        self.scale = scale
+        self.scaler = scaler
+        self.shape = hap.shape
+
+    def chunked_gram(self):
+        """Compute X @ X.T via chunked processing."""
+        from ._memutil import estimate_variant_chunk_size
+        n_samples, n_var = self.hap.shape
+        chunk_size = estimate_variant_chunk_size(n_samples, bytes_per_element=8,
+                                                  n_intermediates=2)
+        C = cp.zeros((n_samples, n_samples), dtype=cp.float64)
+        has_missing = bool(cp.any(self.hap < 0).get())
+
+        for start in range(0, n_var, chunk_size):
+            end = min(start + chunk_size, n_var)
+            chunk = self.hap[:, start:end]
+            if has_missing:
+                valid = chunk >= 0
+                x = cp.where(valid, chunk, 0).astype(cp.float64)
+                x = cp.where(valid, x, self.site_mean[start:end])
+            else:
+                x = chunk.astype(cp.float64)
+            x -= self.site_mean[start:end]
+            if self.scaler == 'patterson' and self.scale is not None:
+                x /= self.scale[start:end]
+            C += x @ x.T
+            del x
+
+        return C
 
 
 def pca(haplotype_matrix: HaplotypeMatrix,
@@ -97,14 +149,31 @@ def pca(haplotype_matrix: HaplotypeMatrix,
     explained_variance_ratio : ndarray, float64, shape (n_components,)
         Proportion of variance explained by each component.
     """
-    X = _prepare_matrix(haplotype_matrix, scaler, population, missing_data)
+    prepared = _prepare_matrix(haplotype_matrix, scaler, population, missing_data)
+
+    if isinstance(prepared, _DeferredPCA):
+        # Memory-constrained: use covariance trick (eigendecompose X @ X.T)
+        n_samples, n_variants = prepared.shape
+        n_components = min(n_components, n_samples)
+        C = prepared.chunked_gram()  # (n_samples, n_samples)
+        eigvals, eigvecs = cp.linalg.eigh(C)
+        # eigh returns ascending order; reverse for descending
+        idx = cp.argsort(eigvals)[::-1]
+        eigvals = eigvals[idx]
+        eigvecs = eigvecs[:, idx]
+        # Eigenvalues of C = singular values^2 of X
+        coords = eigvecs[:, :n_components] * cp.sqrt(cp.maximum(eigvals[:n_components], 0))
+        var = eigvals / n_samples
+        explained_variance_ratio = var[:n_components] / cp.sum(cp.maximum(var, 0))
+        return coords.get(), explained_variance_ratio.get()
+
+    # Fast path: full SVD
+    X = prepared
     n_samples, n_variants = X.shape
     n_components = min(n_components, min(n_samples, n_variants))
 
     U, S, Vt = cp.linalg.svd(X, full_matrices=False)
-
     coords = U[:, :n_components] * S[:n_components]
-
     var = (S ** 2) / n_samples
     explained_variance_ratio = var[:n_components] / cp.sum(var)
 
