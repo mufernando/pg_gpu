@@ -35,20 +35,21 @@ from . import ld_statistics
 
 
 def compute_ld_statistics(
-    vcf_file, rec_map_file=None, pop_file=None, pops=None,
+    vcf_file=None, rec_map_file=None, pop_file=None, pops=None,
     r_bins=None, bp_bins=None, use_genotypes=False,
-    report=True, ac_filter=True,
+    report=True, ac_filter=True, haplotype_matrix=None,
 ):
     """GPU-accelerated multi-population LD statistics, moments-compatible.
 
     Parameters
     ----------
-    vcf_file : str
-        Path to VCF file.
+    vcf_file : str, optional
+        Path to VCF file. Not needed if haplotype_matrix is provided.
     rec_map_file : str, optional
         Recombination map (tab-delimited: pos, Map(cM)). Required with r_bins.
-    pop_file : str
-        Population file (tab-delimited: sample, pop).
+    pop_file : str, optional
+        Population file (tab-delimited: sample, pop). Not needed if
+        haplotype_matrix already has sample_sets configured.
     pops : list of str
         Population names (1-4). Defaults to ['pop0', 'pop1'].
     r_bins : array-like, optional
@@ -59,6 +60,8 @@ def compute_ld_statistics(
         Print progress.
     ac_filter : bool
         Apply biallelic filter.
+    haplotype_matrix : HaplotypeMatrix, optional
+        Pre-loaded HaplotypeMatrix (skips VCF loading and GPU transfer).
 
     Returns
     -------
@@ -71,17 +74,23 @@ def compute_ld_statistics(
         raise ValueError("1-4 populations supported")
     if r_bins is None and bp_bins is None:
         raise ValueError("Either r_bins or bp_bins must be provided")
-    if pop_file is None:
-        raise ValueError("pop_file is required")
 
-    if report:
-        print(f"Loading {vcf_file} ...")
-    hm = HaplotypeMatrix.from_vcf(vcf_file)
-    hm.load_pop_file(pop_file, pops=pops)
-
-    if ac_filter:
-        hm = hm.apply_biallelic_filter()
-    hm.transfer_to_gpu()
+    if haplotype_matrix is not None:
+        hm = haplotype_matrix
+        if not isinstance(hm.haplotypes, cp.ndarray):
+            hm.transfer_to_gpu()
+    else:
+        if vcf_file is None:
+            raise ValueError("vcf_file or haplotype_matrix is required")
+        if pop_file is None:
+            raise ValueError("pop_file is required when loading from VCF")
+        if report:
+            print(f"Loading {vcf_file} ...")
+        hm = HaplotypeMatrix.from_vcf(vcf_file)
+        hm.load_pop_file(pop_file, pops=pops)
+        if ac_filter:
+            hm = hm.apply_biallelic_filter()
+        hm.transfer_to_gpu()
 
     if report:
         print(f"  {hm.num_haplotypes} hap, {hm.num_variants:,} variants")
