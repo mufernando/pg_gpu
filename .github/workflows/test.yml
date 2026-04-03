@@ -18,29 +18,6 @@ jobs:
           environments: lint
       - run: pixi run -e lint ruff check pg_gpu/ tests/ examples/
 
-  test-gpu:
-    name: GPU tests
-    runs-on: self-hosted
-    timeout-minutes: 30
-    needs: lint
-    steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: latest
-      - run: pixi install
-      - run: pixi run pytest tests/ -v --tb=short -x
-      - run: pixi run python tests/validate_against_allel.py
-
-  test-moments:
-    name: Moments integration
-    runs-on: self-hosted
-    timeout-minutes: 30
-    needs: test-gpu
-    steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: latest
-      - run: pixi install -e moments
-      - run: pixi run -e moments pytest tests/test_moments_ld.py -v --tb=short
+  # GPU tests and moments integration require a GPU and must be run locally:
+  #   pixi run pytest tests/ -v
+  #   pixi run -e moments pytest tests/test_moments_ld.py -v
