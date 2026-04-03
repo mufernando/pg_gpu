@@ -356,5 +356,263 @@ def main():
         print(f"  Total (moments):      {t_moments + t_inference:>8.1f}s")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Four-population LD inference demo
+# ══════════════════════════════════════════════════════════════════════════
+
+FOUR_POP_REPS = 200
+FOUR_POP_DIR = "examples/data/four_pop_demo"
+FOUR_POP_POPS = ["pop0", "pop1", "pop2", "pop3"]
+
+
+def four_pop_demographic_model():
+    """Balanced tree: ((pop0,pop1),(pop2,pop3)).
+
+    Ancestral population splits into two clades at T_deep=2000 gen,
+    each clade splits at T_shallow=500 gen. Close relatives exchange
+    migrants at rate 5e-4, distant relatives at 5e-5.
+    """
+    b = demes.Builder()
+    b.add_deme("anc", epochs=[dict(start_size=10000, end_time=2000)])
+    b.add_deme("AB", ancestors=["anc"], epochs=[dict(start_size=10000, end_time=500)])
+    b.add_deme("CD", ancestors=["anc"], epochs=[dict(start_size=10000, end_time=500)])
+    b.add_deme("pop0", ancestors=["AB"], epochs=[dict(start_size=5000)])
+    b.add_deme("pop1", ancestors=["AB"], epochs=[dict(start_size=15000)])
+    b.add_deme("pop2", ancestors=["CD"], epochs=[dict(start_size=3000)])
+    b.add_deme("pop3", ancestors=["CD"], epochs=[dict(start_size=20000)])
+    b.add_migration(demes=["pop0", "pop1"], rate=5e-4)
+    b.add_migration(demes=["pop2", "pop3"], rate=5e-4)
+    b.add_migration(demes=["pop0", "pop2"], rate=5e-5)
+    b.add_migration(demes=["pop1", "pop3"], rate=5e-5)
+    return b.resolve()
+
+
+def four_pop_split_mig(params, rho=None, theta=0.001, pop_ids=None):
+    """Balanced tree ((pop0,pop1),(pop2,pop3)) for moments LD inference.
+
+    params = [nu0, nu1, nu2, nu3, T_deep, T_shallow, m_close, m_far]
+    All sizes relative to N_anc, times in 2*N_anc generations.
+    """
+    nu0, nu1, nu2, nu3, Td, Ts, mc, mf = params
+
+    # Clamp to avoid negative integration time
+    if Td <= Ts:
+        Td = Ts + 1e-4
+
+    y = moments.LD.Demographics1D.snm(rho=rho, theta=theta)
+    # Deep split: anc → AB + CD
+    y = y.split(0)
+    y.integrate([1, 1], Td - Ts, m=[[0, mf], [mf, 0]],
+                rho=rho, theta=theta)
+    # Split AB → pop0 + pop1
+    y = y.split(0)
+    # Split CD → pop2 + pop3
+    y = y.split(2)
+    # Four-pop integration with migration
+    m = [[0, mc, mf, mf],
+         [mc, 0, mf, mf],
+         [mf, mf, 0, mc],
+         [mf, mf, mc, 0]]
+    y.integrate([nu0, nu1, nu2, nu3], Ts, m=m, rho=rho, theta=theta)
+    if pop_ids is not None:
+        y.pop_ids = pop_ids
+    return y
+
+
+def simulate_four_pop_data():
+    """Simulate replicate regions for the 4-population model."""
+    os.makedirs(FOUR_POP_DIR, exist_ok=True)
+
+    g = four_pop_demographic_model()
+    demog = msprime.Demography.from_demes(g)
+
+    print(f"Simulating {FOUR_POP_REPS} x {SEQ_LEN/1e6:.0f}Mb regions (4 pops) ...")
+    tree_sequences = msprime.sim_ancestry(
+        {p: SAMPLE_SIZE for p in FOUR_POP_POPS},
+        demography=demog,
+        sequence_length=SEQ_LEN,
+        recombination_rate=REC_RATE,
+        num_replicates=FOUR_POP_REPS,
+        random_seed=123,
+    )
+    for ii, ts in enumerate(tree_sequences):
+        ts = msprime.sim_mutations(ts, rate=MUT_RATE, random_seed=ii + 100)
+        vcf_path = os.path.join(FOUR_POP_DIR, f"rep_{ii}.vcf")
+        with open(vcf_path, "w") as f:
+            ts.write_vcf(f, allow_position_zero=True)
+
+    # Write samples file
+    with open(os.path.join(FOUR_POP_DIR, "samples.txt"), "w") as f:
+        f.write("sample\tpop\n")
+        for pop_idx, pop_name in enumerate(FOUR_POP_POPS):
+            for ind in range(SAMPLE_SIZE):
+                sample_id = pop_idx * SAMPLE_SIZE + ind
+                f.write(f"tsk_{sample_id}\t{pop_name}\n")
+
+    # Write flat recombination map
+    with open(os.path.join(FOUR_POP_DIR, "flat_map.txt"), "w") as f:
+        f.write("pos\tMap(cM)\n")
+        f.write("0\t0\n")
+        f.write(f"{SEQ_LEN}\t{REC_RATE * SEQ_LEN * 100}\n")
+
+
+def run_four_pop_demo():
+    """Run the four-population LD inference demo."""
+    print("\n" + "=" * 66)
+    print("Four-Population LD Inference: pg_gpu + moments")
+    print("=" * 66)
+
+    cache_file = os.path.join(FOUR_POP_DIR, "ld_stats_cache.pkl")
+    pop_file = os.path.join(FOUR_POP_DIR, "samples.txt")
+    rec_map = os.path.join(FOUR_POP_DIR, "flat_map.txt")
+
+    if not os.path.exists(cache_file):
+        simulate_four_pop_data()
+
+        # Parse LD with pg_gpu
+        print(f"\nParsing 4-pop LD statistics ({len(R_BINS)-1} bins) ...")
+        ld_stats = {}
+        t0 = time.time()
+        for ii in range(FOUR_POP_REPS):
+            vcf_path = os.path.join(FOUR_POP_DIR, f"rep_{ii}.vcf")
+            ld_stats[ii] = compute_ld_statistics(
+                vcf_path, rec_map_file=rec_map, pop_file=pop_file,
+                pops=FOUR_POP_POPS, r_bins=R_BINS, report=False,
+            )
+        t_gpu = time.time() - t0
+        print(f"  pg_gpu: {FOUR_POP_REPS} replicates in {t_gpu:.1f}s "
+              f"({t_gpu/FOUR_POP_REPS:.2f}s per rep)")
+
+        # moments 4-pop LD parsing with r_bins has a known issue,
+        # so we skip the direct comparison here.
+        t_mom = None
+
+        with open(cache_file, "wb") as f:
+            pickle.dump({'gpu': ld_stats, 't_gpu': t_gpu,
+                         't_mom': t_mom}, f)
+    else:
+        print(f"\nLoading cached LD statistics from {cache_file}")
+        with open(cache_file, "rb") as f:
+            cache = pickle.load(f)
+        ld_stats = cache['gpu']
+        t_gpu = cache['t_gpu']
+        t_mom = cache.get('t_mom')
+
+    # Bootstrap
+    print(f"\nBootstrapping {FOUR_POP_REPS} replicates ...")
+    mv = moments.LD.Parsing.bootstrap_data(ld_stats)
+    all_boot = moments.LD.Parsing.get_bootstrap_sets(
+        ld_stats, remove_norm_stats=False)
+
+    # Inference
+    print("\nRunning 4-pop demographic inference ...")
+    Ne_true = 10000
+    # True params in coalescent units:
+    # nu0=0.5, nu1=1.5, nu2=0.3, nu3=2.0, T_deep=0.1, T_shallow=0.025,
+    # m_close=10, m_far=1
+    p_guess = [0.5, 1.5, 0.3, 2.0, 0.1, 0.025, 10, 1, Ne_true]
+    p_guess = moments.LD.Util.perturb_params(p_guess, fold=0.1)
+
+    # Bounds: all params positive; Td > Ts enforced in model function
+    lower = [0.01, 0.01, 0.01, 0.01, 0.001, 0.001, 0.01, 0.01, 100]
+    upper = [100, 100, 100, 100, 10, 10, 100, 100, 1e6]
+
+    t0 = time.time()
+    opt_params, LL = moments.LD.Inference.optimize_log_lbfgsb(
+        p_guess, [mv["means"], mv["varcovs"]],
+        [four_pop_split_mig], rs=R_BINS,
+        func_kwargs={"pop_ids": FOUR_POP_POPS},
+        lower_bound=lower, upper_bound=upper,
+    )
+    t_inference = time.time() - t0
+    print(f"  Inference completed in {t_inference:.1f}s (LL = {LL:.2f})")
+
+    # Convert to physical units
+    Ne_inferred = opt_params[-1]
+    g = four_pop_demographic_model()
+
+    true_vals = {
+        "N(pop0)": g["pop0"].epochs[0].start_size,
+        "N(pop1)": g["pop1"].epochs[0].start_size,
+        "N(pop2)": g["pop2"].epochs[0].start_size,
+        "N(pop3)": g["pop3"].epochs[0].start_size,
+        "T_deep (gen)": 2000,
+        "T_shallow (gen)": 500,
+        "m_close": 5e-4,
+        "m_far": 5e-5,
+        "N(ancestral)": 10000,
+    }
+
+    inferred_physical = moments.LD.Util.rescale_params(
+        opt_params, ["nu", "nu", "nu", "nu", "T", "T", "m", "m", "Ne"])
+
+    print("\n" + "=" * 60)
+    print(f"{'Parameter':<20s} {'True':>12s} {'Inferred':>12s}")
+    print("-" * 60)
+    for i, (name, true) in enumerate(true_vals.items()):
+        est = inferred_physical[i]
+        if "m_" in name:
+            print(f"{name:<20s} {true:>12.6f} {est:>12.6f}")
+        else:
+            print(f"{name:<20s} {true:>12.0f} {est:>12.0f}")
+    print("=" * 60)
+
+    # Plot a subset of LD statistics
+    print("\nPlotting 4-pop LD comparison ...")
+    ld_names = mv["means"][0].names()[0] if hasattr(mv["means"][0], 'names') else ld_stats[0]['stats'][0]
+    r_mids = (R_BINS[:-1] + R_BINS[1:]) / 2
+
+    # Compute expected LD curves from inferred model
+    rho_bins = 4 * Ne_inferred * R_BINS
+    y_inf = moments.LD.Inference.bin_stats(
+        four_pop_split_mig, opt_params[:-1], rho=rho_bins,
+        kwargs={"pop_ids": FOUR_POP_POPS})
+    sd_inf = moments.LD.Inference.sigmaD2(y_inf, normalization=0)
+
+    # Select a few representative statistics to plot
+    panels = [
+        ("DD_0_0", r"$D_0^2$"),
+        ("DD_0_2", r"$D_0 D_2$ (cross-clade)"),
+        ("DD_2_3", r"$D_2 D_3$"),
+        ("pi2_0_0_1_1", r"$\pi_{2;0,0,1,1}$"),
+        ("pi2_0_0_2_2", r"$\pi_{2;0,0,2,2}$ (cross)"),
+        ("pi2_0_1_2_3", r"$\pi_{2;0,1,2,3}$ (all)"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6), sharex=True)
+    axes = axes.flatten()
+
+    for ax, (stat_name, label) in zip(axes, panels):
+        idx = ld_names.index(stat_name)
+        emp_vals = np.array([mv["means"][b][idx] for b in range(len(r_mids))])
+        emp_se = np.array([np.sqrt(mv["varcovs"][b][idx, idx])
+                           for b in range(len(r_mids))])
+        inf_vals = np.array([sd_inf[b][idx] for b in range(len(r_mids))])
+
+        ax.errorbar(r_mids, emp_vals, yerr=emp_se, fmt='o', ms=3,
+                    color='k', capsize=2, zorder=3)
+        ax.plot(r_mids, inf_vals, '-', color='C0', lw=2)
+        ax.set_xscale('log')
+        ax.set_title(label, fontsize=10)
+        ax.tick_params(labelsize=8)
+
+    for ax in axes[3:]:
+        ax.set_xlabel('r (recombination rate)', fontsize=9)
+    fig.suptitle("4-population LD inference: empirical vs inferred", y=1.02)
+    fig.tight_layout()
+    outfile = os.path.join(FOUR_POP_DIR, "four_pop_ld_comparison.pdf")
+    fig.savefig(outfile, dpi=150, bbox_inches='tight')
+    print(f"  Saved to {outfile}")
+    plt.close(fig)
+
+    print(f"\nTiming summary:")
+    print(f"  LD parsing (pg_gpu):  {t_gpu:>8.1f}s  ({FOUR_POP_REPS} replicates)")
+    if t_mom is not None:
+        print(f"  LD parsing (moments): {t_mom:>8.1f}s  ({t_mom/t_gpu:.0f}x slower)")
+    print(f"  Inference:            {t_inference:>8.1f}s")
+    print(f"  Total (pg_gpu):       {t_gpu + t_inference:>8.1f}s")
+
+
 if __name__ == "__main__":
     main()
+    run_four_pop_demo()
