@@ -2861,7 +2861,8 @@ class _PopDataGeno:
     Stores 9 genotype configuration counts and derived frequency quantities.
     """
     __slots__ = ('g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8', 'g9',
-                 'n', 'D_geno', 'pA', 'qA', 'pB', 'qB', 'fdA', 'fdB')
+                 'n', 'D_geno', 'pA', 'qA', 'pB', 'qB', 'fdA', 'fdB',
+                 'B_L', 'B_R', 'C00', 'C01', 'C10', 'C11')
 
     def __init__(self, counts, n_valid):
         # Our counting: combo = geno_i*3+geno_j gives columns:
@@ -2895,6 +2896,22 @@ class _PopDataGeno:
         self.qB = self.g2 / 2 + self.g3 + self.g5 / 2 + self.g6 + self.g8 / 2 + self.g9
         self.fdA = -self.g1 + self.g3 - self.g4 + self.g6 - self.g7 + self.g9
         self.fdB = -self.g1 - self.g2 - self.g3 + self.g7 + self.g8 + self.g9
+        # pi2 kernel precomputations
+        H_L = self.g4 + self.g5 + self.g6  # het count at locus A
+        H_R = self.g2 + self.g5 + self.g8  # het count at locus B
+        nn1 = 4 * self.n * (self.n - 1)
+        self.B_L = (4*self.pA*self.qA - H_L) / cp.maximum(nn1, 1)
+        self.B_R = (4*self.pB*self.qB - H_R) / cp.maximum(nn1, 1)
+        # Same-individual joint allele matrix X (2x2 per pair)
+        x_AB = self.g1 + self.g2/2 + self.g4/2 + self.g5/4
+        x_Ab = self.g2/2 + self.g3 + self.g5/4 + self.g6/2
+        x_aB = self.g4/2 + self.g5/4 + self.g7 + self.g8/2
+        x_ab = self.g5/4 + self.g6/2 + self.g8/2 + self.g9
+        # C_i = ([P,R]^T [Q,S] - X) / (4*n*(n-1))
+        self.C00 = (self.pA*self.pB - x_AB) / cp.maximum(nn1, 1)
+        self.C01 = (self.pA*self.qB - x_Ab) / cp.maximum(nn1, 1)
+        self.C10 = (self.qA*self.pB - x_aB) / cp.maximum(nn1, 1)
+        self.C11 = (self.qA*self.qB - x_ab) / cp.maximum(nn1, 1)
 
 
 def _compute_multi_pop_statistics_batch_geno(counts_per_pop, n_valid_per_pop,
@@ -3049,15 +3066,26 @@ def _compute_all_dz_geno(pops, dz_calls):
 
 
 def _compute_all_pi2_geno(pops, pi2_calls):
-    """Batch-compute all raw pi2 values for genotype data."""
+    """Batch-compute all raw pi2 values for genotype data.
+
+    Uses the kernel decomposition: precomputed A^L, A^R (off-diagonal),
+    B^L, B^R (same-pop diagonal), and C (overlap) kernels replace the
+    full polynomial formulas for 5 of 8 case types. Triple, ijij, and
+    single-pop cases still use the formula functions.
+    """
     from . import ld_statistics_genotype as ldg
 
     P = len(pops)
     n_pairs = pops[0].n.shape[0]
 
-    # Genotype pi2 formulas have finite-sample corrections that prevent
-    # the H_A/H_B einsum factorization used in the haplotype path.
-    # All cases use the full formula functions with semantic dedup caches.
+    # Stack per-pop kernel quantities for batched evaluation
+    pA_s = cp.stack([p.pA for p in pops])  # (P, N)
+    qA_s = cp.stack([p.qA for p in pops])
+    pB_s = cp.stack([p.pB for p in pops])
+    qB_s = cp.stack([p.qB for p in pops])
+    n_s = cp.stack([p.n for p in pops])
+    B_L_s = cp.stack([p.B_L for p in pops])
+    B_R_s = cp.stack([p.B_R for p in pops])
 
     groups = {
         'same': [], 'triple': [], 'iikk': [], 'iikl': [],
@@ -3091,74 +3119,59 @@ def _compute_all_pi2_geno(pops, pi2_calls):
 
     group_results = {}
 
-    # All-different
+    # --- Kernel-based cases (no formula function calls) ---
+
+    # All-different: A_ij^L * A_kl^R
     if groups['alldiff']:
-        alldiff_cache = {}
-        results = []
-        for i, j, k, l in groups['alldiff']:
-            cache_key = (i, j, k, l)
-            if cache_key not in alldiff_cache:
-                alldiff_cache[cache_key] = ldg.pi2_geno_alldiff(
-                    pops[i], pops[j], pops[k], pops[l])
-            results.append(alldiff_cache[cache_key])
-        group_results['alldiff'] = results
+        # A^L via einsum: H_A[i,j] / (2*n_i*n_j)
+        pq_A = cp.einsum('in,jn->ijn', pA_s, qA_s)
+        H_A = pq_A + pq_A.transpose(1, 0, 2)
+        del pq_A
+        pq_B = cp.einsum('in,jn->ijn', pB_s, qB_s)
+        H_B = pq_B + pq_B.transpose(1, 0, 2)
+        del pq_B
+        nn_A = cp.einsum('in,jn->ijn', n_s, n_s)
+        nn_B = nn_A  # same n values, different locus
 
-    # pi2(i,i,k,k)
+        ii = [t[0] for t in groups['alldiff']]
+        jj = [t[1] for t in groups['alldiff']]
+        kk = [t[2] for t in groups['alldiff']]
+        ll = [t[3] for t in groups['alldiff']]
+        A_L = H_A[ii, jj] / (2 * nn_A[ii, jj])
+        A_R = H_B[kk, ll] / (2 * nn_B[kk, ll])
+        batch = A_L * A_R
+        group_results['alldiff'] = [batch[r] for r in range(len(groups['alldiff']))]
+        del H_A, H_B, nn_A
+
+    # pi2(i,i;k,k): B_i^L * B_k^R
     if groups['iikk']:
-        iikk_cache = {}
-        results = []
-        for i, j, k, l in groups['iikk']:
-            cache_key = (i, k)
-            if cache_key not in iikk_cache:
-                iikk_cache[cache_key] = ldg.pi2_geno_iikk(pops[i], pops[k])
-            results.append(iikk_cache[cache_key])
-        group_results['iikk'] = results
+        ii = [t[0] for t in groups['iikk']]
+        kk = [t[2] for t in groups['iikk']]
+        batch = B_L_s[ii] * B_R_s[kk]
+        group_results['iikk'] = [batch[r] for r in range(len(groups['iikk']))]
 
-    # pi2(i,i,k,l)
+    # pi2(i,i;k,l): B_i^L * A_kl^R
     if groups['iikl']:
-        iikl_cache = {}
-        results = []
-        for i, j, k, l in groups['iikl']:
-            cache_key = (i, k, l)
-            if cache_key not in iikl_cache:
-                iikl_cache[cache_key] = ldg.pi2_geno_iikl(pops[i], pops[k], pops[l])
-            results.append(iikl_cache[cache_key])
-        group_results['iikl'] = results
+        ii = [t[0] for t in groups['iikl']]
+        kk = [t[2] for t in groups['iikl']]
+        ll = [t[3] for t in groups['iikl']]
+        A_R = (pB_s[kk]*qB_s[ll] + qB_s[kk]*pB_s[ll]) / (2*n_s[kk]*n_s[ll])
+        batch = B_L_s[ii] * A_R
+        group_results['iikl'] = [batch[r] for r in range(len(groups['iikl']))]
 
-    # pi2(i,j,k,k)
+    # pi2(i,j;k,k): A_ij^L * B_k^R
     if groups['ijkk']:
-        ijkk_cache = {}
-        results = []
-        for i, j, k, l in groups['ijkk']:
-            cache_key = (i, j, k)
-            if cache_key not in ijkk_cache:
-                ijkk_cache[cache_key] = ldg.pi2_geno_ijkk(pops[k], pops[i], pops[j])
-            results.append(ijkk_cache[cache_key])
-        group_results['ijkk'] = results
+        ii = [t[0] for t in groups['ijkk']]
+        jj = [t[1] for t in groups['ijkk']]
+        kk = [t[2] for t in groups['ijkk']]
+        A_L = (pA_s[ii]*qA_s[jj] + qA_s[ii]*pA_s[jj]) / (2*n_s[ii]*n_s[jj])
+        batch = A_L * B_R_s[kk]
+        group_results['ijkk'] = [batch[r] for r in range(len(groups['ijkk']))]
 
-    if groups['triple']:
-        trip_cache = {}
-        results = []
-        for i, j, k, l in groups['triple']:
-            cnt = {}
-            for p in (i, j, k, l):
-                cnt[p] = cnt.get(p, 0) + 1
-            tp = [p for p, c in cnt.items() if c == 3][0]
-            sp = [p for p, c in cnt.items() if c == 1][0]
-            # Check if triple pop occupies both positions in the first pair
-            first_pair_triple = (i == tp and j == tp)
-            cache_key = (tp, sp, first_pair_triple)
-            if cache_key not in trip_cache:
-                if first_pair_triple:
-                    trip_cache[cache_key] = ldg.pi2_geno_triple_123(pops[tp], pops[sp])
-                else:
-                    trip_cache[cache_key] = ldg.pi2_geno_triple_134(pops[tp], pops[sp])
-            results.append(trip_cache[cache_key])
-        group_results['triple'] = results
-
+    # Overlap: u_j^T C_i v_k
     if groups['shared']:
-        shared_cache = {}
         results = []
+        shared_cache = {}
         for i, j, k, l in groups['shared']:
             if i == k:
                 si, ai, bi = i, j, l
@@ -3173,9 +3186,38 @@ def _compute_all_pi2_geno(pops, pi2_calls):
                 continue
             cache_key = (si, ai, bi)
             if cache_key not in shared_cache:
-                shared_cache[cache_key] = ldg.pi2_geno_shared(pops[si], pops[ai], pops[bi])
+                s = pops[si]
+                # u = [qA_a/n_a, pA_a/n_a], v = [qB_b/n_b, pB_b/n_b]
+                u0 = pops[ai].qA / pops[ai].n
+                u1 = pops[ai].pA / pops[ai].n
+                v0 = pops[bi].qB / pops[bi].n
+                v1 = pops[bi].pB / pops[bi].n
+                shared_cache[cache_key] = (
+                    u0 * (s.C00*v0 + s.C01*v1)
+                    + u1 * (s.C10*v0 + s.C11*v1))
             results.append(shared_cache[cache_key])
         group_results['shared'] = results
+
+    # --- Formula-based cases (complex within-individual corrections) ---
+
+    if groups['triple']:
+        trip_cache = {}
+        results = []
+        for i, j, k, l in groups['triple']:
+            cnt = {}
+            for p in (i, j, k, l):
+                cnt[p] = cnt.get(p, 0) + 1
+            tp = [p for p, c in cnt.items() if c == 3][0]
+            sp = [p for p, c in cnt.items() if c == 1][0]
+            first_pair_triple = (i == tp and j == tp)
+            cache_key = (tp, sp, first_pair_triple)
+            if cache_key not in trip_cache:
+                if first_pair_triple:
+                    trip_cache[cache_key] = ldg.pi2_geno_triple_123(pops[tp], pops[sp])
+                else:
+                    trip_cache[cache_key] = ldg.pi2_geno_triple_134(pops[tp], pops[sp])
+            results.append(trip_cache[cache_key])
+        group_results['triple'] = results
 
     if groups['ijij']:
         ijij_cache = {}
