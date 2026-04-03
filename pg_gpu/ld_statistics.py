@@ -531,6 +531,41 @@ def compute_ld_statistics(counts: cp.ndarray,
 
 # Internal implementation functions
 
+
+def _get_pop_data(counts, n_valid, pop_idx):
+    """Extract counts and valid sample size for one population.
+
+    Parameters
+    ----------
+    counts : cp.ndarray, shape (N, 4*P)
+        Concatenated haplotype counts for P populations.
+    n_valid : tuple of cp.ndarray, cp.ndarray with ndim==2, or None
+        Per-population valid sample counts.
+    pop_idx : int
+        Population index (0-based).
+
+    Returns
+    -------
+    c1, c2, c3, c4, n : cp.ndarray
+        Haplotype counts and total valid samples for this population.
+    """
+    start = pop_idx * 4
+    pop_counts = counts[:, start:start+4]
+    if n_valid is not None:
+        if isinstance(n_valid, tuple):
+            if pop_idx < len(n_valid) and n_valid[pop_idx] is not None:
+                pop_n = n_valid[pop_idx]
+            else:
+                pop_n = cp.sum(pop_counts, axis=1)
+        elif hasattr(n_valid, 'ndim') and n_valid.ndim == 2:
+            pop_n = n_valid[:, pop_idx]
+        else:
+            pop_n = n_valid
+    else:
+        pop_n = cp.sum(pop_counts, axis=1)
+    return pop_counts[:, 0], pop_counts[:, 1], pop_counts[:, 2], pop_counts[:, 3], pop_n
+
+
 def _dd_single(counts: cp.ndarray, n_valid: Optional[cp.ndarray] = None) -> cp.ndarray:
     """Compute D² for single population."""
     c1, c2, c3, c4 = counts[:, 0], counts[:, 1], counts[:, 2], counts[:, 3]
@@ -613,23 +648,8 @@ def _dz_multi(counts: cp.ndarray,
     """Compute Dz for multiple populations."""
     pop1, pop2, pop3 = populations
 
-    # Helper to extract counts and valid sizes
     def get_pop_data(pop_idx):
-        start = pop_idx * 4
-        pop_counts = counts[:, start:start+4]
-        if n_valid is not None:
-            if isinstance(n_valid, tuple):
-                if pop_idx < len(n_valid) and n_valid[pop_idx] is not None:
-                    pop_n = n_valid[pop_idx]
-                else:
-                    pop_n = cp.sum(pop_counts, axis=1)
-            elif hasattr(n_valid, 'ndim') and n_valid.ndim == 2:
-                pop_n = n_valid[:, pop_idx]
-            else:
-                pop_n = n_valid
-        else:
-            pop_n = cp.sum(pop_counts, axis=1)
-        return pop_counts[:, 0], pop_counts[:, 1], pop_counts[:, 2], pop_counts[:, 3], pop_n
+        return _get_pop_data(counts, n_valid, pop_idx)
 
     if pop1 == pop2 == pop3:
         # Single population
@@ -686,9 +706,21 @@ def _dz_multi(counts: cp.ndarray,
         result[valid_mask] = numer[valid_mask] / denom[valid_mask]
 
     else:
-        # All different populations - return zeros
-        n1 = n_valid[:, 0] if n_valid is not None and n_valid.ndim == 2 else cp.sum(counts[:, :4], axis=1)
+        # Dz(i,j,k) all different populations
+        c11, c12, c13, c14, n1 = get_pop_data(pop1)
+        c21, c22, c23, c24, n2 = get_pop_data(pop2)
+        c31, c32, c33, c34, n3 = get_pop_data(pop3)
+
+        numer = -(
+            (c12 * c13 - c11 * c14)
+            * (c21 + c22 - c23 - c24)
+            * (c31 - c32 + c33 - c34)
+        )
+        denom = n1 * (n1 - 1) * n2 * n3
+
+        valid_mask = (n1 >= 2) & (n2 >= 1) & (n3 >= 1)
         result = cp.zeros_like(n1, dtype=cp.float64)
+        result[valid_mask] = numer[valid_mask] / denom[valid_mask]
 
     return result
 
@@ -723,31 +755,30 @@ def _pi2_multi(counts: cp.ndarray,
     """Compute π₂ for multiple populations."""
     i, j, k, l = populations
 
-    # Helper to extract counts and valid sizes
     def get_pop_data(pop_idx):
-        start = pop_idx * 4
-        pop_counts = counts[:, start:start+4]
-        if n_valid is not None:
-            if isinstance(n_valid, tuple):
-                if pop_idx < len(n_valid) and n_valid[pop_idx] is not None:
-                    pop_n = n_valid[pop_idx]
-                else:
-                    pop_n = cp.sum(pop_counts, axis=1)
-            elif hasattr(n_valid, 'ndim') and n_valid.ndim == 2:
-                pop_n = n_valid[:, pop_idx]
-            else:
-                pop_n = n_valid
-        else:
-            pop_n = cp.sum(pop_counts, axis=1)
-        return pop_counts[:, 0], pop_counts[:, 1], pop_counts[:, 2], pop_counts[:, 3], pop_n
+        return _get_pop_data(counts, n_valid, pop_idx)
 
-    if i == j == k == l:
-        # Single population
+    # Count how many times each population index appears
+    pop_list = [i, j, k, l]
+    pop_counts = {}
+    for p in pop_list:
+        pop_counts[p] = pop_counts.get(p, 0) + 1
+    n_unique = len(pop_counts)
+    max_count = max(pop_counts.values())
+
+    if n_unique == 1:
+        # All same population
         return _pi2_single(counts[:, i*4:(i+1)*4],
                           n_valid[:, i] if n_valid is not None and n_valid.ndim == 2 else n_valid)
 
-    elif i == j and k == l and i != k:
-        # pi2(i,i,j,j) - average of two permutations
+    elif max_count == 3:
+        # Three same, one different -- normalize to (single, triple, triple, triple)
+        triple_pop = [p for p, c in pop_counts.items() if c == 3][0]
+        single_pop = [p for p, c in pop_counts.items() if c == 1][0]
+        result = _pi2_iiij(counts, (single_pop, triple_pop, triple_pop, triple_pop), n_valid)
+
+    elif i == j and k == l:
+        # pi2(i,i,k,k) -- two pairs
         c11, c12, c13, c14, n1 = get_pop_data(i)
         c21, c22, c23, c24, n2 = get_pop_data(k)
 
@@ -760,19 +791,9 @@ def _pi2_multi(counts: cp.ndarray,
         result = cp.zeros_like(n1, dtype=cp.float64)
         result[valid_mask] = 0.5 * (numer1[valid_mask] + numer2[valid_mask]) / denom[valid_mask]
 
-    elif j == k == l and i != j:
-        # pi2(i,j,j,j) type
-        result = _pi2_iiij(counts, populations, n_valid)
-
     elif i == j and k != l:
-        # pi2(i,i,k,l) type - need to check specific cases
-        if i == k or i == l:
-            # Cases like (0,0,0,1) or (0,0,1,0)
-            result = _pi2_iikl(counts, populations, n_valid)
-        else:
-            # Other cases - for now return zeros
-            n1 = get_pop_data(0)[4]
-            result = cp.zeros_like(n1, dtype=cp.float64)
+        # pi2(i,i,k,l) type -- handles both 2 and 3 distinct populations
+        result = _pi2_iikl(counts, populations, n_valid)
 
     elif i != j and k == l:
         # pi2(i,j,k,k) type
@@ -834,10 +855,12 @@ def _pi2_multi(counts: cp.ndarray,
         result[valid_mask] = numer[valid_mask] / denom[valid_mask]
 
     else:
-        # Other cases - for now return zeros
-        # This would need full implementation of all permutation patterns
-        n1 = get_pop_data(0)[4]
-        result = cp.zeros_like(n1, dtype=cp.float64)
+        if n_unique == 4:
+            result = _pi2_all_different(counts, populations, n_valid)
+        elif n_unique == 3:
+            result = _pi2_shared_pop(counts, populations, n_valid)
+        else:
+            result = cp.zeros_like(get_pop_data(0)[4], dtype=cp.float64)
 
     return result
 
@@ -848,23 +871,8 @@ def _pi2_iiij(counts: cp.ndarray,
     """Helper for pi2(i,j,j,j) configurations."""
     i, j, k, l = populations
 
-    # Helper to extract counts and valid sizes
     def get_pop_data(pop_idx):
-        start = pop_idx * 4
-        pop_counts = counts[:, start:start+4]
-        if n_valid is not None:
-            if isinstance(n_valid, tuple):
-                if pop_idx < len(n_valid) and n_valid[pop_idx] is not None:
-                    pop_n = n_valid[pop_idx]
-                else:
-                    pop_n = cp.sum(pop_counts, axis=1)
-            elif hasattr(n_valid, 'ndim') and n_valid.ndim == 2:
-                pop_n = n_valid[:, pop_idx]
-            else:
-                pop_n = n_valid
-        else:
-            pop_n = cp.sum(pop_counts, axis=1)
-        return pop_counts[:, 0], pop_counts[:, 1], pop_counts[:, 2], pop_counts[:, 3], pop_n
+        return _get_pop_data(counts, n_valid, pop_idx)
 
     # For pi2(i,j,j,j) where j==k==l and i!=j
     c11, c12, c13, c14, n1 = get_pop_data(j)  # The population that appears 3 times
@@ -896,54 +904,32 @@ def _pi2_iikl(counts: cp.ndarray,
     """Helper for pi2(i,i,k,l) configurations."""
     i, j, k, l = populations
 
-    # Helper to extract counts and valid sizes
     def get_pop_data(pop_idx):
-        start = pop_idx * 4
-        pop_counts = counts[:, start:start+4]
-        if n_valid is not None:
-            if isinstance(n_valid, tuple):
-                if pop_idx < len(n_valid) and n_valid[pop_idx] is not None:
-                    pop_n = n_valid[pop_idx]
-                else:
-                    pop_n = cp.sum(pop_counts, axis=1)
-            elif hasattr(n_valid, 'ndim') and n_valid.ndim == 2:
-                pop_n = n_valid[:, pop_idx]
-            else:
-                pop_n = n_valid
-        else:
-            pop_n = cp.sum(pop_counts, axis=1)
-        return pop_counts[:, 0], pop_counts[:, 1], pop_counts[:, 2], pop_counts[:, 3], pop_n
+        return _get_pop_data(counts, n_valid, pop_idx)
 
     # Get all unique populations involved
     unique_pops = list(set([i, k, l]))
 
-    if len(unique_pops) == 2:  # Cases like (0,0,0,1)
-        # Population i appears 3 times, other population appears once
-        pop_major = i
+    if len(unique_pops) == 2:  # Cases like (0,0,0,1) -- delegate to _pi2_iiij
         pop_minor = k if k != i else l
+        result = _pi2_iiij(counts, (pop_minor, i, i, i), n_valid)
+    else:
+        # 3 distinct populations: pi2(i,i,j,k) where i,j,k all different
+        # cs1 = counts[i], cs2 = counts[k], cs3 = counts[l]
+        c11, c12, c13, c14, n1 = get_pop_data(i)
+        c21, c22, c23, c24, n2 = get_pop_data(k)
+        c31, c32, c33, c34, n3 = get_pop_data(l)
 
-        c_major1, c_major2, c_major3, c_major4, n_major = get_pop_data(pop_major)
-        c_minor1, c_minor2, c_minor3, c_minor4, n_minor = get_pop_data(pop_minor)
-
-        # From moments pi2 formula for (i,i,i,j) case
         numer = (
-            -((c_major1 + c_major2) * c_major4 * (c_minor1 + c_minor3))
-            - (c_major2 * (c_major3 + c_major4) * (c_minor1 + c_minor3))
-            + ((c_major1 + c_major2) * (c_major2 + c_major4) * (c_major3 + c_major4) * (c_minor1 + c_minor3))
-            + ((c_major1 + c_major2) * (c_major3 + c_major4) * (-2 * c_minor2 - 2 * c_minor4))
-            + ((c_major1 + c_major2) * c_major4 * (c_minor2 + c_minor4))
-            + (c_major2 * (c_major3 + c_major4) * (c_minor2 + c_minor4))
-            + ((c_major1 + c_major2) * (c_major1 + c_major3) * (c_major3 + c_major4) * (c_minor2 + c_minor4))
+            (c11 + c12)
+            * (c13 + c14)
+            * (c22 * (c31 + c33) + c24 * (c31 + c33) + (c21 + c23) * (c32 + c34))
         ) / 2.0
 
-        denom = n_minor * n_major * (n_major - 1) * (n_major - 2)
-        valid_mask = (n_major >= 3) & (n_minor >= 1)
-        result = cp.zeros_like(n_major, dtype=cp.float64)
-        result[valid_mask] = numer[valid_mask] / denom[valid_mask]
-    else:
-        # Other cases - return zeros for now
-        n1 = get_pop_data(0)[4]
+        denom = n1 * (n1 - 1) * n2 * n3
+        valid_mask = (n1 >= 2) & (n2 >= 1) & (n3 >= 1)
         result = cp.zeros_like(n1, dtype=cp.float64)
+        result[valid_mask] = numer[valid_mask] / denom[valid_mask]
 
     return result
 
@@ -954,23 +940,8 @@ def _pi2_ijkk(counts: cp.ndarray,
     """Helper for pi2(i,j,k,k) configurations."""
     i, j, k, l = populations
 
-    # Helper to extract counts and valid sizes
     def get_pop_data(pop_idx):
-        start = pop_idx * 4
-        pop_counts = counts[:, start:start+4]
-        if n_valid is not None:
-            if isinstance(n_valid, tuple):
-                if pop_idx < len(n_valid) and n_valid[pop_idx] is not None:
-                    pop_n = n_valid[pop_idx]
-                else:
-                    pop_n = cp.sum(pop_counts, axis=1)
-            elif hasattr(n_valid, 'ndim') and n_valid.ndim == 2:
-                pop_n = n_valid[:, pop_idx]
-            else:
-                pop_n = n_valid
-        else:
-            pop_n = cp.sum(pop_counts, axis=1)
-        return pop_counts[:, 0], pop_counts[:, 1], pop_counts[:, 2], pop_counts[:, 3], pop_n
+        return _get_pop_data(counts, n_valid, pop_idx)
 
     # From moments: pi2(i,j,k,k) where pop3 == pop4
     c11, c12, c13, c14, n1 = get_pop_data(k)  # pop3/pop4 (k)
@@ -995,6 +966,107 @@ def _pi2_ijkk(counts: cp.ndarray,
     result = cp.zeros_like(n1, dtype=cp.float64)
     result[valid_mask] = numer[valid_mask] / denom[valid_mask]
 
+    return result
+
+
+def _pi2_shared_pop(counts: cp.ndarray,
+                    populations: Tuple[int, int, int, int],
+                    n_valid: Optional[cp.ndarray] = None) -> cp.ndarray:
+    """Helper for pi2 with one population shared between pairs.
+
+    Handles pi2(i,j,i,k), pi2(i,j,k,i), pi2(i,j,j,k), pi2(i,j,k,j)
+    where exactly one population appears in both the first and second pair.
+    """
+    i, j, k, l = populations
+
+    def get_pop_data(pop_idx):
+        return _get_pop_data(counts, n_valid, pop_idx)
+
+    # Map to canonical form: cs1 = shared pop, cs2 = other from first pair,
+    # cs3 = other from second pair
+    if i == k:      # pi2(i,j;i,l)
+        shared, other1, other2 = i, j, l
+    elif i == l:    # pi2(i,j;k,i)
+        shared, other1, other2 = i, j, k
+    elif j == k:    # pi2(i,j;j,l)
+        shared, other1, other2 = j, i, l
+    elif j == l:    # pi2(i,j;k,j)
+        shared, other1, other2 = j, i, k
+    else:
+        n1 = get_pop_data(0)[4]
+        return cp.zeros_like(n1, dtype=cp.float64)
+
+    c11, c12, c13, c14, n1 = get_pop_data(shared)
+    c21, c22, c23, c24, n2 = get_pop_data(other1)
+    c31, c32, c33, c34, n3 = get_pop_data(other2)
+
+    numer = (
+        c14 ** 2 * (c21 + c22) * (c31 + c33)
+        + c12 ** 2 * (c23 + c24) * (c31 + c33)
+        + (-1 + c11 + c13) * (c13 * (c21 + c22) + c11 * (c23 + c24)) * (c32 + c34)
+        + c14
+        * (
+            c11 * (c23 + c24) * (c31 + c33)
+            + c21
+            * (
+                (-1 + c13) * c31
+                + c13 * c32
+                - c33
+                + c13 * c33
+                + c13 * c34
+                + c11 * (c32 + c34)
+            )
+            + c22
+            * (
+                (-1 + c13) * c31
+                + c13 * c32
+                - c33
+                + c13 * c33
+                + c13 * c34
+                + c11 * (c32 + c34)
+            )
+        )
+        + c12
+        * (
+            c14 * (c21 + c22 + c23 + c24) * (c31 + c33)
+            + c13
+            * (c21 * (c31 + c33) + c22 * (c31 + c33) + (c23 + c24) * (c32 + c34))
+            + (c23 + c24) * ((-1 + c11) * c31 - c33 + c11 * (c32 + c33 + c34))
+        )
+    ) / 4.0
+
+    denom = n1 * (n1 - 1) * n2 * n3
+    valid_mask = (n1 >= 2) & (n2 >= 1) & (n3 >= 1)
+    result = cp.zeros_like(n1, dtype=cp.float64)
+    result[valid_mask] = numer[valid_mask] / denom[valid_mask]
+    return result
+
+
+def _pi2_all_different(counts: cp.ndarray,
+                       populations: Tuple[int, int, int, int],
+                       n_valid: Optional[cp.ndarray] = None) -> cp.ndarray:
+    """Helper for pi2(i,j,k,l) where all 4 populations are different."""
+    i, j, k, l = populations
+
+    def get_pop_data(pop_idx):
+        return _get_pop_data(counts, n_valid, pop_idx)
+
+    c11, c12, c13, c14, n1 = get_pop_data(i)
+    c21, c22, c23, c24, n2 = get_pop_data(j)
+    c31, c32, c33, c34, n3 = get_pop_data(k)
+    c41, c42, c43, c44, n4 = get_pop_data(l)
+
+    numer = (
+        ((c13 + c14) * (c21 + c22) * (c32 + c34) * (c41 + c43)) / 4.0
+        + ((c11 + c12) * (c23 + c24) * (c32 + c34) * (c41 + c43)) / 4.0
+        + ((c13 + c14) * (c21 + c22) * (c31 + c33) * (c42 + c44)) / 4.0
+        + ((c11 + c12) * (c23 + c24) * (c31 + c33) * (c42 + c44)) / 4.0
+    )
+
+    denom = n1 * n2 * n3 * n4
+    valid_mask = (n1 >= 1) & (n2 >= 1) & (n3 >= 1) & (n4 >= 1)
+    result = cp.zeros_like(n1, dtype=cp.float64)
+    result[valid_mask] = numer[valid_mask] / denom[valid_mask]
     return result
 
 
