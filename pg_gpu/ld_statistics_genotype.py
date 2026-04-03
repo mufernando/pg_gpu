@@ -5,6 +5,21 @@ Formulas transcribed from moments.LD.stats_from_genotype_counts,
 vectorized for CuPy GPU computation. The polynomial numerators
 are Mathematica-derived unbiased estimators operating on 9-way
 genotype configuration counts.
+
+Module status
+-------------
+DD functions (dd_geno_single, dd_geno_between) are LIVE -- called
+by genotype_kernels.compute_all_dd_geno() for the small number of
+DD evaluations per chunk.
+
+Dz and pi2 functions are RETAINED AS REFERENCE but no longer called
+in the production path. They have been superseded by fused CUDA
+RawKernels in genotype_kernels.py that compute each statistic in
+a single kernel launch with all arithmetic in GPU registers. The
+CuPy-based formulas here serve as:
+  - A readable reference for the exact polynomial expressions
+  - A potential CPU-fallback path (CuPy ops work without CUDA)
+  - A validation target for the fused kernels
 """
 import cupy as cp
 
@@ -14,9 +29,9 @@ def _safe_div(numer, denom, valid):
     return cp.where(valid, numer / cp.maximum(denom, 1), 0.0)
 
 
-# ---------------------------------------------------------------------------
-# DD  (D^2 and D1*D2)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# DD  (D^2 and D1*D2)  --  LIVE: called by genotype_kernels
+# ===========================================================================
 
 
 def dd_geno_single(p):
@@ -161,9 +176,10 @@ def dd_geno_between(pi, pj):
     return 4.0 * _safe_div(numer, denom, valid)
 
 
-# ---------------------------------------------------------------------------
-# Dz
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Dz  --  REFERENCE ONLY: superseded by fused CUDA kernels in
+#         genotype_kernels._DZ_*_KERN
+# ===========================================================================
 
 
 def dz_geno_single(p):
@@ -471,9 +487,10 @@ def dz_geno_alldiff(pi, pj, pk):
     return 2.0 * _safe_div(numer, denom, valid)
 
 
-# ---------------------------------------------------------------------------
-# pi2
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# pi2  --  REFERENCE ONLY: superseded by fused CUDA kernels in
+#          genotype_kernels._PI2_*_KERN
+# ===========================================================================
 
 
 def pi2_geno_single(p):
