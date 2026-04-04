@@ -482,6 +482,9 @@ def ihs(haplotype_matrix: HaplotypeMatrix,
     hap = matrix.haplotypes.T  # (n_variants, n_haplotypes)
     n_haplotypes = hap.shape[1]
 
+    # Fall back to matrix's accessible mask if not provided explicitly
+    if is_accessible is None and haplotype_matrix.has_accessible_mask:
+        is_accessible = haplotype_matrix.accessible_mask.mask
     gaps = _compute_gaps(pos, map_pos, gap_scale, max_gap, is_accessible)
     gaps_gpu = cp.asarray(gaps)
 
@@ -578,6 +581,9 @@ def xpehh(haplotype_matrix: HaplotypeMatrix,
     h1 = m1.haplotypes.T
     h2 = m2.haplotypes.T
 
+    # Fall back to matrix's accessible mask if not provided explicitly
+    if is_accessible is None and haplotype_matrix.has_accessible_mask:
+        is_accessible = haplotype_matrix.accessible_mask.mask
     gaps = _compute_gaps(pos, map_pos, gap_scale, max_gap, is_accessible)
     gaps_gpu = cp.asarray(gaps)
 
