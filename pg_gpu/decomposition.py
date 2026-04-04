@@ -308,7 +308,12 @@ def pairwise_distance(haplotype_matrix: HaplotypeMatrix,
         idx_i, idx_j = cp.triu_indices(n, k=1)
         n_pairs = len(idx_i)
 
-        batch_size = max(1, min(n_pairs, 50000))
+        # Estimate batch size from available GPU memory
+        n_variants = X.shape[1]
+        free_mem = cp.cuda.Device().mem_info[0]
+        # Each pair needs ~3 float64 arrays of n_variants (diff, joint, result)
+        bytes_per_pair = n_variants * 8 * 3
+        batch_size = max(1, min(n_pairs, int(free_mem * 0.3 / bytes_per_pair)))
         dist_parts = []
 
         for start in range(0, n_pairs, batch_size):
