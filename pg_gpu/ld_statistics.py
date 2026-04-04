@@ -473,7 +473,6 @@ def zns(r2_matrix_or_matrix, missing_data='include'):
 
     # Streaming path for HaplotypeMatrix: O(B²) memory instead of O(m²)
     if isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
-        r2_matrix_or_matrix = r2_matrix_or_matrix.filter_to_accessible()
         return _zns_tiled(r2_matrix_or_matrix, missing_data)
 
     if missing_data == 'project':
@@ -548,9 +547,6 @@ def omega(r2_matrix_or_matrix, missing_data='include'):
         Maximum omega value. Returns 0 if fewer than 5 SNPs.
     """
     from .haplotype_matrix import HaplotypeMatrix
-
-    if isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
-        r2_matrix_or_matrix = r2_matrix_or_matrix.filter_to_accessible()
 
     if missing_data == 'project':
         if not isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
@@ -633,7 +629,6 @@ def mu_ld(haplotype_matrix, missing_data='include'):
     -------
     float
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if haplotype_matrix.device == 'CPU':
         haplotype_matrix.transfer_to_gpu()
 

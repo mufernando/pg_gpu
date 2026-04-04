@@ -369,11 +369,8 @@ class WindowIterator:
 
     def __init__(self, haplotype_matrix: HaplotypeMatrix,
                  window_params: WindowParams):
-        # Save mask before filtering (needed for per-window n_total_sites)
         self._parent_mask = haplotype_matrix.accessible_mask
-        # Filter variants at inaccessible positions before iterating
-        self.matrix = _filter_inaccessible_variants(
-            haplotype_matrix, haplotype_matrix)
+        self.matrix = haplotype_matrix
         self.params = window_params
         self.positions = self.matrix.positions
 
@@ -1248,8 +1245,9 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    matrix = _filter_inaccessible_variants(matrix, haplotype_matrix,
-                                           is_accessible)
+    if is_accessible is not None:
+        matrix = _filter_inaccessible_variants(matrix, haplotype_matrix,
+                                               is_accessible)
 
     hap_raw = matrix.haplotypes
     n_hap = hap_raw.shape[0]
@@ -1832,8 +1830,9 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    matrix = _filter_inaccessible_variants(matrix, haplotype_matrix,
-                                           is_accessible)
+    if is_accessible is not None:
+        matrix = _filter_inaccessible_variants(matrix, haplotype_matrix,
+                                               is_accessible)
 
     hap = matrix.haplotypes  # (n_haplotypes, n_variants)
     n_hap_int = hap.shape[0]

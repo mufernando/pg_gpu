@@ -425,36 +425,49 @@ class TestFilterToAccessible:
         hm.set_accessible_mask(mask)
         assert hm.filter_to_accessible() is hm
 
-    def test_filters_inaccessible_variants(self):
+    def test_set_accessible_mask_filters_immediately(self):
+        """set_accessible_mask filters variants at inaccessible positions."""
         rng = np.random.RandomState(42)
         n_var = 50
         hap = rng.randint(0, 2, size=(10, n_var)).astype(np.int8)
         pos = np.arange(100, 100 + n_var * 10, 10)  # 100, 110, ..., 590
         hm = HaplotypeMatrix(hap, pos, chrom_start=0, chrom_end=600)
+        original_nvar = hm.num_variants
         # Mark positions 200-400 as inaccessible
         mask = np.ones(600, dtype=bool)
         mask[200:400] = False
         hm.set_accessible_mask(mask)
 
-        filtered = hm.filter_to_accessible()
-        assert filtered.num_variants < hm.num_variants
-        # All remaining positions should be accessible
-        for p in filtered.positions:
+        # Variants should be filtered immediately
+        assert hm.num_variants < original_nvar
+        for p in hm.positions:
             assert int(p) < 200 or int(p) >= 400
-        # Mask is cleared on filtered result so downstream calls short-circuit
-        assert not filtered.has_accessible_mask
+        # Mask retained for span normalization
+        assert hm.has_accessible_mask
 
-    def test_genotype_matrix_filter(self):
+    def test_filter_to_accessible_noop_after_set(self):
+        """filter_to_accessible is a no-op after set_accessible_mask."""
+        rng = np.random.RandomState(42)
+        hap = rng.randint(0, 2, size=(10, 50)).astype(np.int8)
+        pos = np.arange(100, 600, 10)
+        hm = HaplotypeMatrix(hap, pos, chrom_start=0, chrom_end=600)
+        mask = np.ones(600, dtype=bool)
+        mask[200:400] = False
+        hm.set_accessible_mask(mask)
+        # filter_to_accessible should return self (already filtered)
+        assert hm.filter_to_accessible() is hm
+
+    def test_genotype_matrix_set_mask_filters(self):
         rng = np.random.RandomState(42)
         geno = rng.randint(0, 3, size=(5, 30)).astype(np.int8)
         pos = np.arange(10, 310, 10)
+        gm = GenotypeMatrix(geno, pos, chrom_start=0, chrom_end=320)
+        original_nvar = gm.num_variants
         mask = np.ones(320, dtype=bool)
         mask[100:200] = False
-        gm = GenotypeMatrix(geno, pos, chrom_start=0, chrom_end=320,
-                            accessible_mask=mask)
-        filtered = gm.filter_to_accessible()
-        assert filtered.num_variants < gm.num_variants
-        for p in filtered.positions:
+        gm.set_accessible_mask(mask)
+        assert gm.num_variants < original_nvar
+        for p in gm.positions:
             assert int(p) < 100 or int(p) >= 200
 
 

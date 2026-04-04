@@ -41,7 +41,6 @@ def pairwise_diffs_haploid(haplotype_matrix, population=None,
     diffs : ndarray, float64, condensed form (n_pairs,)
         For 'include'/'pairwise', values are per-site average differences.
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -93,7 +92,6 @@ def pairwise_diffs_diploid(genotype_matrix, population=None,
     -------
     diffs : ndarray, float64, condensed form (n_pairs,)
     """
-    genotype_matrix = genotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -147,7 +145,6 @@ def dist_moments(matrix, population=None, missing_data='include'):
     skew : float
     kurt : float
     """
-    matrix = matrix.filter_to_accessible()
     diffs = np.asarray(_get_diffs(matrix, population, missing_data))
     n = diffs.shape[0]
 
@@ -208,7 +205,6 @@ def pairwise_diffs(matrix, population=None, missing_data='include'):
     -------
     diffs : ndarray, float64, condensed form (n_pairs,)
     """
-    matrix = matrix.filter_to_accessible()
     if isinstance(matrix, GenotypeMatrix):
         return pairwise_diffs_diploid(matrix, population, missing_data)
     else:

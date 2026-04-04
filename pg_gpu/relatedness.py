@@ -41,8 +41,6 @@ def grm(genotype_matrix_or_haplotype_matrix,
         Symmetric GRM. Diagonal entries are individual inbreeding
         coefficients + 1. Off-diagonal entries are pairwise relatedness.
     """
-    genotype_matrix_or_haplotype_matrix = \
-        genotype_matrix_or_haplotype_matrix.filter_to_accessible()
     from ._memutil import estimate_variant_chunk_size, chunked_dac_and_n
 
     hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,
@@ -129,8 +127,6 @@ def ibs(genotype_matrix_or_haplotype_matrix,
         Symmetric IBS matrix. Values in [0, 1] where 1 = identical.
         Diagonal is always 1.
     """
-    genotype_matrix_or_haplotype_matrix = \
-        genotype_matrix_or_haplotype_matrix.filter_to_accessible()
     from ._memutil import estimate_variant_chunk_size
 
     hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,

@@ -59,7 +59,8 @@ class HaplotypeMatrix:
         self.n_total_sites = n_total_sites
         self.samples = samples  # diploid sample names from VCF
 
-        # Accessible site mask
+        # Accessible site mask (internal use only -- use set_accessible_mask
+        # for user-facing mask attachment which also filters variants)
         if accessible_mask is not None and not isinstance(accessible_mask, AccessibleMask):
             accessible_mask = resolve_accessible_mask(
                 accessible_mask, chrom_start, chrom_end)
@@ -107,7 +108,11 @@ class HaplotypeMatrix:
         return self.accessible_mask is not None
 
     def set_accessible_mask(self, mask_or_path, chrom=None):
-        """Attach an accessible site mask from a BED file, array, or AccessibleMask.
+        """Attach an accessible site mask and filter out inaccessible variants.
+
+        Variants at positions not marked accessible are immediately removed.
+        The mask is retained for per-base normalization (get_span, windowed
+        analysis denominators).
 
         Parameters
         ----------
@@ -125,6 +130,15 @@ class HaplotypeMatrix:
         self._filtered_cache = None
         if self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
+        # Filter variants at inaccessible positions immediately
+        pos = self.positions.get() if self.device == 'GPU' \
+            else np.asarray(self.positions)
+        keep = self.accessible_mask.is_accessible_at(pos.astype(int))
+        if not keep.all():
+            xp = cp if self.device == 'GPU' else np
+            keep_idx = xp.asarray(np.where(keep)[0])
+            self.haplotypes = self.haplotypes[:, keep_idx]
+            self.positions = self.positions[keep_idx]
 
     def filter_to_accessible(self):
         """Return a matrix with variants at inaccessible positions removed.

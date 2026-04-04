@@ -130,7 +130,6 @@ def garud_h(matrix, population=None, missing_data='include'):
     """
     from .genotype_matrix import GenotypeMatrix
 
-    matrix = matrix.filter_to_accessible()
     if isinstance(matrix, GenotypeMatrix):
         return _garud_h_diploid(matrix, population)
 
@@ -185,7 +184,6 @@ def moving_garud_h(haplotype_matrix: HaplotypeMatrix,
     h123 : ndarray, float
     h2_h1 : ndarray, float
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -316,7 +314,6 @@ def nsl(haplotype_matrix: HaplotypeMatrix,
     score : ndarray, float, shape (n_variants,)
         Unstandardized nSL scores: log(nSL1 / nSL0).
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -373,7 +370,6 @@ def xpnsl(haplotype_matrix: HaplotypeMatrix,
     score : ndarray, float, shape (n_variants,)
         Unstandardized XP-nSL scores: log(nSL_pop1 / nSL_pop2).
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'exclude':
         if haplotype_matrix.device == 'CPU':
             haplotype_matrix.transfer_to_gpu()
@@ -460,7 +456,6 @@ def ihs(haplotype_matrix: HaplotypeMatrix,
     score : ndarray, float, shape (n_variants,)
         Unstandardized iHS scores: log(IHH1 / IHH0).
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -559,7 +554,6 @@ def xpehh(haplotype_matrix: HaplotypeMatrix,
     score : ndarray, float, shape (n_variants,)
         Unstandardized XP-EHH scores: log(IHH_pop1 / IHH_pop2).
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'exclude':
         if haplotype_matrix.device == 'CPU':
             haplotype_matrix.transfer_to_gpu()
@@ -637,7 +631,6 @@ def ehh_decay(haplotype_matrix: HaplotypeMatrix,
     ehh : ndarray, float, shape (n_variants,)
         EHH values at each variant position from the first.
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:

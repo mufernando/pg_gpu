@@ -98,7 +98,6 @@ def fst(haplotype_matrix: HaplotypeMatrix,
     float
         FST value between populations
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if method == 'hudson':
         return fst_hudson(haplotype_matrix, pop1, pop2, missing_data)
     elif method == 'weir_cockerham':
@@ -138,7 +137,6 @@ def fst_hudson(haplotype_matrix: HaplotypeMatrix,
     float
         Hudson's FST estimate
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population indices
     pop1_idx = _get_population_indices(haplotype_matrix, pop1)
     pop2_idx = _get_population_indices(haplotype_matrix, pop2)
@@ -250,7 +248,6 @@ def fst_weir_cockerham(haplotype_matrix: HaplotypeMatrix,
     float
         Weir & Cockerham's FST estimate
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # pairwise uses same ratio-of-sums as include for W-C
     if missing_data == 'pairwise':
         missing_data = 'include'
@@ -372,7 +369,6 @@ def fst_nei(haplotype_matrix: HaplotypeMatrix,
     float
         Nei's GST estimate
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population indices
     pop1_idx = _get_population_indices(haplotype_matrix, pop1)
     pop2_idx = _get_population_indices(haplotype_matrix, pop2)
@@ -473,7 +469,6 @@ def dxy(haplotype_matrix: HaplotypeMatrix,
     float, cp.ndarray, or PairwiseResult
         Mean Dxy, per-site Dxy values, or components
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population indices
     pop1_idx = _get_population_indices(haplotype_matrix, pop1)
     pop2_idx = _get_population_indices(haplotype_matrix, pop2)
@@ -585,7 +580,6 @@ def da(haplotype_matrix: HaplotypeMatrix,
     float
         Net divergence (Da)
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get Dxy
     dxy_value = dxy(haplotype_matrix, pop1, pop2, missing_data=missing_data,
                    span_denominator=span_denominator)
@@ -626,7 +620,6 @@ def pi_within_population(haplotype_matrix: HaplotypeMatrix,
     float
         Nucleotide diversity
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population indices
     pop_idx = _get_population_indices(haplotype_matrix, pop)
 
@@ -713,7 +706,6 @@ def divergence_stats(haplotype_matrix: HaplotypeMatrix,
     dict
         Dictionary of statistic names to values
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     results = {}
 
     for stat in statistics:
@@ -769,7 +761,6 @@ def pairwise_fst(haplotype_matrix: HaplotypeMatrix,
     pop_names : list
         Population names in matrix order
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if populations is None:
         if haplotype_matrix.sample_sets is None:
             raise ValueError("No populations defined in haplotype matrix")
@@ -919,7 +910,6 @@ def pbs(haplotype_matrix: HaplotypeMatrix,
     ndarray, float64, shape (n_windows,)
         PBS values per window.
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if haplotype_matrix.device == 'CPU':
         haplotype_matrix.transfer_to_gpu()
 

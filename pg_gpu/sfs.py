@@ -93,7 +93,6 @@ def sfs(haplotype_matrix: HaplotypeMatrix,
     ndarray, int64, shape (n_chromosomes + 1,)
         Element k = number of variants with k derived alleles.
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -136,7 +135,6 @@ def sfs_folded(haplotype_matrix: HaplotypeMatrix,
     ndarray, int64, shape (n_chromosomes // 2 + 1,)
         Element k = number of variants with minor allele count k.
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -181,7 +179,6 @@ def sfs_scaled(haplotype_matrix: HaplotypeMatrix,
     -------
     ndarray, float64, shape (n_chromosomes + 1,)
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     s = sfs(haplotype_matrix, population, missing_data=missing_data)
     return scale_sfs(s)
 
@@ -203,7 +200,6 @@ def sfs_folded_scaled(haplotype_matrix: HaplotypeMatrix,
     -------
     ndarray, float64, shape (n_chromosomes // 2 + 1,)
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -239,7 +235,6 @@ def joint_sfs(haplotype_matrix: HaplotypeMatrix,
         Element [i, j] = number of variants with i derived alleles in pop1
         and j derived alleles in pop2.
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     md = 'include' if missing_data == 'pairwise' else missing_data
 
     m1 = _get_population_matrix(haplotype_matrix, pop1)
@@ -281,7 +276,6 @@ def joint_sfs_folded(haplotype_matrix: HaplotypeMatrix,
     -------
     ndarray, int64, shape (n1 // 2 + 1, n2 // 2 + 1)
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     md = 'include' if missing_data == 'pairwise' else missing_data
 
     m1 = _get_population_matrix(haplotype_matrix, pop1)
@@ -328,7 +322,6 @@ def joint_sfs_scaled(haplotype_matrix: HaplotypeMatrix,
     -------
     ndarray, float64, shape (n1 + 1, n2 + 1)
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     s = joint_sfs(haplotype_matrix, pop1, pop2, missing_data=missing_data)
     return scale_joint_sfs(s)
 
@@ -351,7 +344,6 @@ def joint_sfs_folded_scaled(haplotype_matrix: HaplotypeMatrix,
     -------
     ndarray, float64, shape (n1 // 2 + 1, n2 // 2 + 1)
     """
-    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     md = 'include' if missing_data == 'pairwise' else missing_data
 
     m1 = _get_population_matrix(haplotype_matrix, pop1)

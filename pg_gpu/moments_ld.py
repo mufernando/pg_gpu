@@ -41,9 +41,35 @@ def compute_ld_statistics(
     vcf_file=None, rec_map_file=None, pop_file=None, pops=None,
     r_bins=None, bp_bins=None, use_genotypes=False,
     report=True, ac_filter=True, haplotype_matrix=None,
-    genotype_matrix=None,
+    genotype_matrix=None, accessible_bed=None,
 ):
-    """GPU-accelerated multi-population LD statistics, moments-compatible.
+    """GPU-accelerated drop-in replacement for moments.LD.Parsing.compute_ld_statistics.
+
+    Accepts the same arguments as the moments version so existing pipelines
+    can switch by changing only the import::
+
+        # moments (CPU):
+        import moments.LD
+        ld_stats = moments.LD.Parsing.compute_ld_statistics(
+            vcf_file="data.vcf.gz",
+            rec_map_file="rec_map.txt",
+            pop_file="pops.txt",
+            pops=["popA", "popB"],
+            r_bins=[0, 1e-6, 2e-6, 5e-6],
+        )
+
+        # pg_gpu (GPU, same call signature):
+        from pg_gpu.moments_ld import compute_ld_statistics
+        ld_stats = compute_ld_statistics(
+            vcf_file="data.vcf.gz",
+            rec_map_file="rec_map.txt",
+            pop_file="pops.txt",
+            pops=["popA", "popB"],
+            r_bins=[0, 1e-6, 2e-6, 5e-6],
+        )
+
+    The returned dict has the same structure (keys 'bins', 'sums', 'stats',
+    'pops') and can be passed directly to moments inference functions.
 
     Parameters
     ----------
@@ -70,6 +96,9 @@ def compute_ld_statistics(
         Pre-loaded HaplotypeMatrix (skips VCF loading and GPU transfer).
     genotype_matrix : GenotypeMatrix, optional
         Pre-loaded GenotypeMatrix (skips VCF loading and GPU transfer).
+    accessible_bed : str, optional
+        Path to a BED file defining accessible/callable regions. Variants
+        at inaccessible positions are removed before computing statistics.
 
     Returns
     -------
@@ -104,6 +133,8 @@ def compute_ld_statistics(
             gm.load_pop_file(pop_file, pops=pops)
             if ac_filter:
                 gm = gm.apply_biallelic_filter()
+            if accessible_bed is not None and not gm.has_accessible_mask:
+                gm.set_accessible_mask(accessible_bed)
             gm.transfer_to_gpu()
         mat = gm
         if report:
@@ -125,6 +156,8 @@ def compute_ld_statistics(
             hm.load_pop_file(pop_file, pops=pops)
             if ac_filter:
                 hm = hm.apply_biallelic_filter()
+            if accessible_bed is not None and not hm.has_accessible_mask:
+                hm.set_accessible_mask(accessible_bed)
             hm.transfer_to_gpu()
         mat = hm
         if report:

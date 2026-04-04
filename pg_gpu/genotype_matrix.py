@@ -95,7 +95,7 @@ class GenotypeMatrix:
         return self.accessible_mask is not None
 
     def set_accessible_mask(self, mask_or_path, chrom=None):
-        """Attach an accessible site mask from a BED file, array, or AccessibleMask.
+        """Attach an accessible site mask and filter out inaccessible variants.
 
         Parameters
         ----------
@@ -109,6 +109,15 @@ class GenotypeMatrix:
         self._filtered_cache = None
         if self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
+        # Filter variants at inaccessible positions immediately
+        pos = self.positions.get() if self.device == 'GPU' \
+            else np.asarray(self.positions)
+        keep = self.accessible_mask.is_accessible_at(pos.astype(int))
+        if not keep.all():
+            xp = cp if self.device == 'GPU' else np
+            keep_idx = xp.asarray(np.where(keep)[0])
+            self.genotypes = self.genotypes[:, keep_idx]
+            self.positions = self.positions[keep_idx]
 
     @property
     def has_invariant_info(self):
