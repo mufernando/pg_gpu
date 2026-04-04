@@ -56,6 +56,7 @@ class HaplotypeMatrix:
         self._accessible_idx = None
         self._hap_filtered = None
         self._pos_filtered = None
+        self._accessible_mask = None
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
@@ -66,8 +67,8 @@ class HaplotypeMatrix:
             accessible_mask = resolve_accessible_mask(
                 accessible_mask, chrom_start, chrom_end)
         self.accessible_mask = accessible_mask
-        if self.accessible_mask is not None and self.n_total_sites is None:
-            self.n_total_sites = self.accessible_mask.total_accessible
+        if self._accessible_mask is not None and self.n_total_sites is None:
+            self.n_total_sites = self._accessible_mask.total_accessible
 
     @property
     def haplotypes(self):
@@ -93,6 +94,27 @@ class HaplotypeMatrix:
     @positions.setter
     def positions(self, value):
         self._positions = value
+        self._pos_filtered = None
+
+    @property
+    def accessible_mask(self):
+        return self._accessible_mask
+
+    @accessible_mask.setter
+    def accessible_mask(self, mask):
+        self._accessible_mask = mask
+        if mask is not None:
+            pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
+                else np.asarray(self._positions)
+            keep = mask.is_accessible_at(pos.astype(int))
+            if keep.all():
+                self._accessible_idx = None
+            else:
+                xp = cp if self._device == 'GPU' else np
+                self._accessible_idx = xp.asarray(np.where(keep)[0])
+        else:
+            self._accessible_idx = None
+        self._hap_filtered = None
         self._pos_filtered = None
 
     @property
@@ -156,20 +178,10 @@ class HaplotypeMatrix:
         self
             For method chaining.
         """
+        # The property setter handles _accessible_idx and cache invalidation
         self.accessible_mask = resolve_accessible_mask(
             mask_or_path, self.chrom_start, self.chrom_end, chrom)
         self.n_total_sites = self.accessible_mask.total_accessible
-        # Compute index of accessible variants from the ORIGINAL positions
-        pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
-            else np.asarray(self._positions)
-        keep = self.accessible_mask.is_accessible_at(pos.astype(int))
-        if keep.all():
-            self._accessible_idx = None
-        else:
-            xp = cp if self.device == 'GPU' else np
-            self._accessible_idx = xp.asarray(np.where(keep)[0])
-        self._hap_filtered = None
-        self._pos_filtered = None
         return self
 
     def remove_accessible_mask(self):
@@ -177,10 +189,7 @@ class HaplotypeMatrix:
 
         Returns self for chaining.
         """
-        self.accessible_mask = None
-        self._accessible_idx = None
-        self._hap_filtered = None
-        self._pos_filtered = None
+        self.accessible_mask = None  # setter clears _accessible_idx and caches
         self.n_total_sites = None
         return self
 
