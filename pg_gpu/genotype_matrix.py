@@ -135,8 +135,7 @@ class GenotypeMatrix:
         """
         self.accessible_mask = resolve_accessible_mask(
             mask_or_path, self.chrom_start, self.chrom_end, chrom)
-        if self.n_total_sites is None:
-            self.n_total_sites = self.accessible_mask.total_accessible
+        self.n_total_sites = self.accessible_mask.total_accessible
         pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
             else np.asarray(self._positions)
         keep = self.accessible_mask.is_accessible_at(pos.astype(int))
@@ -147,6 +146,18 @@ class GenotypeMatrix:
             self._accessible_idx = xp.asarray(np.where(keep)[0])
         self._geno_filtered = None
         self._pos_filtered = None
+        return self
+
+    def remove_accessible_mask(self):
+        """Remove the accessible mask, restoring all original variants.
+
+        Returns self for chaining.
+        """
+        self.accessible_mask = None
+        self._accessible_idx = None
+        self._geno_filtered = None
+        self._pos_filtered = None
+        self.n_total_sites = None
         return self
 
     @property

@@ -662,6 +662,7 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
                      missing_data: str = 'include',
                      span_denominator: str = 'total',
                      accessible_bed: str = None,
+                     chrom: str = None,
                      **kwargs) -> pd.DataFrame:
     """
     Convenience function for windowed analysis.
@@ -698,7 +699,7 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
         Windowed statistics results
     """
     if accessible_bed is not None and not haplotype_matrix.has_accessible_mask:
-        haplotype_matrix.set_accessible_mask(accessible_bed)
+        haplotype_matrix.set_accessible_mask(accessible_bed, chrom=chrom)
     if step_size is None:
         step_size = window_size
 

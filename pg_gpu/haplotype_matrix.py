@@ -158,8 +158,7 @@ class HaplotypeMatrix:
         """
         self.accessible_mask = resolve_accessible_mask(
             mask_or_path, self.chrom_start, self.chrom_end, chrom)
-        if self.n_total_sites is None:
-            self.n_total_sites = self.accessible_mask.total_accessible
+        self.n_total_sites = self.accessible_mask.total_accessible
         # Compute index of accessible variants from the ORIGINAL positions
         pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
             else np.asarray(self._positions)
@@ -171,6 +170,18 @@ class HaplotypeMatrix:
             self._accessible_idx = xp.asarray(np.where(keep)[0])
         self._hap_filtered = None
         self._pos_filtered = None
+        return self
+
+    def remove_accessible_mask(self):
+        """Remove the accessible mask, restoring all original variants.
+
+        Returns self for chaining.
+        """
+        self.accessible_mask = None
+        self._accessible_idx = None
+        self._hap_filtered = None
+        self._pos_filtered = None
+        self.n_total_sites = None
         return self
 
     @property
@@ -402,7 +413,8 @@ class HaplotypeMatrix:
     @classmethod
     def from_ts(cls, ts: tskit.TreeSequence, device: str = 'CPU',
                 include_invariant: bool = False,
-                accessible_bed: str = None) -> 'HaplotypeMatrix':
+                accessible_bed: str = None,
+                chrom: str = None) -> 'HaplotypeMatrix':
         """
         Create a HaplotypeMatrix from a tskit.TreeSequence.
 
@@ -413,6 +425,7 @@ class HaplotypeMatrix:
                 length so that pairwise-mode calculations can account for
                 invariant sites analytically (no extra rows stored).
             accessible_bed: Path to a BED file defining accessible regions.
+            chrom: Chromosome name for BED file filtering.
 
         Returns:
             HaplotypeMatrix: A new HaplotypeMatrix instance
@@ -432,7 +445,7 @@ class HaplotypeMatrix:
         hm = cls(haplotypes, positions, chrom_start, chrom_end,
                  n_total_sites=n_total_sites)
         if accessible_bed is not None:
-            hm.set_accessible_mask(accessible_bed)
+            hm.set_accessible_mask(accessible_bed, chrom=chrom)
         return hm
 
     def get_matrix(self) -> cp.ndarray:
