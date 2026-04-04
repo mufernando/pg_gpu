@@ -59,6 +59,7 @@ class GenotypeMatrix:
             accessible_mask = resolve_accessible_mask(
                 accessible_mask, chrom_start, chrom_end)
         self.accessible_mask = accessible_mask
+        self._filtered_cache = None
         if self.accessible_mask is not None and self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
 
@@ -105,6 +106,7 @@ class GenotypeMatrix:
         """
         self.accessible_mask = resolve_accessible_mask(
             mask_or_path, self.chrom_start, self.chrom_end, chrom)
+        self._filtered_cache = None
         if self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
 
@@ -114,9 +116,10 @@ class GenotypeMatrix:
         return self.n_total_sites is not None
 
     def filter_to_accessible(self):
-        """Return a new matrix with variants at inaccessible positions removed.
+        """Return a matrix with variants at inaccessible positions removed.
 
-        If no accessible mask is set, returns self unchanged.
+        Returns self if no mask is set or all variants are accessible.
+        Result is cached so repeated calls are O(1).
 
         Returns
         -------
@@ -125,14 +128,18 @@ class GenotypeMatrix:
         """
         if self.accessible_mask is None:
             return self
+        if self._filtered_cache is not None:
+            return self._filtered_cache
         pos = self.positions.get() if self.device == 'GPU' \
             else np.asarray(self.positions)
         keep = self.accessible_mask.is_accessible_at(pos.astype(int))
         if keep.all():
+            self._filtered_cache = self
             return self
         xp = cp if self.device == 'GPU' else np
         keep_idx = xp.asarray(np.where(keep)[0])
-        return GenotypeMatrix(
+        # Clear mask on filtered result so downstream calls short-circuit
+        self._filtered_cache = GenotypeMatrix(
             self.genotypes[:, keep_idx],
             self.positions[keep_idx],
             chrom_start=self.chrom_start,
@@ -140,8 +147,8 @@ class GenotypeMatrix:
             sample_sets=self._sample_sets,
             n_total_sites=self.n_total_sites,
             samples=self.samples,
-            accessible_mask=self.accessible_mask,
         )
+        return self._filtered_cache
 
     @property
     def n_invariant_sites(self):

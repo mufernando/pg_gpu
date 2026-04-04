@@ -441,7 +441,8 @@ class TestFilterToAccessible:
         # All remaining positions should be accessible
         for p in filtered.positions:
             assert int(p) < 200 or int(p) >= 400
-        assert filtered.has_accessible_mask
+        # Mask is cleared on filtered result so downstream calls short-circuit
+        assert not filtered.has_accessible_mask
 
     def test_genotype_matrix_filter(self):
         rng = np.random.RandomState(42)

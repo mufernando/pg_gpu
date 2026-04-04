@@ -149,6 +149,7 @@ def pca(haplotype_matrix: HaplotypeMatrix,
     explained_variance_ratio : ndarray, float64, shape (n_components,)
         Proportion of variance explained by each component.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     prepared = _prepare_matrix(haplotype_matrix, scaler, population, missing_data)
 
     if isinstance(prepared, _DeferredPCA):
@@ -212,6 +213,7 @@ def randomized_pca(haplotype_matrix: HaplotypeMatrix,
     coords : ndarray, float64, shape (n_samples, n_components)
     explained_variance_ratio : ndarray, float64, shape (n_components,)
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     X = _prepare_matrix(haplotype_matrix, scaler, population, missing_data)
     n_samples, n_variants = X.shape
     n_components = min(n_components, min(n_samples, n_variants))
@@ -272,6 +274,7 @@ def pairwise_distance(haplotype_matrix: HaplotypeMatrix,
     dist : ndarray, float64, shape (n_samples * (n_samples - 1) // 2,)
         Condensed distance matrix.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 

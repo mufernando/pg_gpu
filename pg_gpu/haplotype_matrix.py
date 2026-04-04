@@ -64,6 +64,7 @@ class HaplotypeMatrix:
             accessible_mask = resolve_accessible_mask(
                 accessible_mask, chrom_start, chrom_end)
         self.accessible_mask = accessible_mask
+        self._filtered_cache = None
         if self.accessible_mask is not None and self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
 
@@ -121,15 +122,15 @@ class HaplotypeMatrix:
         """
         self.accessible_mask = resolve_accessible_mask(
             mask_or_path, self.chrom_start, self.chrom_end, chrom)
+        self._filtered_cache = None
         if self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
 
     def filter_to_accessible(self):
-        """Return a new matrix with variants at inaccessible positions removed.
+        """Return a matrix with variants at inaccessible positions removed.
 
-        If no accessible mask is set, returns self unchanged.
-        Call this once before computing scalar statistics to exclude
-        variants in inaccessible regions.
+        Returns self if no mask is set or all variants are accessible.
+        Result is cached so repeated calls are O(1).
 
         Returns
         -------
@@ -138,13 +139,20 @@ class HaplotypeMatrix:
         """
         if self.accessible_mask is None:
             return self
+        if self._filtered_cache is not None:
+            return self._filtered_cache
         pos = self.positions.get() if self.device == 'GPU' \
             else np.asarray(self.positions)
         keep = self.accessible_mask.is_accessible_at(pos.astype(int))
         if keep.all():
+            self._filtered_cache = self
             return self
         xp = cp if self.device == 'GPU' else np
-        return self.get_subset(xp.asarray(np.where(keep)[0]))
+        result = self.get_subset(xp.asarray(np.where(keep)[0]))
+        # Clear mask on filtered result so downstream calls short-circuit
+        result.accessible_mask = None
+        self._filtered_cache = result
+        return self._filtered_cache
 
     @property
     def has_invariant_info(self):
@@ -178,6 +186,7 @@ class HaplotypeMatrix:
             self.haplotypes = cp.asarray(self.haplotypes)
             self.positions = cp.asarray(self.positions)
             self._device = 'GPU'
+            self._filtered_cache = None
 
     def transfer_to_cpu(self):
         """Transfer data from GPU to CPU."""
@@ -185,6 +194,7 @@ class HaplotypeMatrix:
             self.haplotypes = np.asarray(self.haplotypes.get())
             self.positions = np.asarray(self.positions.get())
             self._device = 'CPU'
+            self._filtered_cache = None
 
     @classmethod
     def from_vcf(cls, path: str, region: str = None,
@@ -495,6 +505,7 @@ class HaplotypeMatrix:
             result._device = self._device
             result.n_total_sites = self.n_total_sites
             result.accessible_mask = self.accessible_mask
+            result._filtered_cache = None
             result.samples = self.samples
             return result
 

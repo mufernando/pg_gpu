@@ -134,6 +134,7 @@ def pi(haplotype_matrix: HaplotypeMatrix,
     float or PairwiseResult
         Nucleotide diversity value, or components if return_components=True
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
@@ -245,6 +246,7 @@ def theta_w(haplotype_matrix: HaplotypeMatrix,
     float or PairwiseResult
         Watterson's theta value
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
@@ -382,6 +384,7 @@ def tajimas_d(haplotype_matrix: HaplotypeMatrix,
     float
         Tajima's D value
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
@@ -526,6 +529,7 @@ def allele_frequency_spectrum(haplotype_matrix: HaplotypeMatrix,
     ndarray
         Array where element i contains the number of sites with i derived alleles
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # pairwise mode uses same per-site logic as include for AFS
     if missing_data == 'pairwise':
         missing_data = 'include'
@@ -619,6 +623,7 @@ def segregating_sites(haplotype_matrix: HaplotypeMatrix,
     int
         Number of segregating sites
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # pairwise mode uses same per-site logic as include for counting
     if missing_data == 'pairwise':
         missing_data = 'include'
@@ -684,6 +689,7 @@ def singleton_count(haplotype_matrix: HaplotypeMatrix,
     int
         Number of singleton variants
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # pairwise mode uses same per-site logic as include for counting
     if missing_data == 'pairwise':
         missing_data = 'include'
@@ -756,6 +762,7 @@ def diversity_stats(haplotype_matrix: HaplotypeMatrix,
     dict
         Dictionary mapping statistic names to values
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     results = {}
 
     for stat in statistics:
@@ -808,6 +815,7 @@ def fay_wus_h(haplotype_matrix: HaplotypeMatrix,
     float
         Fay and Wu's H value
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     # Get population subset if specified
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
@@ -863,6 +871,7 @@ def haplotype_diversity(haplotype_matrix: HaplotypeMatrix,
     float
         Haplotype diversity value
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -995,6 +1004,7 @@ def theta_h(haplotype_matrix: HaplotypeMatrix,
     -------
     float
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -1059,6 +1069,7 @@ def theta_l(haplotype_matrix: HaplotypeMatrix,
     -------
     float
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -1154,6 +1165,7 @@ def normalized_fay_wus_h(haplotype_matrix: HaplotypeMatrix,
         Normalized H*. Negative values indicate excess high-frequency
         derived alleles (directional selection signal).
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -1226,6 +1238,7 @@ def zeng_e(haplotype_matrix: HaplotypeMatrix,
     float
         Normalized E statistic.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -1296,6 +1309,7 @@ def zeng_dh(haplotype_matrix: HaplotypeMatrix,
         DH statistic. Positive when both D and H are negative
         (consistent with a selective sweep).
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     D = tajimas_d(haplotype_matrix, population, missing_data=missing_data)
     H = fay_wus_h(haplotype_matrix, population, missing_data=missing_data)
 
@@ -1324,6 +1338,7 @@ def max_daf(haplotype_matrix: HaplotypeMatrix,
     float
         Maximum DAF in [0, 1].
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -1366,6 +1381,7 @@ def haplotype_count(haplotype_matrix: HaplotypeMatrix,
     -------
     int
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -1539,6 +1555,7 @@ def neutrality_tests(haplotype_matrix: HaplotypeMatrix,
     dict
         Dictionary with neutrality test results
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     return {
         'tajimas_d': tajimas_d(haplotype_matrix, population, missing_data),
         'fay_wus_h': fay_wus_h(haplotype_matrix, population, missing_data),
@@ -1572,6 +1589,7 @@ def heterozygosity_expected(haplotype_matrix: HaplotypeMatrix,
     ndarray, float64, shape (n_variants,)
         Expected heterozygosity per variant.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -1631,6 +1649,7 @@ def heterozygosity_observed(haplotype_matrix: HaplotypeMatrix,
     ndarray, float64, shape (n_variants,)
         Observed heterozygosity per variant.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 
@@ -1710,6 +1729,7 @@ def inbreeding_coefficient(haplotype_matrix: HaplotypeMatrix,
     ndarray, float64, shape (n_variants,)
         Inbreeding coefficient per variant. NaN where He = 0.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     ho = heterozygosity_observed(haplotype_matrix, population, ploidy,
                                  missing_data=missing_data)
     he = heterozygosity_expected(haplotype_matrix, population,
@@ -1741,6 +1761,7 @@ def mu_var(haplotype_matrix: HaplotypeMatrix,
     -------
     float
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if population is not None:
         matrix = _get_population_matrix(haplotype_matrix, population)
     else:
@@ -1775,6 +1796,7 @@ def mu_sfs(haplotype_matrix: HaplotypeMatrix,
     -------
     float
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     if missing_data == 'pairwise':
         missing_data = 'include'
 

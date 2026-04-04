@@ -177,6 +177,7 @@ def patterson_f2(haplotype_matrix: HaplotypeMatrix,
     f2 : ndarray, float64, shape (n_variants,)
         Per-variant F2 estimates.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     ma = _get_population_matrix(haplotype_matrix, pop_a)
     mb = _get_population_matrix(haplotype_matrix, pop_b)
 
@@ -215,6 +216,7 @@ def patterson_f3(haplotype_matrix: HaplotypeMatrix,
     B : ndarray, float64, shape (n_variants,)
         Heterozygosity estimates (2 * h_hat) for population C.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     mc = _get_population_matrix(haplotype_matrix, pop_c)
     ma = _get_population_matrix(haplotype_matrix, pop_a)
     mb = _get_population_matrix(haplotype_matrix, pop_b)
@@ -255,6 +257,7 @@ def patterson_d(haplotype_matrix: HaplotypeMatrix,
     den : ndarray, float64, shape (n_variants,)
         Denominator.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     ma = _get_population_matrix(haplotype_matrix, pop_a)
     mb = _get_population_matrix(haplotype_matrix, pop_b)
     mc = _get_population_matrix(haplotype_matrix, pop_c)
@@ -302,6 +305,7 @@ def moving_patterson_f3(haplotype_matrix: HaplotypeMatrix,
     -------
     f3 : ndarray, float64, shape (n_windows,)
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     T, B = patterson_f3(haplotype_matrix, pop_c, pop_a, pop_b,
                          missing_data=missing_data)
 
@@ -339,6 +343,7 @@ def moving_patterson_d(haplotype_matrix: HaplotypeMatrix,
     -------
     d : ndarray, float64, shape (n_windows,)
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     num, den = patterson_d(haplotype_matrix, pop_a, pop_b, pop_c, pop_d,
                             missing_data=missing_data)
     num_sum = _moving_statistic(num, np.nansum, size, start, stop, step)
@@ -382,6 +387,7 @@ def average_patterson_f3(haplotype_matrix: HaplotypeMatrix,
     vj : ndarray
         Jackknife resampled values.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     T, B = patterson_f3(haplotype_matrix, pop_c, pop_a, pop_b,
                          missing_data=missing_data)
 
@@ -433,6 +439,7 @@ def average_patterson_d(haplotype_matrix: HaplotypeMatrix,
     vj : ndarray
         Jackknife resampled values.
     """
+    haplotype_matrix = haplotype_matrix.filter_to_accessible()
     num, den = patterson_d(haplotype_matrix, pop_a, pop_b, pop_c, pop_d,
                             missing_data=missing_data)
 

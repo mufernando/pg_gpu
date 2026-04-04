@@ -369,6 +369,8 @@ class WindowIterator:
 
     def __init__(self, haplotype_matrix: HaplotypeMatrix,
                  window_params: WindowParams):
+        # Save mask before filtering (needed for per-window n_total_sites)
+        self._parent_mask = haplotype_matrix.accessible_mask
         # Filter variants at inaccessible positions before iterating
         self.matrix = _filter_inaccessible_variants(
             haplotype_matrix, haplotype_matrix)
@@ -382,12 +384,10 @@ class WindowIterator:
             self.positions_np = self.positions
 
     def _attach_window_mask(self, window_matrix, start, end):
-        """Slice the parent's accessible mask onto a window sub-matrix."""
-        if self.matrix.has_accessible_mask:
-            window_matrix.accessible_mask = \
-                self.matrix.accessible_mask.slice(start, end)
+        """Set per-window n_total_sites from the parent's accessible mask."""
+        if self._parent_mask is not None:
             window_matrix.n_total_sites = \
-                window_matrix.accessible_mask.total_accessible
+                self._parent_mask.count_accessible(start, end)
 
     def __iter__(self) -> Iterator[WindowData]:
         """Iterate over windows based on window type."""
