@@ -205,25 +205,20 @@ def r_squared(counts: cp.ndarray,
     return r(counts, n_valid) ** 2
 
 
-def _zns_tiled(mat, missing_data='include', tile_size=512):
-    """Compute ZnS without materializing the full r² matrix.
+def _prepare_segregating(mat, missing_data='include'):
+    """Filter to segregating sites and return cleaned arrays.
 
-    Uses tile-based accumulation: computes D and r² for B×B blocks and
-    sums r² per tile, keeping memory at O(B²) instead of O(m²).
+    Returns (hap_clean, valid_mask, m) or (None, None, 0) if < 2 sites.
     """
-    from .haplotype_matrix import HaplotypeMatrix
-
     if hasattr(mat, 'device') and mat.device == 'CPU':
         mat.transfer_to_gpu()
 
-    # Filter missing data sites
     if missing_data == 'exclude':
         hap = mat.haplotypes
         missing_per_var = cp.sum(hap < 0, axis=0)
         valid = cp.where(missing_per_var == 0)[0]
         mat = mat.get_subset(valid)
 
-    # Filter monomorphic sites
     hap = mat.haplotypes
     dac = cp.sum(cp.maximum(hap, 0).astype(cp.int32), axis=0)
     n_valid_per_site = cp.sum((hap >= 0).astype(cp.int32), axis=0)
@@ -235,55 +230,139 @@ def _zns_tiled(mat, missing_data='include', tile_size=512):
     hap = mat.haplotypes
     m = hap.shape[1]
     if m < 2:
-        return 0.0
+        return None, None, 0
 
-    # Precompute shared arrays
     valid_mask = (hap >= 0).astype(cp.float64)
     hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
-    n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
-    p = cp.where(n_valid > 0, cp.sum(hap_clean, axis=0) / n_valid, 0.0)
-    pq = p * (1 - p)
+    return hap_clean, valid_mask, m
+
+
+def _tile_counts(hi, vi, hj, vj):
+    """Compute 4-way haplotype counts for all pairs in a tile.
+
+    Returns c1, c2, c3, c4 as (B_i, B_j) matrices where:
+        c1 = n_AB (derived at both)
+        c2 = n_Ab (derived at i, ancestral at j)
+        c3 = n_aB (ancestral at i, derived at j)
+        c4 = n_ab (ancestral at both)
+        n  = c1+c2+c3+c4 (valid at both sites)
+    """
+    c1 = hi.T @ hj           # derived at both
+    s12 = hi.T @ vj           # derived at i, valid at j  (= c1 + c2)
+    s13 = vi.T @ hj           # valid at i, derived at j  (= c1 + c3)
+    n = vi.T @ vj             # valid at both
+    c2 = s12 - c1
+    c3 = s13 - c1
+    c4 = n - c1 - c2 - c3
+    return c1, c2, c3, c4, n
+
+
+def _tile_r2_naive(hi, vi, hj, vj, pi, pqi, pj, pqj):
+    """Compute naive r² for a tile (frequency-based, biased)."""
+    joint_n = vi.T @ vj
+    joint_11 = hi.T @ hj
+    p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
+    D = p_AB - cp.outer(pi, pj)
+    denom = cp.outer(pqi, pqj)
+    return cp.where(denom > 0, (D ** 2) / denom, 0.0)
+
+
+def _tile_sigma_d2(hi, vi, hj, vj):
+    """Compute unbiased D²/π² (sigma_d^2) for a tile.
+
+    Uses multinomial projection estimators (Ragsdale & Gravel 2019):
+      D² = [c1(c1-1)c4(c4-1) + c2(c2-1)c3(c3-1) - 2*c1*c2*c3*c4]
+           / [n(n-1)(n-2)(n-3)]
+      π² = [(c1+c2)(c1+c3)(c2+c4)(c3+c4) - c1*c4*(-1+c1+3c2+3c3+c4)
+            - c2*c3*(-1+3c1+c2+c3+3c4)] / [n(n-1)(n-2)(n-3)]
+
+    Returns sigma_d2 tile and valid mask (n >= 4).
+    """
+    c1, c2, c3, c4, n = _tile_counts(hi, vi, hj, vj)
+
+    # Unbiased D² numerator
+    dd_num = (c1 * (c1 - 1) * c4 * (c4 - 1)
+              + c2 * (c2 - 1) * c3 * (c3 - 1)
+              - 2 * c1 * c2 * c3 * c4)
+
+    # Unbiased π² numerator
+    s12 = c1 + c2
+    s13 = c1 + c3
+    s24 = c2 + c4
+    s34 = c3 + c4
+    pi2_num = (s12 * s13 * s24 * s34
+               - c1 * c4 * (-1 + c1 + 3 * c2 + 3 * c3 + c4)
+               - c2 * c3 * (-1 + 3 * c1 + c2 + c3 + 3 * c4))
+
+    valid = n >= 4
+    sigma_d2 = cp.where(valid & (pi2_num != 0),
+                        dd_num / pi2_num, 0.0)
+    return sigma_d2, valid
+
+
+def _zns_tiled(mat, missing_data='include', tile_size=512):
+    """Compute ZnS without materializing the full r² matrix.
+
+    Uses tile-based accumulation: computes r² for B×B blocks and
+    sums per tile, keeping memory at O(B²) instead of O(m²).
+
+    When missing_data='project', uses unbiased multinomial projection
+    estimators (Ragsdale & Gravel 2019) computing σ_D² = D²/π²
+    per pair instead of naive r².
+    """
+    hap_clean, valid_mask, m = _prepare_segregating(mat, missing_data)
+    if m < 2:
+        return 0.0
+
+    use_projection = (missing_data == 'project')
 
     B = tile_size
     total = 0.0
+    n_pairs = 0
+
+    if not use_projection:
+        n_valid = cp.sum(valid_mask, axis=0).astype(cp.float64)
+        p = cp.where(n_valid > 0,
+                     cp.sum(hap_clean, axis=0) / n_valid, 0.0)
+        pq = p * (1 - p)
 
     for i0 in range(0, m, B):
         i1 = min(i0 + B, m)
         hi = hap_clean[:, i0:i1]
         vi = valid_mask[:, i0:i1]
-        pi = p[i0:i1]
-        pqi = pq[i0:i1]
 
         for j0 in range(i0, m, B):
             j1 = min(j0 + B, m)
             hj = hap_clean[:, j0:j1]
             vj = valid_mask[:, j0:j1]
-            pj = p[j0:j1]
-            pqj = pq[j0:j1]
 
-            # D for this tile
-            joint_n = vi.T @ vj
-            joint_11 = hi.T @ hj
-            p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
-            D = p_AB - cp.outer(pi, pj)
-
-            # r² for this tile
-            denom = cp.outer(pqi, pqj)
-            r2_tile = cp.where(denom > 0, (D ** 2) / denom, 0.0)
-
-            if i0 == j0:
-                # Diagonal block: zero the diagonal, count once
-                cp.fill_diagonal(r2_tile, 0.0)
-                total += float(cp.sum(r2_tile).get())
+            if use_projection:
+                tile, valid = _tile_sigma_d2(hi, vi, hj, vj)
+                if i0 == j0:
+                    cp.fill_diagonal(tile, 0.0)
+                    cp.fill_diagonal(valid, False)
+                    total += float(cp.sum(tile).get())
+                    n_pairs += int(cp.sum(valid).get())
+                else:
+                    total += 2.0 * float(cp.sum(tile).get())
+                    n_pairs += 2 * int(cp.sum(valid).get())
             else:
-                # Off-diagonal block: count twice (upper + lower triangle)
-                total += 2.0 * float(cp.sum(r2_tile).get())
+                r2_tile = _tile_r2_naive(
+                    hi, vi, hj, vj,
+                    p[i0:i1], pq[i0:i1], p[j0:j1], pq[j0:j1])
+                if i0 == j0:
+                    cp.fill_diagonal(r2_tile, 0.0)
+                    total += float(cp.sum(r2_tile).get())
+                else:
+                    total += 2.0 * float(cp.sum(r2_tile).get())
 
+    if use_projection:
+        return total / n_pairs if n_pairs > 0 else 0.0
     return total / (m * (m - 1))
 
 
 def _zns_from_precomputed(hap_clean, valid_mask, col_start, col_end,
-                          tile_size=512):
+                          tile_size=512, use_projection=False):
     """Compute ZnS for a column range using precomputed arrays.
 
     This avoids creating a HaplotypeMatrix and recomputing valid_mask/hap_clean
@@ -299,6 +378,8 @@ def _zns_from_precomputed(hap_clean, valid_mask, col_start, col_end,
         Column range [col_start, col_end) to compute ZnS over.
     tile_size : int
         Tile size for accumulation.
+    use_projection : bool
+        If True, use unbiased multinomial projection estimators.
 
     Returns
     -------
@@ -319,40 +400,48 @@ def _zns_from_precomputed(hap_clean, valid_mask, col_start, col_end,
 
     hc = hc[:, seg_idx]
     vm = vm[:, seg_idx]
-    n_valid = n_valid[seg_idx]
-    p = cp.where(n_valid > 0, cp.sum(hc, axis=0) / n_valid, 0.0)
-    pq = p * (1 - p)
+
+    if not use_projection:
+        n_valid = n_valid[seg_idx]
+        p = cp.where(n_valid > 0, cp.sum(hc, axis=0) / n_valid, 0.0)
+        pq = p * (1 - p)
 
     B = tile_size
     total = 0.0
+    n_pairs = 0
 
     for i0 in range(0, m, B):
         i1 = min(i0 + B, m)
         hi = hc[:, i0:i1]
         vi = vm[:, i0:i1]
-        pi = p[i0:i1]
-        pqi = pq[i0:i1]
 
         for j0 in range(i0, m, B):
             j1 = min(j0 + B, m)
             hj = hc[:, j0:j1]
             vj = vm[:, j0:j1]
-            pj = p[j0:j1]
-            pqj = pq[j0:j1]
 
-            joint_n = vi.T @ vj
-            joint_11 = hi.T @ hj
-            p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
-            D = p_AB - cp.outer(pi, pj)
-            denom = cp.outer(pqi, pqj)
-            r2_tile = cp.where(denom > 0, (D ** 2) / denom, 0.0)
-
-            if i0 == j0:
-                cp.fill_diagonal(r2_tile, 0.0)
-                total += float(cp.sum(r2_tile).get())
+            if use_projection:
+                tile, valid = _tile_sigma_d2(hi, vi, hj, vj)
+                if i0 == j0:
+                    cp.fill_diagonal(tile, 0.0)
+                    cp.fill_diagonal(valid, False)
+                    total += float(cp.sum(tile).get())
+                    n_pairs += int(cp.sum(valid).get())
+                else:
+                    total += 2.0 * float(cp.sum(tile).get())
+                    n_pairs += 2 * int(cp.sum(valid).get())
             else:
-                total += 2.0 * float(cp.sum(r2_tile).get())
+                r2_tile = _tile_r2_naive(
+                    hi, vi, hj, vj,
+                    p[i0:i1], pq[i0:i1], p[j0:j1], pq[j0:j1])
+                if i0 == j0:
+                    cp.fill_diagonal(r2_tile, 0.0)
+                    total += float(cp.sum(r2_tile).get())
+                else:
+                    total += 2.0 * float(cp.sum(r2_tile).get())
 
+    if use_projection:
+        return total / n_pairs if n_pairs > 0 else 0.0
     return total / (m * (m - 1))
 
 
@@ -369,17 +458,27 @@ def zns(r2_matrix_or_matrix, missing_data='include'):
     missing_data : str
         'include' - per-site valid data for frequency computation
         'exclude' - filter to sites with no missing data
+        'project' - unbiased multinomial projection estimators, computing
+          mean σ_D² = D²/π² per pair using falling-factorial corrections
+          for finite sample size. Requires HaplotypeMatrix input.
+          See: Ragsdale & Gravel (2019) "Unbiased estimation of linkage
+          disequilibrium from unphased data", MBE 37(3):923-932.
 
     Returns
     -------
     float
-        Mean r-squared (excluding diagonal).
+        Mean r-squared (or mean σ_D² for 'project' mode).
     """
     from .haplotype_matrix import HaplotypeMatrix
 
     # Streaming path for HaplotypeMatrix: O(B²) memory instead of O(m²)
     if isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
         return _zns_tiled(r2_matrix_or_matrix, missing_data)
+
+    if missing_data == 'project':
+        raise ValueError(
+            "missing_data='project' requires a HaplotypeMatrix, "
+            "not a pre-computed r² array")
 
     r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix, missing_data)
 
@@ -388,6 +487,33 @@ def zns(r2_matrix_or_matrix, missing_data='include'):
         return 0.0
     total = cp.sum(r2_matrix) - cp.trace(r2_matrix)
     return float((total / (m * (m - 1))).get())
+
+
+def _build_sigma_d2_matrix(mat, missing_data='include'):
+    """Build full m×m σ_D² matrix using unbiased estimators.
+
+    Used by omega() when missing_data='project'.
+    """
+    hap_clean, valid_mask, m = _prepare_segregating(mat, missing_data)
+    if m < 2:
+        return cp.zeros((0, 0), dtype=cp.float64)
+
+    c1, c2, c3, c4, n = _tile_counts(hap_clean, valid_mask,
+                                       hap_clean, valid_mask)
+
+    dd_num = (c1 * (c1 - 1) * c4 * (c4 - 1)
+              + c2 * (c2 - 1) * c3 * (c3 - 1)
+              - 2 * c1 * c2 * c3 * c4)
+
+    s12, s13, s24, s34 = c1 + c2, c1 + c3, c2 + c4, c3 + c4
+    pi2_num = (s12 * s13 * s24 * s34
+               - c1 * c4 * (-1 + c1 + 3 * c2 + 3 * c3 + c4)
+               - c2 * c3 * (-1 + 3 * c1 + c2 + c3 + 3 * c4))
+
+    valid = (n >= 4) & (pi2_num != 0)
+    result = cp.where(valid, dd_num / pi2_num, 0.0)
+    cp.fill_diagonal(result, 0.0)
+    return result
 
 
 def omega(r2_matrix_or_matrix, missing_data='include'):
@@ -410,13 +536,25 @@ def omega(r2_matrix_or_matrix, missing_data='include'):
     missing_data : str
         'include' - per-site valid data for frequency computation
         'exclude' - filter to sites with no missing data
+        'project' - unbiased multinomial projection estimators, using
+          σ_D² = D²/π² instead of naive r². Requires HaplotypeMatrix input.
+          See: Ragsdale & Gravel (2019) "Unbiased estimation of linkage
+          disequilibrium from unphased data", MBE 37(3):923-932.
 
     Returns
     -------
     float
         Maximum omega value. Returns 0 if fewer than 5 SNPs.
     """
-    r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix, missing_data)
+    from .haplotype_matrix import HaplotypeMatrix
+
+    if missing_data == 'project':
+        if not isinstance(r2_matrix_or_matrix, HaplotypeMatrix):
+            raise ValueError(
+                "missing_data='project' requires a HaplotypeMatrix")
+        r2_matrix = _build_sigma_d2_matrix(r2_matrix_or_matrix)
+    else:
+        r2_matrix = _resolve_r2_matrix(r2_matrix_or_matrix, missing_data)
 
     m = r2_matrix.shape[0]
     if m < 5:
