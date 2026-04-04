@@ -116,7 +116,7 @@ class StatisticsComputer:
 
     # LD-based statistics
     LD_STATS = {
-        'ld_decay': lambda w, **kwargs: _compute_ld_decay(w.matrix, **kwargs),
+        'ld_decay': lambda w, **kwargs: _compute_mean_r2(w.matrix, **kwargs),
         'mean_r2': lambda w, max_dist: _compute_mean_r2(w.matrix, max_dist),
     }
 
@@ -725,54 +725,18 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
 
 
 
-def _compute_ld_decay(matrix: HaplotypeMatrix, bins: List[int],
-                     max_distance: int = 50000) -> float:
-    """Compute mean LD decay (mean r² across all distance bins)."""
-    # Simplified implementation - returns single summary value
-    # In practice, might want to return the full decay curve
+def _compute_mean_r2(matrix: HaplotypeMatrix, max_distance: int,
+                     **kwargs) -> float:
+    """Compute mean r² for variant pairs within a genomic distance."""
     r2_matrix = matrix.pairwise_r2()
     positions = matrix.positions
 
-    # Calculate pairwise distances
-    if matrix.device == 'GPU':
-        pos_i, pos_j = cp.meshgrid(positions, positions, indexing='ij')
-        distances = cp.abs(pos_j - pos_i)
-
-        # Get mean r² within max distance
-        mask = (distances > 0) & (distances <= max_distance)
-        if cp.any(mask):
-            mean_r2 = float(cp.mean(r2_matrix[mask]).get())
-        else:
-            mean_r2 = np.nan
-    else:
-        # CPU version
-        pos_i, pos_j = np.meshgrid(positions, positions, indexing='ij')
-        distances = np.abs(pos_j - pos_i)
-
-        mask = (distances > 0) & (distances <= max_distance)
-        if np.any(mask):
-            mean_r2 = float(np.mean(r2_matrix[mask]))
-        else:
-            mean_r2 = np.nan
-
-    return mean_r2
-
-
-def _compute_mean_r2(matrix: HaplotypeMatrix, max_distance: int) -> float:
-    """Compute mean r² within a distance."""
-    r2_matrix = matrix.pairwise_r2()
-    positions = matrix.positions
-
-    if matrix.device == 'GPU':
-        pos_i, pos_j = cp.meshgrid(positions, positions, indexing='ij')
-        distances = cp.abs(pos_j - pos_i)
-        mask = (distances > 0) & (distances <= max_distance)
-        return float(cp.mean(r2_matrix[mask]).get()) if cp.any(mask) else np.nan
-    else:
-        pos_i, pos_j = np.meshgrid(positions, positions, indexing='ij')
-        distances = np.abs(pos_j - pos_i)
-        mask = (distances > 0) & (distances <= max_distance)
-        return float(np.mean(r2_matrix[mask])) if np.any(mask) else np.nan
+    pos_i, pos_j = cp.meshgrid(positions, positions, indexing='ij')
+    distances = cp.abs(pos_j - pos_i)
+    mask = (distances > 0) & (distances <= max_distance)
+    if cp.any(mask):
+        return float(cp.mean(r2_matrix[mask]).get())
+    return np.nan
 
 
 # ---------------------------------------------------------------------------
@@ -1475,27 +1439,39 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
 
         stat_arrays = {s: np.full(n_windows, np.nan) for s in perwin_stats}
         need_dist = bool(perwin_stats & dist_pairwise)
+        need_winmat = ('omega' in stat_arrays or 'mu_ld' in stat_arrays
+                       or need_dist)
+
+        # Precompute for fused ZnS path
+        if 'zns' in stat_arrays:
+            hap = matrix.haplotypes
+            hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
+            valid_mask = (hap >= 0).astype(cp.float64)
 
         for wi in range(n_windows):
             s, e = int(ws_np[wi]), int(we_np[wi])
             if e - s < 4:
                 continue
-            win_mat = HaplotypeMatrix(matrix.haplotypes[:, s:e],
-                                       matrix.positions[s:e])
+
             if 'zns' in stat_arrays:
-                stat_arrays['zns'][wi] = ld_statistics.zns(win_mat)
-            if 'omega' in stat_arrays:
-                stat_arrays['omega'][wi] = ld_statistics.omega(win_mat)
-            if 'mu_ld' in stat_arrays:
-                stat_arrays['mu_ld'][wi] = ld_statistics.mu_ld(win_mat)
-            if need_dist:
-                v, sk, ku = distance_stats.dist_moments(win_mat)
-                if 'dist_var' in stat_arrays:
-                    stat_arrays['dist_var'][wi] = v
-                if 'dist_skew' in stat_arrays:
-                    stat_arrays['dist_skew'][wi] = sk
-                if 'dist_kurt' in stat_arrays:
-                    stat_arrays['dist_kurt'][wi] = ku
+                stat_arrays['zns'][wi] = ld_statistics._zns_from_precomputed(
+                    hap_clean, valid_mask, s, e)
+
+            if need_winmat:
+                win_mat = HaplotypeMatrix(matrix.haplotypes[:, s:e],
+                                           matrix.positions[s:e])
+                if 'omega' in stat_arrays:
+                    stat_arrays['omega'][wi] = ld_statistics.omega(win_mat)
+                if 'mu_ld' in stat_arrays:
+                    stat_arrays['mu_ld'][wi] = ld_statistics.mu_ld(win_mat)
+                if need_dist:
+                    v, sk, ku = distance_stats.dist_moments(win_mat)
+                    if 'dist_var' in stat_arrays:
+                        stat_arrays['dist_var'][wi] = v
+                    if 'dist_skew' in stat_arrays:
+                        stat_arrays['dist_skew'][wi] = sk
+                    if 'dist_kurt' in stat_arrays:
+                        stat_arrays['dist_kurt'][wi] = ku
 
         results.update(stat_arrays)
 
