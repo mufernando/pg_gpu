@@ -38,5 +38,6 @@ def get_population_matrix(haplotype_matrix: HaplotypeMatrix,
         haplotype_matrix.positions,
         haplotype_matrix.chrom_start,
         haplotype_matrix.chrom_end,
-        sample_sets={'all': list(range(len(pop_indices)))}
+        sample_sets={'all': list(range(len(pop_indices)))},
+        n_total_sites=haplotype_matrix.n_total_sites,
     )

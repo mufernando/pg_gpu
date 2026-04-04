@@ -19,6 +19,40 @@ from . import divergence
 from . import diversity
 
 
+def _compute_window_bases(haplotype_matrix, win_starts, win_stops,
+                          is_accessible=None):
+    """Compute per-window accessible base counts for per-base normalization.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+        Source matrix (checked for accessible_mask attribute).
+    win_starts, win_stops : array_like
+        Window boundary arrays (numpy, not cupy).
+    is_accessible : array_like, optional
+        Explicit accessibility mask (takes precedence over matrix attribute).
+
+    Returns
+    -------
+    numpy.ndarray, float64
+        Accessible base count per window.
+    """
+    ws = np.asarray(win_starts, dtype=np.float64)
+    we = np.asarray(win_stops, dtype=np.float64)
+
+    if is_accessible is not None:
+        from .accessible import AccessibleMask
+        amask = AccessibleMask(np.asarray(is_accessible, dtype=bool))
+        return amask.count_accessible_windows(
+            ws.astype(np.int64), we.astype(np.int64))
+
+    if haplotype_matrix.has_accessible_mask:
+        return haplotype_matrix.accessible_mask.count_accessible_windows(
+            ws.astype(np.int64), we.astype(np.int64))
+
+    return we - ws
+
+
 @dataclass
 class WindowParams:
     """Parameters defining genomic windows."""
@@ -282,7 +316,7 @@ class StatisticsComputer:
             matrix.chrom_start,
             matrix.chrom_end,
             sample_sets={'all': list(range(len(pop_indices)))},
-            n_total_sites=matrix.n_total_sites
+            n_total_sites=matrix.n_total_sites,
         )
 
 
@@ -291,15 +325,22 @@ class WindowIterator:
 
     def __init__(self, haplotype_matrix: HaplotypeMatrix,
                  window_params: WindowParams):
+        self._parent_mask = haplotype_matrix.accessible_mask
         self.matrix = haplotype_matrix
         self.params = window_params
-        self.positions = haplotype_matrix.positions
+        self.positions = self.matrix.positions
 
         # Get positions as numpy array for easier manipulation
         if isinstance(self.positions, cp.ndarray):
             self.positions_np = self.positions.get()
         else:
             self.positions_np = self.positions
+
+    def _attach_window_mask(self, window_matrix, start, end):
+        """Set per-window n_total_sites from the parent's accessible mask."""
+        if self._parent_mask is not None:
+            window_matrix.n_total_sites = \
+                self._parent_mask.count_accessible(start, end)
 
     def __iter__(self) -> Iterator[WindowData]:
         """Iterate over windows based on window type."""
@@ -334,6 +375,7 @@ class WindowIterator:
                 # Set correct chromosome coordinates for span normalization
                 window_matrix.chrom_start = start
                 window_matrix.chrom_end = end - 1  # end is exclusive in our window definition
+                self._attach_window_mask(window_matrix, start, end)
 
                 yield WindowData(
                     chrom=1,  # TODO: Handle multiple chromosomes
@@ -368,6 +410,7 @@ class WindowIterator:
             # Set correct chromosome coordinates for span normalization
             window_matrix.chrom_start = window_start
             window_matrix.chrom_end = window_end
+            self._attach_window_mask(window_matrix, window_start, window_end + 1)
 
             yield WindowData(
                 chrom=1,  # TODO: Handle multiple chromosomes
@@ -398,6 +441,7 @@ class WindowIterator:
 
             if len(variant_indices) > 0:
                 window_matrix = self.matrix.get_subset(variant_indices)
+                self._attach_window_mask(window_matrix, start, end)
 
                 yield WindowData(
                     chrom=region.get('chrom', 1),
@@ -617,6 +661,8 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
                      populations: Optional[List[str]] = None,
                      missing_data: str = 'include',
                      span_denominator: str = 'total',
+                     accessible_bed: str = None,
+                     chrom: str = None,
                      **kwargs) -> pd.DataFrame:
     """
     Convenience function for windowed analysis.
@@ -640,6 +686,10 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
         'total' - Use total genomic span (chrom_end - chrom_start)
         'sites' - Use number of sites analyzed
         'callable' - Use span from first to last site included in analysis
+        'accessible' - Use number of accessible sites from mask
+    accessible_bed : str, optional
+        Path to a BED file defining accessible/callable regions.
+        If provided and the matrix has no mask, loads the mask.
     **kwargs
         Additional arguments passed to WindowedAnalyzer
 
@@ -648,6 +698,8 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
     pd.DataFrame
         Windowed statistics results
     """
+    if accessible_bed is not None and not haplotype_matrix.has_accessible_mask:
+        haplotype_matrix.set_accessible_mask(accessible_bed, chrom=chrom)
     if step_size is None:
         step_size = window_size
 
@@ -702,7 +754,7 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
             statistics=tuple(statistics),
             pop1=pop1,
             pop2=pop2,
-            per_base=(span_denominator == 'total'),
+            per_base=(span_denominator in ('total', 'accessible')),
             _win_starts=win_starts,
             _win_stops=win_stops,
             missing_data=missing_data,
@@ -1180,16 +1232,9 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
     }
 
     if per_base:
-        if is_accessible is not None:
-            is_accessible = np.asarray(is_accessible, dtype=bool)
-            ws_np = results['window_start']
-            we_np = results['window_stop']
-            window_bases = np.array([
-                np.count_nonzero(is_accessible[max(0, int(ws_np[i])):int(we_np[i])])
-                for i in range(n_windows)
-            ], dtype=np.float64)
-        else:
-            window_bases = results['window_stop'] - results['window_start']
+        window_bases = _compute_window_bases(
+            haplotype_matrix, results['window_start'],
+            results['window_stop'], is_accessible)
 
     # single-pop stats via fused kernel
     single_pop_stats = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites',
@@ -1283,8 +1328,9 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
         if pop1 is None or pop2 is None:
             raise ValueError("pop1 and pop2 required for fst/dxy/da")
 
-        m1 = get_population_matrix(haplotype_matrix, pop1)
-        m2 = get_population_matrix(haplotype_matrix, pop2)
+        # Use filtered matrix so inaccessible variants are excluded
+        m1 = get_population_matrix(matrix, pop1)
+        m2 = get_population_matrix(matrix, pop2)
         if m1.device == 'CPU':
             m1.transfer_to_gpu()
         if m2.device == 'CPU':
@@ -1355,7 +1401,7 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                    'haplotype_count'}
     garud_requested = any(s in statistics for s in garud_stats)
     if garud_requested:
-        _compute_fused_garud_h(haplotype_matrix, population,
+        _compute_fused_garud_h(matrix, population,
                                win_start, win_stop, n_windows, statistics,
                                results)
 
@@ -1370,7 +1416,7 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
 
     if 'mean_nsl' in statistics:
         from . import selection as sel
-        nsl_gpu = cp.asarray(sel.nsl(haplotype_matrix, population=population))
+        nsl_gpu = cp.asarray(sel.nsl(matrix, population=population))
         valid = cp.isfinite(nsl_gpu) & in_range
         results['mean_nsl'] = _windowed_mean(nsl_gpu, bin_idx, valid, n_windows)
 
@@ -1765,18 +1811,10 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
 
     # window sizes for per-base normalization
     if per_base:
-        if is_accessible is not None:
-            is_accessible = np.asarray(is_accessible, dtype=bool)
-            window_bases = np.zeros(n_windows)
-            bp_edges = bp_bins.get()
-            for i in range(n_windows):
-                start = int(bp_edges[i])
-                stop = int(bp_edges[i + 1])
-                window_bases[i] = np.count_nonzero(
-                    is_accessible[max(0, start):stop])
-            window_bases = cp.asarray(window_bases, dtype=cp.float64)
-        else:
-            window_bases = cp.diff(bp_bins)
+        window_bases = _compute_window_bases(
+            haplotype_matrix, results['window_start'],
+            results['window_stop'], is_accessible)
+        window_bases = cp.asarray(window_bases, dtype=cp.float64)
 
     # Phase 1: compute per-variant values and aggregate
 
@@ -1875,8 +1913,9 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
         if pop1 is None or pop2 is None:
             raise ValueError("pop1 and pop2 required for fst/dxy")
 
-        m1 = get_population_matrix(haplotype_matrix, pop1)
-        m2 = get_population_matrix(haplotype_matrix, pop2)
+        # Use filtered matrix so inaccessible variants are excluded
+        m1 = get_population_matrix(matrix, pop1)
+        m2 = get_population_matrix(matrix, pop2)
         if m1.device == 'CPU':
             m1.transfer_to_gpu()
         if m2.device == 'CPU':

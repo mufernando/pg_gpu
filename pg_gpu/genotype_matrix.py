@@ -9,6 +9,8 @@ import numpy as np
 import cupy as cp
 from typing import Optional
 
+from .accessible import AccessibleMask, resolve_accessible_mask
+
 
 class GenotypeMatrix:
     """Diploid genotype matrix with values 0 (hom ref), 1 (het), 2 (hom alt).
@@ -28,7 +30,8 @@ class GenotypeMatrix:
     """
 
     def __init__(self, genotypes, positions, chrom_start=None, chrom_end=None,
-                 sample_sets=None, n_total_sites=None, samples=None):
+                 sample_sets=None, n_total_sites=None, samples=None,
+                 accessible_mask=None):
         if genotypes.size == 0:
             raise ValueError("genotypes cannot be empty")
         if positions.size == 0:
@@ -43,13 +46,71 @@ class GenotypeMatrix:
             if isinstance(positions, cp.ndarray):
                 positions = positions.get()
 
-        self.genotypes = genotypes
-        self.positions = positions
+        self._genotypes = genotypes
+        self._positions = positions
+        self._accessible_idx = None
+        self._geno_filtered = None
+        self._pos_filtered = None
+        self._accessible_mask = None
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
         self.n_total_sites = n_total_sites
         self.samples = samples
+
+        if accessible_mask is not None and not isinstance(accessible_mask, AccessibleMask):
+            accessible_mask = resolve_accessible_mask(
+                accessible_mask, chrom_start, chrom_end)
+        self.accessible_mask = accessible_mask
+        if self._accessible_mask is not None and self.n_total_sites is None:
+            self.n_total_sites = self._accessible_mask.total_accessible
+
+    @property
+    def genotypes(self):
+        if self._accessible_idx is None:
+            return self._genotypes
+        if self._geno_filtered is None:
+            self._geno_filtered = self._genotypes[:, self._accessible_idx]
+        return self._geno_filtered
+
+    @genotypes.setter
+    def genotypes(self, value):
+        self._genotypes = value
+        self._geno_filtered = None
+
+    @property
+    def positions(self):
+        if self._accessible_idx is None:
+            return self._positions
+        if self._pos_filtered is None:
+            self._pos_filtered = self._positions[self._accessible_idx]
+        return self._pos_filtered
+
+    @positions.setter
+    def positions(self, value):
+        self._positions = value
+        self._pos_filtered = None
+
+    @property
+    def accessible_mask(self):
+        return self._accessible_mask
+
+    @accessible_mask.setter
+    def accessible_mask(self, mask):
+        self._accessible_mask = mask
+        if mask is not None:
+            pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
+                else np.asarray(self._positions)
+            keep = mask.is_accessible_at(pos.astype(int))
+            if keep.all():
+                self._accessible_idx = None
+            else:
+                xp = cp if self._device == 'GPU' else np
+                self._accessible_idx = xp.asarray(np.where(keep)[0])
+        else:
+            self._accessible_idx = None
+        self._geno_filtered = None
+        self._pos_filtered = None
 
     @property
     def device(self):
@@ -76,6 +137,37 @@ class GenotypeMatrix:
     @property
     def num_individuals(self):
         return self.genotypes.shape[0]
+
+    @property
+    def has_accessible_mask(self):
+        """Whether an accessible site mask is attached."""
+        return self.accessible_mask is not None
+
+    def set_accessible_mask(self, mask_or_path, chrom=None):
+        """Attach an accessible site mask (non-destructive).
+
+        Returns self for chaining.
+
+        Parameters
+        ----------
+        mask_or_path : str, path-like, numpy.ndarray, or AccessibleMask
+            BED file path, boolean array, or AccessibleMask instance.
+        chrom : str, optional
+            Chromosome name (required for BED file input).
+        """
+        self.accessible_mask = resolve_accessible_mask(
+            mask_or_path, self.chrom_start, self.chrom_end, chrom)
+        self.n_total_sites = self.accessible_mask.total_accessible
+        return self
+
+    def remove_accessible_mask(self):
+        """Remove the accessible mask, restoring all original variants.
+
+        Returns self for chaining.
+        """
+        self.accessible_mask = None
+        self.n_total_sites = None
+        return self
 
     @property
     def has_invariant_info(self):
@@ -106,14 +198,22 @@ class GenotypeMatrix:
 
     def transfer_to_gpu(self):
         if self._device == 'CPU':
-            self.genotypes = cp.asarray(self.genotypes)
-            self.positions = cp.asarray(self.positions)
+            self._genotypes = cp.asarray(self._genotypes)
+            self._positions = cp.asarray(self._positions)
+            if self._accessible_idx is not None:
+                self._accessible_idx = cp.asarray(self._accessible_idx)
+            self._geno_filtered = None
+            self._pos_filtered = None
             self._device = 'GPU'
 
     def transfer_to_cpu(self):
         if self._device == 'GPU':
-            self.genotypes = np.asarray(self.genotypes.get())
-            self.positions = np.asarray(self.positions.get())
+            self._genotypes = np.asarray(self._genotypes.get())
+            self._positions = np.asarray(self._positions.get())
+            if self._accessible_idx is not None:
+                self._accessible_idx = np.asarray(self._accessible_idx.get())
+            self._geno_filtered = None
+            self._pos_filtered = None
             self._device = 'CPU'
 
     @classmethod
@@ -165,7 +265,8 @@ class GenotypeMatrix:
 
         return cls(geno, hap_matrix.positions, hap_matrix.chrom_start,
                    hap_matrix.chrom_end, sample_sets=new_sample_sets,
-                   n_total_sites=hap_matrix.n_total_sites)
+                   n_total_sites=hap_matrix.n_total_sites,
+                   accessible_mask=hap_matrix.accessible_mask)
 
     def to_haplotype_matrix(self):
         """Convert back to HaplotypeMatrix (expand diploid to haploid).
@@ -199,10 +300,11 @@ class GenotypeMatrix:
 
         return HaplotypeMatrix(hap, self.positions, self.chrom_start,
                                self.chrom_end,
-                               n_total_sites=self.n_total_sites)
+                               n_total_sites=self.n_total_sites,
+                               accessible_mask=self.accessible_mask)
 
     @classmethod
-    def from_vcf(cls, path, include_invariant=False):
+    def from_vcf(cls, path, include_invariant=False, accessible_bed=None):
         """Construct from a VCF file.
 
         Parameters
@@ -211,6 +313,8 @@ class GenotypeMatrix:
             Path to VCF file.
         include_invariant : bool
             If True, include invariant sites and set n_total_sites.
+        accessible_bed : str, optional
+            Path to a BED file defining accessible/callable regions.
 
         Returns
         -------
@@ -240,8 +344,14 @@ class GenotypeMatrix:
         geno = geno.T
 
         n_total_sites = geno.shape[1] if include_invariant else None
-        return cls(geno, pos, chrom_start=pos[0], chrom_end=pos[-1],
-                   n_total_sites=n_total_sites, samples=samples)
+        gm = cls(geno, pos, chrom_start=pos[0], chrom_end=pos[-1],
+                 n_total_sites=n_total_sites, samples=samples)
+        if accessible_bed is not None:
+            chrom = None
+            if 'variants/CHROM' in callset:
+                chrom = callset['variants/CHROM'][0]
+            gm.set_accessible_mask(accessible_bed, chrom=chrom)
+        return gm
 
     def load_pop_file(self, pop_file, pops=None):
         """Load population assignments from a tab-delimited file.
@@ -306,4 +416,5 @@ class GenotypeMatrix:
                               self.chrom_start, self.chrom_end,
                               sample_sets=self._sample_sets,
                               n_total_sites=self.n_total_sites,
-                              samples=self.samples)
+                              samples=self.samples,
+                              accessible_mask=self.accessible_mask)

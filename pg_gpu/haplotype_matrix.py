@@ -4,6 +4,8 @@ import allel
 import tskit
 from collections import Counter, OrderedDict
 
+from .accessible import AccessibleMask, bed_to_mask, resolve_accessible_mask
+
 
 class HaplotypeMatrix:
     """
@@ -29,6 +31,7 @@ class HaplotypeMatrix:
                  sample_sets: dict = None,
                  n_total_sites: int = None,
                  samples: list = None,
+                 accessible_mask=None,
                 ):
         if genotypes.size == 0:
             raise ValueError("genotypes cannot be empty")
@@ -48,13 +51,71 @@ class HaplotypeMatrix:
             if isinstance(positions, cp.ndarray):
                 positions = positions.get()
 
-        self.haplotypes = genotypes
-        self.positions = positions
+        self._haplotypes = genotypes
+        self._positions = positions
+        self._accessible_idx = None
+        self._hap_filtered = None
+        self._pos_filtered = None
+        self._accessible_mask = None
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
         self.n_total_sites = n_total_sites
         self.samples = samples  # diploid sample names from VCF
+
+        if accessible_mask is not None and not isinstance(accessible_mask, AccessibleMask):
+            accessible_mask = resolve_accessible_mask(
+                accessible_mask, chrom_start, chrom_end)
+        self.accessible_mask = accessible_mask
+        if self._accessible_mask is not None and self.n_total_sites is None:
+            self.n_total_sites = self._accessible_mask.total_accessible
+
+    @property
+    def haplotypes(self):
+        if self._accessible_idx is None:
+            return self._haplotypes
+        if self._hap_filtered is None:
+            self._hap_filtered = self._haplotypes[:, self._accessible_idx]
+        return self._hap_filtered
+
+    @haplotypes.setter
+    def haplotypes(self, value):
+        self._haplotypes = value
+        self._hap_filtered = None
+
+    @property
+    def positions(self):
+        if self._accessible_idx is None:
+            return self._positions
+        if self._pos_filtered is None:
+            self._pos_filtered = self._positions[self._accessible_idx]
+        return self._pos_filtered
+
+    @positions.setter
+    def positions(self, value):
+        self._positions = value
+        self._pos_filtered = None
+
+    @property
+    def accessible_mask(self):
+        return self._accessible_mask
+
+    @accessible_mask.setter
+    def accessible_mask(self, mask):
+        self._accessible_mask = mask
+        if mask is not None:
+            pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
+                else np.asarray(self._positions)
+            keep = mask.is_accessible_at(pos.astype(int))
+            if keep.all():
+                self._accessible_idx = None
+            else:
+                xp = cp if self._device == 'GPU' else np
+                self._accessible_idx = xp.asarray(np.where(keep)[0])
+        else:
+            self._accessible_idx = None
+        self._hap_filtered = None
+        self._pos_filtered = None
 
     @property
     def device(self):
@@ -90,6 +151,49 @@ class HaplotypeMatrix:
         self._sample_sets = sample_sets
 
     @property
+    def has_accessible_mask(self):
+        """Whether an accessible site mask is attached."""
+        return self.accessible_mask is not None
+
+    def set_accessible_mask(self, mask_or_path, chrom=None):
+        """Attach an accessible site mask (non-destructive).
+
+        The mask filters which variants are visible through the haplotypes
+        and positions properties. Original data is preserved and a different
+        mask can be applied later. Returns self for chaining.
+
+        Parameters
+        ----------
+        mask_or_path : str, path-like, numpy.ndarray, or AccessibleMask
+            If a string/path, treated as a BED file path defining accessible
+            regions. If an ndarray, wrapped as an AccessibleMask with offset
+            equal to chrom_start. If already an AccessibleMask, assigned
+            directly.
+        chrom : str, optional
+            Chromosome name to extract from the BED file. Required when
+            mask_or_path is a BED file path.
+
+        Returns
+        -------
+        self
+            For method chaining.
+        """
+        # The property setter handles _accessible_idx and cache invalidation
+        self.accessible_mask = resolve_accessible_mask(
+            mask_or_path, self.chrom_start, self.chrom_end, chrom)
+        self.n_total_sites = self.accessible_mask.total_accessible
+        return self
+
+    def remove_accessible_mask(self):
+        """Remove the accessible mask, restoring all original variants.
+
+        Returns self for chaining.
+        """
+        self.accessible_mask = None  # setter clears _accessible_idx and caches
+        self.n_total_sites = None
+        return self
+
+    @property
     def has_invariant_info(self):
         """Whether invariant site information is available for pairwise mode."""
         return self.n_total_sites is not None
@@ -118,20 +222,29 @@ class HaplotypeMatrix:
     def transfer_to_gpu(self):
         """Transfer data from CPU to GPU."""
         if self.device == 'CPU':
-            self.haplotypes = cp.asarray(self.haplotypes)
-            self.positions = cp.asarray(self.positions)
+            self._haplotypes = cp.asarray(self._haplotypes)
+            self._positions = cp.asarray(self._positions)
+            if self._accessible_idx is not None:
+                self._accessible_idx = cp.asarray(self._accessible_idx)
+            self._hap_filtered = None
+            self._pos_filtered = None
             self._device = 'GPU'
 
     def transfer_to_cpu(self):
         """Transfer data from GPU to CPU."""
         if self.device == 'GPU':
-            self.haplotypes = np.asarray(self.haplotypes.get())
-            self.positions = np.asarray(self.positions.get())
+            self._haplotypes = np.asarray(self._haplotypes.get())
+            self._positions = np.asarray(self._positions.get())
+            if self._accessible_idx is not None:
+                self._accessible_idx = np.asarray(self._accessible_idx.get())
+            self._hap_filtered = None
+            self._pos_filtered = None
             self._device = 'CPU'
 
     @classmethod
     def from_vcf(cls, path: str, region: str = None,
-                 samples: list = None, include_invariant: bool = False):
+                 samples: list = None, include_invariant: bool = False,
+                 accessible_bed: str = None):
         """Construct a HaplotypeMatrix from a VCF file.
 
         Parameters
@@ -145,6 +258,8 @@ class HaplotypeMatrix:
             Subset of samples to load. If None, loads all samples.
         include_invariant : bool
             If True, set n_total_sites from the loaded variant count.
+        accessible_bed : str, optional
+            Path to a BED file defining accessible/callable regions.
 
         Returns
         -------
@@ -169,11 +284,21 @@ class HaplotypeMatrix:
         sample_names = list(vcf['samples'])
 
         n_total_sites = num_variants if include_invariant else None
-        return cls(haplotypes, positions, positions[0], positions[-1],
-                   n_total_sites=n_total_sites, samples=sample_names)
+        hm = cls(haplotypes, positions, positions[0], positions[-1],
+                 n_total_sites=n_total_sites, samples=sample_names)
+        if accessible_bed is not None:
+            # Extract chrom from region string or VCF data
+            chrom = None
+            if region is not None:
+                chrom = region.split(':')[0]
+            elif 'variants/CHROM' in vcf:
+                chrom = vcf['variants/CHROM'][0]
+            hm.set_accessible_mask(accessible_bed, chrom=chrom)
+        return hm
 
     @classmethod
-    def from_zarr(cls, path: str, region: str = None):
+    def from_zarr(cls, path: str, region: str = None,
+                  accessible_bed: str = None):
         """Construct a HaplotypeMatrix from a Zarr store.
 
         Zarr provides fast columnar access, especially for large datasets.
@@ -186,6 +311,8 @@ class HaplotypeMatrix:
             Path to Zarr store directory.
         region : str, optional
             Genomic region 'chrom:start-end' to load a subset.
+        accessible_bed : str, optional
+            Path to a BED file defining accessible/callable regions.
 
         Returns
         -------
@@ -199,8 +326,9 @@ class HaplotypeMatrix:
         sample_names = list(store['samples']) if 'samples' in store else None
 
         # Apply region filter if specified
+        chrom = None
         if region is not None:
-            chrom_str, coords = region.split(':')
+            chrom, coords = region.split(':')
             start, end = [int(x) for x in coords.split('-')]
             mask = (positions >= start) & (positions < end)
             positions = positions[mask]
@@ -216,8 +344,11 @@ class HaplotypeMatrix:
         haplotypes[:, num_samples:] = gt[:, :, 1]
         haplotypes = haplotypes.T
 
-        return cls(haplotypes, positions, positions[0], positions[-1],
-                   samples=sample_names)
+        hm = cls(haplotypes, positions, positions[0], positions[-1],
+                 samples=sample_names)
+        if accessible_bed is not None:
+            hm.set_accessible_mask(accessible_bed, chrom=chrom)
+        return hm
 
     def to_zarr(self, zarr_path: str):
         """Save haplotype data to Zarr format for fast reloading.
@@ -290,7 +421,9 @@ class HaplotypeMatrix:
 
     @classmethod
     def from_ts(cls, ts: tskit.TreeSequence, device: str = 'CPU',
-                include_invariant: bool = False) -> 'HaplotypeMatrix':
+                include_invariant: bool = False,
+                accessible_bed: str = None,
+                chrom: str = None) -> 'HaplotypeMatrix':
         """
         Create a HaplotypeMatrix from a tskit.TreeSequence.
 
@@ -300,6 +433,8 @@ class HaplotypeMatrix:
             include_invariant: If True, set n_total_sites from the sequence
                 length so that pairwise-mode calculations can account for
                 invariant sites analytically (no extra rows stored).
+            accessible_bed: Path to a BED file defining accessible regions.
+            chrom: Chromosome name for BED file filtering.
 
         Returns:
             HaplotypeMatrix: A new HaplotypeMatrix instance
@@ -316,8 +451,11 @@ class HaplotypeMatrix:
             positions = cp.array(positions)
 
         n_total_sites = int(ts.sequence_length) if include_invariant else None
-        return cls(haplotypes, positions, chrom_start, chrom_end,
-                   n_total_sites=n_total_sites)
+        hm = cls(haplotypes, positions, chrom_start, chrom_end,
+                 n_total_sites=n_total_sites)
+        if accessible_bed is not None:
+            hm.set_accessible_mask(accessible_bed, chrom=chrom)
+        return hm
 
     def get_matrix(self) -> cp.ndarray:
         """
@@ -404,15 +542,20 @@ class HaplotypeMatrix:
                 empty_haplotypes = np.empty((self.haplotypes.shape[0], 0), dtype=self.haplotypes.dtype)
                 empty_positions = np.array([], dtype=self.positions.dtype)
 
-            # For empty subsets, bypass constructor validation by setting size to non-zero temporarily
+            # For empty subsets, bypass constructor validation
             result = object.__new__(HaplotypeMatrix)
-            result.haplotypes = empty_haplotypes
-            result.positions = empty_positions
+            result._haplotypes = empty_haplotypes
+            result._positions = empty_positions
+            result._accessible_idx = None
+            result._hap_filtered = None
+            result._pos_filtered = None
             result.chrom_start = self.chrom_start
             result.chrom_end = self.chrom_end
             result._sample_sets = self._sample_sets
             result._device = self._device
-            result.n_total_sites = None
+            result.n_total_sites = self.n_total_sites
+            result.accessible_mask = None
+            result.samples = self.samples
             return result
 
         if not (positions >= 0).all() or not (positions < self.haplotypes.shape[1]).all():
@@ -422,10 +565,12 @@ class HaplotypeMatrix:
         subset_positions = self.positions[positions]
 
         # Create and return a new instance, maintaining the device state and sample sets.
+        # Don't propagate accessible_mask -- child data is already filtered.
         return HaplotypeMatrix(
             subset_haplotypes,
             subset_positions,
-            sample_sets=self._sample_sets
+            sample_sets=self._sample_sets,
+            n_total_sites=self.n_total_sites,
         )
 
     def get_subset_from_range(self, low: int, high: int) -> "HaplotypeMatrix":
@@ -448,12 +593,16 @@ class HaplotypeMatrix:
         indices = cp.where((positions >= low) & (positions < high))[0] if self.device == 'GPU' else np.where((positions >= low) & (positions < high))[0]
 
         # Create the subset of haplotypes based on the found indices
+        sliced_mask = None
+        if self.accessible_mask is not None:
+            sliced_mask = self.accessible_mask.slice(low, high)
         return HaplotypeMatrix(
             self.haplotypes[:, indices],
             self.positions[indices],
             chrom_start=low,
             chrom_end=high,
-            sample_sets=self._sample_sets
+            sample_sets=self._sample_sets,
+            accessible_mask=sliced_mask,
         )
 
     def apply_biallelic_filter(self) -> "HaplotypeMatrix":
@@ -515,7 +664,9 @@ class HaplotypeMatrix:
             filtered_positions,
             chrom_start=new_chrom_start,
             chrom_end=new_chrom_end,
-            sample_sets=self._sample_sets
+            sample_sets=self._sample_sets,
+            n_total_sites=self.n_total_sites,
+            accessible_mask=self.accessible_mask,
         )
 
         return filtered_matrix
@@ -616,12 +767,21 @@ class HaplotypeMatrix:
             'total' - Use total genomic span (chrom_end - chrom_start)
             'sites' - Use number of variant sites
             'callable' - Use span from first to last variant position
+            'accessible' - Use number of accessible sites from mask
 
         Returns
         -------
         span : int
             The span to use for normalization
         """
+        if span_denominator == 'accessible':
+            if self.accessible_mask is not None:
+                start = self.chrom_start if self.chrom_start is not None else 0
+                end = self.chrom_end if self.chrom_end is not None else start
+                return self.accessible_mask.count_accessible(start, end)
+            # Fall back to total if no mask
+            span_denominator = 'total'
+
         if span_denominator == 'total':
             if self.chrom_start is not None and self.chrom_end is not None:
                 return self.chrom_end - self.chrom_start
