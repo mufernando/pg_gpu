@@ -1,5 +1,14 @@
 # pg_gpu - GPU-accelerated population genetics statistics
 
+try:
+    import cupy as cp
+    cp.cuda.runtime.getDeviceCount()
+except Exception as e:
+    raise RuntimeError(
+        "pg_gpu requires a CUDA-capable GPU and CuPy installed with "
+        "working CUDA drivers. No usable GPU was detected."
+    ) from e
+
 from . import ld_statistics
 from . import diversity
 from . import divergence
