@@ -46,22 +46,49 @@ class GenotypeMatrix:
             if isinstance(positions, cp.ndarray):
                 positions = positions.get()
 
-        self.genotypes = genotypes
-        self.positions = positions
+        self._genotypes = genotypes
+        self._positions = positions
+        self._accessible_idx = None
+        self._geno_filtered = None
+        self._pos_filtered = None
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
         self.n_total_sites = n_total_sites
         self.samples = samples
 
-        # Accessible site mask
         if accessible_mask is not None and not isinstance(accessible_mask, AccessibleMask):
             accessible_mask = resolve_accessible_mask(
                 accessible_mask, chrom_start, chrom_end)
         self.accessible_mask = accessible_mask
-        self._filtered_cache = None
         if self.accessible_mask is not None and self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
+
+    @property
+    def genotypes(self):
+        if self._accessible_idx is None:
+            return self._genotypes
+        if self._geno_filtered is None:
+            self._geno_filtered = self._genotypes[:, self._accessible_idx]
+        return self._geno_filtered
+
+    @genotypes.setter
+    def genotypes(self, value):
+        self._genotypes = value
+        self._geno_filtered = None
+
+    @property
+    def positions(self):
+        if self._accessible_idx is None:
+            return self._positions
+        if self._pos_filtered is None:
+            self._pos_filtered = self._positions[self._accessible_idx]
+        return self._pos_filtered
+
+    @positions.setter
+    def positions(self, value):
+        self._positions = value
+        self._pos_filtered = None
 
     @property
     def device(self):
@@ -95,7 +122,9 @@ class GenotypeMatrix:
         return self.accessible_mask is not None
 
     def set_accessible_mask(self, mask_or_path, chrom=None):
-        """Attach an accessible site mask and filter out inaccessible variants.
+        """Attach an accessible site mask (non-destructive).
+
+        Returns self for chaining.
 
         Parameters
         ----------
@@ -106,58 +135,24 @@ class GenotypeMatrix:
         """
         self.accessible_mask = resolve_accessible_mask(
             mask_or_path, self.chrom_start, self.chrom_end, chrom)
-        self._filtered_cache = None
         if self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
-        # Filter variants at inaccessible positions immediately
-        pos = self.positions.get() if self.device == 'GPU' \
-            else np.asarray(self.positions)
+        pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
+            else np.asarray(self._positions)
         keep = self.accessible_mask.is_accessible_at(pos.astype(int))
-        if not keep.all():
+        if keep.all():
+            self._accessible_idx = None
+        else:
             xp = cp if self.device == 'GPU' else np
-            keep_idx = xp.asarray(np.where(keep)[0])
-            self.genotypes = self.genotypes[:, keep_idx]
-            self.positions = self.positions[keep_idx]
+            self._accessible_idx = xp.asarray(np.where(keep)[0])
+        self._geno_filtered = None
+        self._pos_filtered = None
+        return self
 
     @property
     def has_invariant_info(self):
         """Whether invariant site information is available for pairwise mode."""
         return self.n_total_sites is not None
-
-    def filter_to_accessible(self):
-        """Return a matrix with variants at inaccessible positions removed.
-
-        Returns self if no mask is set or all variants are accessible.
-        Result is cached so repeated calls are O(1).
-
-        Returns
-        -------
-        GenotypeMatrix
-            Filtered matrix (or self if no mask).
-        """
-        if self.accessible_mask is None:
-            return self
-        if self._filtered_cache is not None:
-            return self._filtered_cache
-        pos = self.positions.get() if self.device == 'GPU' \
-            else np.asarray(self.positions)
-        keep = self.accessible_mask.is_accessible_at(pos.astype(int))
-        if keep.all():
-            self._filtered_cache = self
-            return self
-        xp = cp if self.device == 'GPU' else np
-        keep_idx = xp.asarray(np.where(keep)[0])
-        # Clear mask on filtered result so downstream calls short-circuit
-        self._filtered_cache = GenotypeMatrix(
-            self.genotypes[:, keep_idx],
-            self.positions[keep_idx],
-            chrom_start=self.chrom_start,
-            chrom_end=self.chrom_end,
-            sample_sets=self._sample_sets,
-            n_total_sites=self.n_total_sites,
-            samples=self.samples,
-        )
-        return self._filtered_cache
 
     @property
     def n_invariant_sites(self):
@@ -183,14 +178,22 @@ class GenotypeMatrix:
 
     def transfer_to_gpu(self):
         if self._device == 'CPU':
-            self.genotypes = cp.asarray(self.genotypes)
-            self.positions = cp.asarray(self.positions)
+            self._genotypes = cp.asarray(self._genotypes)
+            self._positions = cp.asarray(self._positions)
+            if self._accessible_idx is not None:
+                self._accessible_idx = cp.asarray(self._accessible_idx)
+            self._geno_filtered = None
+            self._pos_filtered = None
             self._device = 'GPU'
 
     def transfer_to_cpu(self):
         if self._device == 'GPU':
-            self.genotypes = np.asarray(self.genotypes.get())
-            self.positions = np.asarray(self.positions.get())
+            self._genotypes = np.asarray(self._genotypes.get())
+            self._positions = np.asarray(self._positions.get())
+            if self._accessible_idx is not None:
+                self._accessible_idx = np.asarray(self._accessible_idx.get())
+            self._geno_filtered = None
+            self._pos_filtered = None
             self._device = 'CPU'
 
     @classmethod

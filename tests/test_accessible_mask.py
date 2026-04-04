@@ -283,14 +283,14 @@ class TestHaplotypeMatrixAccessibleMask:
         span = hm.get_span('accessible')
         assert span == hm.get_span('total')
 
-    def test_get_subset_propagates_mask(self):
+    def test_get_subset_no_mask_propagation(self):
+        """get_subset creates child from filtered view, no mask on child."""
         mask = np.ones(1000, dtype=bool)
         hm = _make_haplotype_matrix()
         hm.set_accessible_mask(mask)
         indices = np.array([0, 1, 2])
         subset = hm.get_subset(indices)
-        assert subset.has_accessible_mask
-        assert subset.accessible_mask is hm.accessible_mask
+        assert not subset.has_accessible_mask
 
     def test_get_subset_propagates_n_total_sites(self):
         hm = _make_haplotype_matrix()
@@ -299,14 +299,11 @@ class TestHaplotypeMatrixAccessibleMask:
         subset = hm.get_subset(indices)
         assert subset.n_total_sites == 5000
 
-    def test_get_subset_empty_propagates(self):
-        mask = np.ones(1000, dtype=bool)
+    def test_get_subset_empty(self):
         hm = _make_haplotype_matrix()
-        hm.set_accessible_mask(mask)
         hm.n_total_sites = 999
         indices = np.array([], dtype=np.int64)
         subset = hm.get_subset(indices)
-        assert subset.has_accessible_mask
         assert subset.n_total_sites == 999
 
     def test_get_subset_from_range_slices_mask(self):
@@ -376,8 +373,8 @@ class TestPopulationMatrixPropagation:
         mask = np.ones(1000, dtype=bool)
         hm.set_accessible_mask(mask)
         pop_hm = get_population_matrix(hm, 'pop1')
-        assert pop_hm.has_accessible_mask
-        assert pop_hm.accessible_mask is hm.accessible_mask
+        # Population subset gets filtered data, no mask propagation
+        assert not pop_hm.has_accessible_mask
         assert pop_hm.n_total_sites == hm.n_total_sites
 
 
@@ -414,50 +411,60 @@ class TestBackwardCompatibility:
 
 # ---- filter_to_accessible tests ----
 
-class TestFilterToAccessible:
-    def test_no_mask_returns_self(self):
+class TestPropertyBasedFiltering:
+    def test_no_mask_returns_raw(self):
         hm = _make_haplotype_matrix()
-        assert hm.filter_to_accessible() is hm
+        assert hm.haplotypes is hm._haplotypes
 
-    def test_all_accessible_returns_self(self):
-        hm = _make_haplotype_matrix()
-        mask = np.ones(1000, dtype=bool)
-        hm.set_accessible_mask(mask)
-        assert hm.filter_to_accessible() is hm
-
-    def test_set_accessible_mask_filters_immediately(self):
-        """set_accessible_mask filters variants at inaccessible positions."""
+    def test_mask_filters_via_property(self):
+        """haplotypes property returns filtered view when mask is set."""
         rng = np.random.RandomState(42)
         n_var = 50
         hap = rng.randint(0, 2, size=(10, n_var)).astype(np.int8)
-        pos = np.arange(100, 100 + n_var * 10, 10)  # 100, 110, ..., 590
+        pos = np.arange(100, 100 + n_var * 10, 10)
         hm = HaplotypeMatrix(hap, pos, chrom_start=0, chrom_end=600)
         original_nvar = hm.num_variants
-        # Mark positions 200-400 as inaccessible
         mask = np.ones(600, dtype=bool)
         mask[200:400] = False
         hm.set_accessible_mask(mask)
 
-        # Variants should be filtered immediately
         assert hm.num_variants < original_nvar
         for p in hm.positions:
             assert int(p) < 200 or int(p) >= 400
-        # Mask retained for span normalization
+        # Original data preserved
+        assert hm._haplotypes.shape[1] == original_nvar
         assert hm.has_accessible_mask
 
-    def test_filter_to_accessible_noop_after_set(self):
-        """filter_to_accessible is a no-op after set_accessible_mask."""
-        rng = np.random.RandomState(42)
-        hap = rng.randint(0, 2, size=(10, 50)).astype(np.int8)
-        pos = np.arange(100, 600, 10)
-        hm = HaplotypeMatrix(hap, pos, chrom_start=0, chrom_end=600)
-        mask = np.ones(600, dtype=bool)
-        mask[200:400] = False
-        hm.set_accessible_mask(mask)
-        # filter_to_accessible should return self (already filtered)
-        assert hm.filter_to_accessible() is hm
+    def test_set_mask_returns_self(self):
+        hm = _make_haplotype_matrix()
+        mask = np.ones(1000, dtype=bool)
+        result = hm.set_accessible_mask(mask)
+        assert result is hm
 
-    def test_genotype_matrix_set_mask_filters(self):
+    def test_replace_mask(self):
+        """Calling set_accessible_mask twice re-filters from original."""
+        rng = np.random.RandomState(42)
+        hap = rng.randint(0, 2, size=(10, 100)).astype(np.int8)
+        pos = np.arange(0, 1000, 10)  # 0, 10, 20, ..., 990
+        hm = HaplotypeMatrix(hap, pos, chrom_start=0, chrom_end=1000)
+
+        # Mask 1: block out 200-800 (keep ~40 of 100 variants)
+        mask1 = np.ones(1000, dtype=bool)
+        mask1[200:800] = False
+        hm.set_accessible_mask(mask1)
+        n1 = hm.num_variants
+
+        # Mask 2: block out only 100-200 (keep ~90 of 100 variants)
+        mask2 = np.ones(1000, dtype=bool)
+        mask2[100:200] = False
+        hm.set_accessible_mask(mask2)
+        n2 = hm.num_variants
+
+        # Different masks, different filtered counts, original preserved
+        assert n1 < n2
+        assert hm._haplotypes.shape[1] == 100
+
+    def test_genotype_matrix_property_filtering(self):
         rng = np.random.RandomState(42)
         geno = rng.randint(0, 3, size=(5, 30)).astype(np.int8)
         pos = np.arange(10, 310, 10)
@@ -469,6 +476,7 @@ class TestFilterToAccessible:
         assert gm.num_variants < original_nvar
         for p in gm.positions:
             assert int(p) < 100 or int(p) >= 200
+        assert gm._genotypes.shape[1] == original_nvar
 
 
 # ---- Windowed analysis integration tests ----
@@ -604,13 +612,9 @@ class TestPairwiseModeWithMask:
         windows = list(iterator)
         assert len(windows) >= 2
 
-        # First window [100, 5100): fully accessible
-        w1 = windows[0]
-        assert w1.matrix.has_accessible_mask
-
         # Second window should have fewer accessible sites due to mask
+        w1 = windows[0]
         w2 = windows[1]
-        assert w2.matrix.has_accessible_mask
         assert w2.matrix.n_total_sites < w1.matrix.n_total_sites
 
 

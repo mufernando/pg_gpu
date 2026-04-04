@@ -51,23 +51,49 @@ class HaplotypeMatrix:
             if isinstance(positions, cp.ndarray):
                 positions = positions.get()
 
-        self.haplotypes = genotypes
-        self.positions = positions
+        self._haplotypes = genotypes
+        self._positions = positions
+        self._accessible_idx = None
+        self._hap_filtered = None
+        self._pos_filtered = None
         self.chrom_start = chrom_start
         self.chrom_end = chrom_end
         self._sample_sets = sample_sets
         self.n_total_sites = n_total_sites
         self.samples = samples  # diploid sample names from VCF
 
-        # Accessible site mask (internal use only -- use set_accessible_mask
-        # for user-facing mask attachment which also filters variants)
         if accessible_mask is not None and not isinstance(accessible_mask, AccessibleMask):
             accessible_mask = resolve_accessible_mask(
                 accessible_mask, chrom_start, chrom_end)
         self.accessible_mask = accessible_mask
-        self._filtered_cache = None
         if self.accessible_mask is not None and self.n_total_sites is None:
             self.n_total_sites = self.accessible_mask.total_accessible
+
+    @property
+    def haplotypes(self):
+        if self._accessible_idx is None:
+            return self._haplotypes
+        if self._hap_filtered is None:
+            self._hap_filtered = self._haplotypes[:, self._accessible_idx]
+        return self._hap_filtered
+
+    @haplotypes.setter
+    def haplotypes(self, value):
+        self._haplotypes = value
+        self._hap_filtered = None
+
+    @property
+    def positions(self):
+        if self._accessible_idx is None:
+            return self._positions
+        if self._pos_filtered is None:
+            self._pos_filtered = self._positions[self._accessible_idx]
+        return self._pos_filtered
+
+    @positions.setter
+    def positions(self, value):
+        self._positions = value
+        self._pos_filtered = None
 
     @property
     def device(self):
@@ -108,11 +134,11 @@ class HaplotypeMatrix:
         return self.accessible_mask is not None
 
     def set_accessible_mask(self, mask_or_path, chrom=None):
-        """Attach an accessible site mask and filter out inaccessible variants.
+        """Attach an accessible site mask (non-destructive).
 
-        Variants at positions not marked accessible are immediately removed.
-        The mask is retained for per-base normalization (get_span, windowed
-        analysis denominators).
+        The mask filters which variants are visible through the haplotypes
+        and positions properties. Original data is preserved and a different
+        mask can be applied later. Returns self for chaining.
 
         Parameters
         ----------
@@ -124,49 +150,28 @@ class HaplotypeMatrix:
         chrom : str, optional
             Chromosome name to extract from the BED file. Required when
             mask_or_path is a BED file path.
-        """
-        self.accessible_mask = resolve_accessible_mask(
-            mask_or_path, self.chrom_start, self.chrom_end, chrom)
-        self._filtered_cache = None
-        if self.n_total_sites is None:
-            self.n_total_sites = self.accessible_mask.total_accessible
-        # Filter variants at inaccessible positions immediately
-        pos = self.positions.get() if self.device == 'GPU' \
-            else np.asarray(self.positions)
-        keep = self.accessible_mask.is_accessible_at(pos.astype(int))
-        if not keep.all():
-            xp = cp if self.device == 'GPU' else np
-            keep_idx = xp.asarray(np.where(keep)[0])
-            self.haplotypes = self.haplotypes[:, keep_idx]
-            self.positions = self.positions[keep_idx]
-
-    def filter_to_accessible(self):
-        """Return a matrix with variants at inaccessible positions removed.
-
-        Returns self if no mask is set or all variants are accessible.
-        Result is cached so repeated calls are O(1).
 
         Returns
         -------
-        HaplotypeMatrix
-            Filtered matrix (or self if no mask).
+        self
+            For method chaining.
         """
-        if self.accessible_mask is None:
-            return self
-        if self._filtered_cache is not None:
-            return self._filtered_cache
-        pos = self.positions.get() if self.device == 'GPU' \
-            else np.asarray(self.positions)
+        self.accessible_mask = resolve_accessible_mask(
+            mask_or_path, self.chrom_start, self.chrom_end, chrom)
+        if self.n_total_sites is None:
+            self.n_total_sites = self.accessible_mask.total_accessible
+        # Compute index of accessible variants from the ORIGINAL positions
+        pos = self._positions.get() if isinstance(self._positions, cp.ndarray) \
+            else np.asarray(self._positions)
         keep = self.accessible_mask.is_accessible_at(pos.astype(int))
         if keep.all():
-            self._filtered_cache = self
-            return self
-        xp = cp if self.device == 'GPU' else np
-        result = self.get_subset(xp.asarray(np.where(keep)[0]))
-        # Clear mask on filtered result so downstream calls short-circuit
-        result.accessible_mask = None
-        self._filtered_cache = result
-        return self._filtered_cache
+            self._accessible_idx = None
+        else:
+            xp = cp if self.device == 'GPU' else np
+            self._accessible_idx = xp.asarray(np.where(keep)[0])
+        self._hap_filtered = None
+        self._pos_filtered = None
+        return self
 
     @property
     def has_invariant_info(self):
@@ -197,18 +202,24 @@ class HaplotypeMatrix:
     def transfer_to_gpu(self):
         """Transfer data from CPU to GPU."""
         if self.device == 'CPU':
-            self.haplotypes = cp.asarray(self.haplotypes)
-            self.positions = cp.asarray(self.positions)
+            self._haplotypes = cp.asarray(self._haplotypes)
+            self._positions = cp.asarray(self._positions)
+            if self._accessible_idx is not None:
+                self._accessible_idx = cp.asarray(self._accessible_idx)
+            self._hap_filtered = None
+            self._pos_filtered = None
             self._device = 'GPU'
-            self._filtered_cache = None
 
     def transfer_to_cpu(self):
         """Transfer data from GPU to CPU."""
         if self.device == 'GPU':
-            self.haplotypes = np.asarray(self.haplotypes.get())
-            self.positions = np.asarray(self.positions.get())
+            self._haplotypes = np.asarray(self._haplotypes.get())
+            self._positions = np.asarray(self._positions.get())
+            if self._accessible_idx is not None:
+                self._accessible_idx = np.asarray(self._accessible_idx.get())
+            self._hap_filtered = None
+            self._pos_filtered = None
             self._device = 'CPU'
-            self._filtered_cache = None
 
     @classmethod
     def from_vcf(cls, path: str, region: str = None,
@@ -509,17 +520,19 @@ class HaplotypeMatrix:
                 empty_haplotypes = np.empty((self.haplotypes.shape[0], 0), dtype=self.haplotypes.dtype)
                 empty_positions = np.array([], dtype=self.positions.dtype)
 
-            # For empty subsets, bypass constructor validation by setting size to non-zero temporarily
+            # For empty subsets, bypass constructor validation
             result = object.__new__(HaplotypeMatrix)
-            result.haplotypes = empty_haplotypes
-            result.positions = empty_positions
+            result._haplotypes = empty_haplotypes
+            result._positions = empty_positions
+            result._accessible_idx = None
+            result._hap_filtered = None
+            result._pos_filtered = None
             result.chrom_start = self.chrom_start
             result.chrom_end = self.chrom_end
             result._sample_sets = self._sample_sets
             result._device = self._device
             result.n_total_sites = self.n_total_sites
-            result.accessible_mask = self.accessible_mask
-            result._filtered_cache = None
+            result.accessible_mask = None
             result.samples = self.samples
             return result
 
@@ -530,12 +543,12 @@ class HaplotypeMatrix:
         subset_positions = self.positions[positions]
 
         # Create and return a new instance, maintaining the device state and sample sets.
+        # Don't propagate accessible_mask -- child data is already filtered.
         return HaplotypeMatrix(
             subset_haplotypes,
             subset_positions,
             sample_sets=self._sample_sets,
             n_total_sites=self.n_total_sites,
-            accessible_mask=self.accessible_mask,
         )
 
     def get_subset_from_range(self, low: int, high: int) -> "HaplotypeMatrix":

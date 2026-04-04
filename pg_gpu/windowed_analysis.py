@@ -53,49 +53,6 @@ def _compute_window_bases(haplotype_matrix, win_starts, win_stops,
     return we - ws
 
 
-def _filter_inaccessible_variants(matrix, haplotype_matrix, is_accessible=None):
-    """Remove variants at inaccessible positions from a matrix.
-
-    Does not mutate the input matrix. Returns a new filtered matrix or
-    the original if no filtering is needed.
-
-    Parameters
-    ----------
-    matrix : HaplotypeMatrix
-        Matrix to filter (may be a population subset).
-    haplotype_matrix : HaplotypeMatrix
-        Original matrix (checked for accessible_mask attribute).
-    is_accessible : array_like, optional
-        Explicit mask (takes precedence over matrix attribute).
-
-    Returns
-    -------
-    HaplotypeMatrix
-        Filtered matrix (or original if no filtering needed).
-    """
-    from .accessible import AccessibleMask
-
-    # Resolve which mask to use (explicit > matrix > parent)
-    if is_accessible is not None:
-        amask = AccessibleMask(np.asarray(is_accessible, dtype=bool))
-    elif matrix.has_accessible_mask:
-        amask = matrix.accessible_mask
-    elif haplotype_matrix.has_accessible_mask:
-        amask = haplotype_matrix.accessible_mask
-    else:
-        return matrix
-
-    # Check which variants are at accessible positions
-    pos_np = matrix.positions.get() if hasattr(matrix.positions, 'get') \
-        else np.asarray(matrix.positions)
-    keep = amask.is_accessible_at(pos_np.astype(int))
-    if keep.all():
-        return matrix
-
-    xp = cp if matrix.device == 'GPU' else np
-    return matrix.get_subset(xp.asarray(np.where(keep)[0]))
-
-
 @dataclass
 class WindowParams:
     """Parameters defining genomic windows."""
@@ -360,7 +317,6 @@ class StatisticsComputer:
             matrix.chrom_end,
             sample_sets={'all': list(range(len(pop_indices)))},
             n_total_sites=matrix.n_total_sites,
-            accessible_mask=matrix.accessible_mask,
         )
 
 
@@ -1245,10 +1201,6 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
 
-    if is_accessible is not None:
-        matrix = _filter_inaccessible_variants(matrix, haplotype_matrix,
-                                               is_accessible)
-
     hap_raw = matrix.haplotypes
     n_hap = hap_raw.shape[0]
     n_total_var = hap_raw.shape[1]
@@ -1829,10 +1781,6 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
 
     if matrix.device == 'CPU':
         matrix.transfer_to_gpu()
-
-    if is_accessible is not None:
-        matrix = _filter_inaccessible_variants(matrix, haplotype_matrix,
-                                               is_accessible)
 
     hap = matrix.haplotypes  # (n_haplotypes, n_variants)
     n_hap_int = hap.shape[0]
