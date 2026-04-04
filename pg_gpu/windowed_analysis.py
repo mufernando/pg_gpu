@@ -666,7 +666,8 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
                  | fused_diploshic)
     requested = set(statistics)
 
-    can_fuse = (missing_data == 'include' and requested <= fused_all)
+    can_fuse = (missing_data in ('include', 'project')
+                and requested <= fused_all)
 
     if can_fuse:
         if haplotype_matrix.device == 'CPU':
@@ -704,6 +705,7 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
             per_base=(span_denominator == 'total'),
             _win_starts=win_starts,
             _win_stops=win_stops,
+            missing_data=missing_data,
         )
         return pd.DataFrame(result_dict)
 
@@ -1104,7 +1106,8 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                               per_base: bool = True,
                               is_accessible=None,
                               _win_starts=None,
-                              _win_stops=None):
+                              _win_stops=None,
+                              missing_data='include'):
     """GPU-native windowed statistics using fused CUDA kernels.
 
     One kernel launch processes ALL windows in parallel. Each thread block
@@ -1443,6 +1446,7 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                        or need_dist)
 
         # Precompute for fused ZnS path
+        use_proj = (missing_data == 'project')
         if 'zns' in stat_arrays:
             hap = matrix.haplotypes
             hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
@@ -1455,13 +1459,15 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
 
             if 'zns' in stat_arrays:
                 stat_arrays['zns'][wi] = ld_statistics._zns_from_precomputed(
-                    hap_clean, valid_mask, s, e)
+                    hap_clean, valid_mask, s, e,
+                    use_projection=use_proj)
 
             if need_winmat:
                 win_mat = HaplotypeMatrix(matrix.haplotypes[:, s:e],
                                            matrix.positions[s:e])
                 if 'omega' in stat_arrays:
-                    stat_arrays['omega'][wi] = ld_statistics.omega(win_mat)
+                    stat_arrays['omega'][wi] = ld_statistics.omega(
+                        win_mat, missing_data=missing_data)
                 if 'mu_ld' in stat_arrays:
                     stat_arrays['mu_ld'][wi] = ld_statistics.mu_ld(win_mat)
                 if need_dist:
