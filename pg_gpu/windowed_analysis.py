@@ -1439,27 +1439,39 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
 
         stat_arrays = {s: np.full(n_windows, np.nan) for s in perwin_stats}
         need_dist = bool(perwin_stats & dist_pairwise)
+        need_winmat = ('omega' in stat_arrays or 'mu_ld' in stat_arrays
+                       or need_dist)
+
+        # Precompute for fused ZnS path
+        if 'zns' in stat_arrays:
+            hap = matrix.haplotypes
+            hap_clean = cp.where(hap >= 0, hap, 0).astype(cp.float64)
+            valid_mask = (hap >= 0).astype(cp.float64)
 
         for wi in range(n_windows):
             s, e = int(ws_np[wi]), int(we_np[wi])
             if e - s < 4:
                 continue
-            win_mat = HaplotypeMatrix(matrix.haplotypes[:, s:e],
-                                       matrix.positions[s:e])
+
             if 'zns' in stat_arrays:
-                stat_arrays['zns'][wi] = ld_statistics.zns(win_mat)
-            if 'omega' in stat_arrays:
-                stat_arrays['omega'][wi] = ld_statistics.omega(win_mat)
-            if 'mu_ld' in stat_arrays:
-                stat_arrays['mu_ld'][wi] = ld_statistics.mu_ld(win_mat)
-            if need_dist:
-                v, sk, ku = distance_stats.dist_moments(win_mat)
-                if 'dist_var' in stat_arrays:
-                    stat_arrays['dist_var'][wi] = v
-                if 'dist_skew' in stat_arrays:
-                    stat_arrays['dist_skew'][wi] = sk
-                if 'dist_kurt' in stat_arrays:
-                    stat_arrays['dist_kurt'][wi] = ku
+                stat_arrays['zns'][wi] = ld_statistics._zns_from_precomputed(
+                    hap_clean, valid_mask, s, e)
+
+            if need_winmat:
+                win_mat = HaplotypeMatrix(matrix.haplotypes[:, s:e],
+                                           matrix.positions[s:e])
+                if 'omega' in stat_arrays:
+                    stat_arrays['omega'][wi] = ld_statistics.omega(win_mat)
+                if 'mu_ld' in stat_arrays:
+                    stat_arrays['mu_ld'][wi] = ld_statistics.mu_ld(win_mat)
+                if need_dist:
+                    v, sk, ku = distance_stats.dist_moments(win_mat)
+                    if 'dist_var' in stat_arrays:
+                        stat_arrays['dist_var'][wi] = v
+                    if 'dist_skew' in stat_arrays:
+                        stat_arrays['dist_skew'][wi] = sk
+                    if 'dist_kurt' in stat_arrays:
+                        stat_arrays['dist_kurt'][wi] = ku
 
         results.update(stat_arrays)
 

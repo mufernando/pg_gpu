@@ -282,6 +282,80 @@ def _zns_tiled(mat, missing_data='include', tile_size=512):
     return total / (m * (m - 1))
 
 
+def _zns_from_precomputed(hap_clean, valid_mask, col_start, col_end,
+                          tile_size=512):
+    """Compute ZnS for a column range using precomputed arrays.
+
+    This avoids creating a HaplotypeMatrix and recomputing valid_mask/hap_clean
+    for each window in the windowed_analysis loop.
+
+    Parameters
+    ----------
+    hap_clean : cupy.ndarray, shape (n_hap, n_variants)
+        Haplotype data with missing values set to 0.
+    valid_mask : cupy.ndarray, shape (n_hap, n_variants)
+        1 where data is valid, 0 where missing.
+    col_start, col_end : int
+        Column range [col_start, col_end) to compute ZnS over.
+    tile_size : int
+        Tile size for accumulation.
+
+    Returns
+    -------
+    float
+        ZnS value, or 0.0 if fewer than 2 segregating sites.
+    """
+    hc = hap_clean[:, col_start:col_end]
+    vm = valid_mask[:, col_start:col_end]
+
+    # Filter to segregating sites
+    n_valid = cp.sum(vm, axis=0).astype(cp.float64)
+    dac = cp.sum(hc, axis=0)
+    seg = (dac > 0) & (dac < n_valid)
+    seg_idx = cp.where(seg)[0]
+    m = len(seg_idx)
+    if m < 2:
+        return 0.0
+
+    hc = hc[:, seg_idx]
+    vm = vm[:, seg_idx]
+    n_valid = n_valid[seg_idx]
+    p = cp.where(n_valid > 0, cp.sum(hc, axis=0) / n_valid, 0.0)
+    pq = p * (1 - p)
+
+    B = tile_size
+    total = 0.0
+
+    for i0 in range(0, m, B):
+        i1 = min(i0 + B, m)
+        hi = hc[:, i0:i1]
+        vi = vm[:, i0:i1]
+        pi = p[i0:i1]
+        pqi = pq[i0:i1]
+
+        for j0 in range(i0, m, B):
+            j1 = min(j0 + B, m)
+            hj = hc[:, j0:j1]
+            vj = vm[:, j0:j1]
+            pj = p[j0:j1]
+            pqj = pq[j0:j1]
+
+            joint_n = vi.T @ vj
+            joint_11 = hi.T @ hj
+            p_AB = cp.where(joint_n > 0, joint_11 / joint_n, 0.0)
+            D = p_AB - cp.outer(pi, pj)
+            denom = cp.outer(pqi, pqj)
+            r2_tile = cp.where(denom > 0, (D ** 2) / denom, 0.0)
+
+            if i0 == j0:
+                cp.fill_diagonal(r2_tile, 0.0)
+                total += float(cp.sum(r2_tile).get())
+            else:
+                total += 2.0 * float(cp.sum(r2_tile).get())
+
+    return total / (m * (m - 1))
+
+
 def zns(r2_matrix_or_matrix, missing_data='include'):
     """Kelly's ZnS: mean pairwise r-squared across all SNP pairs.
 
