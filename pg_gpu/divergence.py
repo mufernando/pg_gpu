@@ -955,3 +955,418 @@ def pbs(haplotype_matrix: HaplotypeMatrix,
         ret = ret / norm
 
     return ret
+
+
+# ---------------------------------------------------------------------------
+# Two-population distance-based statistics
+# ---------------------------------------------------------------------------
+
+def _snn_one_pop(within, between):
+    """Score one population block for Hudson's Snn on GPU.
+
+    For each haplotype, checks whether its nearest neighbor is within-pop
+    (score 1), between-pop (score 0), or tied (fractional score).
+    """
+    w = within.copy()
+    cp.fill_diagonal(w, cp.inf)
+    min_within = cp.min(w, axis=1)
+    min_between = cp.min(between, axis=1)
+
+    score = (min_within < min_between).astype(cp.float64)
+
+    tied = min_within == min_between
+    if cp.any(tied):
+        n_within_ties = cp.sum(w == min_within[:, None], axis=1)
+        n_between_ties = cp.sum(between == min_between[:, None], axis=1)
+        tie_score = n_within_ties / (n_within_ties + n_between_ties)
+        score = cp.where(tied, tie_score, score)
+
+    return float(cp.sum(score).get())
+
+
+def _resolve_distance_matrices(haplotype_matrix, pop1, pop2,
+                                missing_data='include',
+                                distance_matrices=None):
+    """Resolve or compute pairwise distance matrices.
+
+    If distance_matrices is provided, validates shapes against populations.
+    Otherwise computes from scratch.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+    distance_matrices : tuple of (dist_between, dist_within1, dist_within2), optional
+        Pre-computed cupy distance matrices from a prior call to
+        pairwise_distance_matrix or distance_based_stats.
+
+    Returns
+    -------
+    dist_between, dist_within1, dist_within2 : cupy.ndarray
+    """
+    if distance_matrices is not None:
+        n1 = len(_get_population_indices(haplotype_matrix, pop1))
+        n2 = len(_get_population_indices(haplotype_matrix, pop2))
+        db, dw1, dw2 = distance_matrices
+        if db.shape != (n1, n2):
+            raise ValueError(
+                f"distance_matrices between-pop shape {db.shape} does not "
+                f"match populations ({n1}, {n2})")
+        if dw1.shape != (n1, n1):
+            raise ValueError(
+                f"distance_matrices within-pop1 shape {dw1.shape} does not "
+                f"match pop1 size ({n1}, {n1})")
+        if dw2.shape != (n2, n2):
+            raise ValueError(
+                f"distance_matrices within-pop2 shape {dw2.shape} does not "
+                f"match pop2 size ({n2}, {n2})")
+        return db, dw1, dw2
+
+    return pairwise_distance_matrix(haplotype_matrix, pop1, pop2, missing_data)
+
+
+def pairwise_distance_matrix(haplotype_matrix, pop1, pop2,
+                              missing_data='include'):
+    """Compute pairwise distance matrices between and within two populations.
+
+    Returns three cupy distance matrices: between-population,
+    within-pop1, and within-pop2. Pre-compute once and pass to
+    individual stats via the ``distance_matrices`` parameter to
+    avoid redundant GPU work.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+
+    Returns
+    -------
+    dist_between : cupy.ndarray, float64, shape (n1, n2)
+    dist_within1 : cupy.ndarray, float64, shape (n1, n1)
+    dist_within2 : cupy.ndarray, float64, shape (n2, n2)
+    """
+    from .distance_stats import _pairwise_diffs_matrix_gpu
+
+    pop1_idx = _get_population_indices(haplotype_matrix, pop1)
+    pop2_idx = _get_population_indices(haplotype_matrix, pop2)
+    all_idx = pop1_idx + pop2_idx
+    n1 = len(pop1_idx)
+
+    # Extract population subset on whatever device the data lives on.
+    # _pairwise_diffs_matrix_gpu accepts both numpy and cupy, chunking
+    # CPU data to GPU on-the-fly so the full matrix never needs to
+    # reside on GPU at once.
+    hap = haplotype_matrix.haplotypes
+    hap_sub = hap[all_idx, :]
+
+    if missing_data == 'exclude':
+        xp = cp if isinstance(hap_sub, cp.ndarray) else np
+        any_missing = xp.any(hap_sub < 0, axis=0)
+        hap_sub = hap_sub[:, ~any_missing]
+
+    # Raw Hamming distances (not normalized) — appropriate for ratio/rank stats
+    diffs = _pairwise_diffs_matrix_gpu(hap_sub, missing_data='include')
+
+    return diffs[:n1, n1:], diffs[:n1, :n1], diffs[n1:, n1:]
+
+
+def snn(haplotype_matrix: HaplotypeMatrix,
+        pop1: Union[str, list],
+        pop2: Union[str, list],
+        missing_data: str = 'include',
+        distance_matrices=None) -> float:
+    """Hudson's nearest-neighbor statistic (Snn).
+
+    For each haplotype, determines whether its nearest neighbor is from
+    the same population. Snn is the fraction of haplotypes whose nearest
+    neighbor is conspecific. Under panmixia Snn ~ 0.5; under population
+    structure Snn -> 1.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+    distance_matrices : tuple, optional
+        Pre-computed (dist_between, dist_within1, dist_within2) from
+        pairwise_distance_matrix. Avoids recomputation when calling
+        multiple stats on the same population pair.
+
+    Returns
+    -------
+    float
+        Snn statistic in [0, 1].
+
+    References
+    ----------
+    Hudson, R.R. (2000). A New Statistic for Detecting Genetic
+    Differentiation. Genetics, 155(4), 2011-2014.
+    """
+    dist_between, dist_within1, dist_within2 = _resolve_distance_matrices(
+        haplotype_matrix, pop1, pop2, missing_data, distance_matrices)
+    n1, n2 = dist_between.shape
+
+    count = _snn_one_pop(dist_within1, dist_between)
+    count += _snn_one_pop(dist_within2, dist_between.T)
+
+    return count / (n1 + n2)
+
+
+def dxy_min(haplotype_matrix: HaplotypeMatrix,
+            pop1: Union[str, list],
+            pop2: Union[str, list],
+            missing_data: str = 'include',
+            distance_matrices=None) -> float:
+    """Minimum pairwise distance between two populations.
+
+    The Hamming distance of the closest pair of haplotypes across
+    the two populations. Used in Gmin (Geneva et al.) and dd
+    (Schrider et al.) statistics.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+    distance_matrices : tuple, optional
+        Pre-computed distance matrices.
+
+    Returns
+    -------
+    float
+        Minimum pairwise distance.
+
+    References
+    ----------
+    Geneva, A.J. et al. (2015). A new method to scan genomes for
+    introgression in a secondary contact model. PLoS ONE, 10(4).
+    """
+    dist_between, _, _ = _resolve_distance_matrices(
+        haplotype_matrix, pop1, pop2, missing_data, distance_matrices)
+    return float(cp.min(dist_between).get())
+
+
+def gmin(haplotype_matrix: HaplotypeMatrix,
+         pop1: Union[str, list],
+         pop2: Union[str, list],
+         missing_data: str = 'include',
+         distance_matrices=None) -> float:
+    """Geneva's Gmin: ratio of minimum to mean between-population distance.
+
+    Gmin = Dxy_min / Dxy_mean. Low values indicate unusually similar
+    haplotypes across populations relative to average divergence,
+    suggesting recent gene flow or shared ancestral variation.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+    distance_matrices : tuple, optional
+        Pre-computed distance matrices.
+
+    Returns
+    -------
+    float
+        Gmin ratio.
+
+    References
+    ----------
+    Geneva, A.J. et al. (2015). A new method to scan genomes for
+    introgression in a secondary contact model. PLoS ONE, 10(4).
+    """
+    dist_between, _, _ = _resolve_distance_matrices(
+        haplotype_matrix, pop1, pop2, missing_data, distance_matrices)
+    mean_dxy = float(cp.mean(dist_between).get())
+    min_dxy = float(cp.min(dist_between).get())
+    if mean_dxy == 0:
+        return float('nan')
+    return min_dxy / mean_dxy
+
+
+def dd(haplotype_matrix: HaplotypeMatrix,
+       pop1: Union[str, list],
+       pop2: Union[str, list],
+       missing_data: str = 'include',
+       distance_matrices=None) -> Tuple[float, float]:
+    """Relative minimum divergence (dd1, dd2).
+
+    dd1 = Dxy_min / pi1, dd2 = Dxy_min / pi2. Low values indicate
+    that the closest between-population pair is unusually similar
+    relative to within-population diversity.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+    distance_matrices : tuple, optional
+        Pre-computed distance matrices.
+
+    Returns
+    -------
+    dd1 : float
+        Dxy_min / pi(pop1).
+    dd2 : float
+        Dxy_min / pi(pop2).
+
+    References
+    ----------
+    Schrider, D.R. et al. (2018). Supervised Machine Learning for
+    Population Genetics: A New Paradigm. Trends in Genetics, 34(4).
+    """
+    from . import diversity
+
+    dist_between, _, _ = _resolve_distance_matrices(
+        haplotype_matrix, pop1, pop2, missing_data, distance_matrices)
+    min_dxy = float(cp.min(dist_between).get())
+
+    pi1 = diversity.pi(haplotype_matrix, population=pop1,
+                       span_normalize=False, missing_data=missing_data)
+    pi2 = diversity.pi(haplotype_matrix, population=pop2,
+                       span_normalize=False, missing_data=missing_data)
+
+    dd1 = min_dxy / pi1 if pi1 > 0 else float('nan')
+    dd2 = min_dxy / pi2 if pi2 > 0 else float('nan')
+    return dd1, dd2
+
+
+def dd_rank(haplotype_matrix: HaplotypeMatrix,
+            pop1: Union[str, list],
+            pop2: Union[str, list],
+            missing_data: str = 'include',
+            distance_matrices=None) -> Tuple[float, float]:
+    """Rank of Dxy_min in within-population pairwise distance distributions.
+
+    For each population, computes the fraction of within-population
+    pairwise distances that are <= Dxy_min. Low values indicate the
+    closest between-population pair is more similar than most
+    within-population pairs, suggesting introgression.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+    distance_matrices : tuple, optional
+        Pre-computed distance matrices.
+
+    Returns
+    -------
+    rank1 : float
+        Fraction of pop1 within-pop distances <= Dxy_min.
+    rank2 : float
+        Fraction of pop2 within-pop distances <= Dxy_min.
+
+    References
+    ----------
+    Schrider, D.R. et al. (2018). Supervised Machine Learning for
+    Population Genetics: A New Paradigm. Trends in Genetics, 34(4).
+    """
+    dist_between, dist_within1, dist_within2 = _resolve_distance_matrices(
+        haplotype_matrix, pop1, pop2, missing_data, distance_matrices)
+    min_dxy = cp.min(dist_between)
+
+    # Extract upper triangle of within-pop distances (exclude diagonal)
+    idx1 = cp.triu_indices(dist_within1.shape[0], k=1)
+    within1 = dist_within1[idx1]
+    idx2 = cp.triu_indices(dist_within2.shape[0], k=1)
+    within2 = dist_within2[idx2]
+
+    rank1 = float(cp.mean((within1 <= min_dxy).astype(cp.float64)).get()) if len(within1) > 0 else float('nan')
+    rank2 = float(cp.mean((within2 <= min_dxy).astype(cp.float64)).get()) if len(within2) > 0 else float('nan')
+    return rank1, rank2
+
+
+def zx(haplotype_matrix: HaplotypeMatrix,
+       pop1: Union[str, list],
+       pop2: Union[str, list],
+       missing_data: str = 'include') -> float:
+    """ZnS ratio: within-population LD relative to total LD.
+
+    Zx = (ZnS_pop1 + ZnS_pop2) / (2 * ZnS_total). Values > 1 indicate
+    stronger LD within populations than across the combined sample,
+    consistent with population structure or recent admixture.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+
+    Returns
+    -------
+    float
+        Zx ratio.
+
+    References
+    ----------
+    Schrider, D.R. et al. (2018). Supervised Machine Learning for
+    Population Genetics: A New Paradigm. Trends in Genetics, 34(4).
+    """
+    from . import ld_statistics
+    from ._utils import get_population_matrix
+
+    m1 = get_population_matrix(haplotype_matrix, pop1)
+    m2 = get_population_matrix(haplotype_matrix, pop2)
+    z1 = ld_statistics.zns(m1, missing_data=missing_data)
+    z2 = ld_statistics.zns(m2, missing_data=missing_data)
+    z_total = ld_statistics.zns(haplotype_matrix, missing_data=missing_data)
+
+    if z_total == 0:
+        return float('nan')
+    return (z1 + z2) / (2 * z_total)
+
+
+def distance_based_stats(haplotype_matrix: HaplotypeMatrix,
+                          pop1: Union[str, list],
+                          pop2: Union[str, list],
+                          missing_data: str = 'include') -> Dict[str, float]:
+    """Compute all distance-based two-population statistics at once.
+
+    Shares the pairwise distance matrix computation across Snn, Gmin,
+    dd, and dd_rank, avoiding redundant GPU work.
+
+    Parameters
+    ----------
+    haplotype_matrix : HaplotypeMatrix
+    pop1, pop2 : str or list
+    missing_data : str
+
+    Returns
+    -------
+    dict
+        Keys: snn, dxy_min, gmin, dd1, dd2, dd_rank1, dd_rank2.
+    """
+    dist_between, dist_within1, dist_within2 = pairwise_distance_matrix(
+        haplotype_matrix, pop1, pop2, missing_data)
+    n1, n2 = dist_between.shape
+
+    min_dxy_gpu = cp.min(dist_between)
+    min_dxy = float(min_dxy_gpu.get())
+    mean_dxy = float(cp.mean(dist_between).get())
+
+    snn_val = (_snn_one_pop(dist_within1, dist_between)
+               + _snn_one_pop(dist_within2, dist_between.T)) / (n1 + n2)
+
+    idx1 = cp.triu_indices(n1, k=1)
+    within1 = dist_within1[idx1]
+    idx2 = cp.triu_indices(n2, k=1)
+    within2 = dist_within2[idx2]
+    rank1 = float(cp.mean((within1 <= min_dxy_gpu).astype(cp.float64)).get()) if len(within1) > 0 else float('nan')
+    rank2 = float(cp.mean((within2 <= min_dxy_gpu).astype(cp.float64)).get()) if len(within2) > 0 else float('nan')
+
+    pi1 = float(cp.mean(within1).get()) if len(within1) > 0 else 0.0
+    pi2 = float(cp.mean(within2).get()) if len(within2) > 0 else 0.0
+
+    return {
+        'snn': snn_val,
+        'dxy_min': min_dxy,
+        'gmin': min_dxy / mean_dxy if mean_dxy > 0 else float('nan'),
+        'dd1': min_dxy / pi1 if pi1 > 0 else float('nan'),
+        'dd2': min_dxy / pi2 if pi2 > 0 else float('nan'),
+        'dd_rank1': rank1,
+        'dd_rank2': rank2,
+    }
