@@ -24,15 +24,27 @@ weighting) so that theta is simply a dot product of weights and SFS counts.
 
 Different weight vectors recover different estimators:
 
-======================== ============================================= ====================
-Estimator                Weight :math:`w_i`                            Reference
-======================== ============================================= ====================
-Watterson's theta        :math:`1 / a_1` where :math:`a_1 = \sum 1/j` Watterson 1975
-Pi (nuc. diversity)      :math:`2i(n-i) / n(n-1)`                     Tajima 1983
-Theta H                  :math:`2i^2 / n(n-1)`                        Fay & Wu 2000
-Theta L                  :math:`i / (n-1)`                             Zeng et al. 2006
-Eta1 (singletons)        :math:`\delta_{i,1} / a_1`                   Fu & Li 1993
-======================== ============================================= ====================
+.. list-table::
+   :header-rows: 1
+
+   * - Estimator
+     - Weight
+     - Reference
+   * - Watterson's theta
+     - :math:`1 / a_1`
+     - Watterson 1975
+   * - Pi (nucleotide diversity)
+     - :math:`2i(n-i) / n(n-1)`
+     - Tajima 1983
+   * - Theta H
+     - :math:`2i^2 / n(n-1)`
+     - Fay & Wu 2000
+   * - Theta L
+     - :math:`i / (n-1)`
+     - Zeng et al. 2006
+   * - Eta1 (singletons)
+     - :math:`\delta_{i,1} / a_1`
+     - Fu & Li 1993
 
 Neutrality tests are contrasts between two estimators:
 
@@ -190,14 +202,4 @@ internally to compute all statistics in one pass:
    # minus_eta1, minus_eta1_star, segregating_sites,
    # tajimas_d, fay_wu_h, normalized_fay_wu_h, zeng_e
 
-API Reference
--------------
-
-.. autoclass:: pg_gpu.achaz.FrequencySpectrum
-   :members:
-
-.. autofunction:: pg_gpu.achaz.compute_sigma_ij
-
-.. autofunction:: pg_gpu.achaz.project_sfs
-
-.. autofunction:: pg_gpu.diversity.diversity_stats_fast
+See the :doc:`api` reference for full function signatures.

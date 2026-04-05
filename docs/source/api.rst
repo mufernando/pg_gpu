@@ -9,33 +9,6 @@ HaplotypeMatrix
    :undoc-members:
    :show-inheritance:
 
-Data Loading
-~~~~~~~~~~~~
-
-.. automethod:: pg_gpu.HaplotypeMatrix.from_vcf
-.. automethod:: pg_gpu.HaplotypeMatrix.from_zarr
-.. automethod:: pg_gpu.HaplotypeMatrix.from_ts
-.. automethod:: pg_gpu.HaplotypeMatrix.to_zarr
-.. automethod:: pg_gpu.HaplotypeMatrix.load_pop_file
-
-Missing Data Methods
-~~~~~~~~~~~~~~~~~~~~
-
-.. automethod:: pg_gpu.HaplotypeMatrix.is_missing
-.. automethod:: pg_gpu.HaplotypeMatrix.is_called
-.. automethod:: pg_gpu.HaplotypeMatrix.count_missing
-.. automethod:: pg_gpu.HaplotypeMatrix.count_called
-.. automethod:: pg_gpu.HaplotypeMatrix.get_span
-.. automethod:: pg_gpu.HaplotypeMatrix.filter_variants_by_missing
-.. automethod:: pg_gpu.HaplotypeMatrix.summarize_missing_data
-
-LD Methods
-~~~~~~~~~~
-
-.. automethod:: pg_gpu.HaplotypeMatrix.pairwise_r2
-.. automethod:: pg_gpu.HaplotypeMatrix.locate_unlinked
-.. automethod:: pg_gpu.HaplotypeMatrix.windowed_r_squared
-
 LD Statistics
 -------------
 
@@ -284,6 +257,7 @@ GenotypeMatrix
 .. autoclass:: pg_gpu.GenotypeMatrix
    :members:
    :undoc-members:
+   :show-inheritance:
 
 Moments Integration (LD Inference)
 -----------------------------------
