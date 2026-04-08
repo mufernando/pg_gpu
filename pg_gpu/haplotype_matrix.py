@@ -669,15 +669,16 @@ class HaplotypeMatrix:
         # Count alleles for each variant across all samples
         n_variants = self.num_variants
 
-        # Count occurrences of each allele value
-        alt_count = xp.sum(self.haplotypes == 1, axis=0)  # Count of allele 1
-        ref_count = xp.sum(self.haplotypes == 0, axis=0)  # Count of allele 0
-        other_count = xp.sum(self.haplotypes >= 2, axis=0) + xp.sum(self.haplotypes < 0, axis=0)  # Count of other alleles (2+, -1, etc.)
+        # Count occurrences of each allele value (ignoring missing = -1)
+        alt_count = xp.sum(self.haplotypes == 1, axis=0)
+        ref_count = xp.sum(self.haplotypes == 0, axis=0)
+        multiallelic_count = xp.sum(self.haplotypes >= 2, axis=0)
 
         # A variant is biallelic if:
-        # 1. No other alleles (> 1 or < 0) are present
+        # 1. No multiallelic alleles (2+) are present
         # 2. Both reference (0) and alternate (1) alleles are present
-        is_biallelic = (other_count == 0) & (ref_count > 0) & (alt_count > 0)
+        # Missing data (-1) is ignored — a site with only 0, 1, and -1 is biallelic
+        is_biallelic = (multiallelic_count == 0) & (ref_count > 0) & (alt_count > 0)
 
         keep_mask = is_biallelic
 
