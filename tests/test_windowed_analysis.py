@@ -494,7 +494,7 @@ class TestFusedMissingData:
         rng = np.random.RandomState(123)
         n_hap, n_var = 40, 2000
         hap = rng.randint(0, 2, (n_hap, n_var), dtype=np.int8)
-        # Inject missing data: ~50% of pop1 entries at odd-indexed variants
+        # Inject missing data: ~50% of pop1 entries at even-indexed variants
         for v in range(0, n_var, 2):
             for h in range(n_hap // 2):
                 if rng.random() < 0.5:

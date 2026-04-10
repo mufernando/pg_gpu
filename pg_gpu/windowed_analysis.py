@@ -1267,9 +1267,6 @@ void fused_windowed_twopop(const signed char* hap1_t,
     double t_dxy = 0.0, t_pi1 = 0.0, t_pi2 = 0.0;
     double t_wc_a = 0.0, t_wc_ab = 0.0;
 
-    // n_hap1 and n_hap2 are used only for array indexing (row stride);
-    // per-site valid counts (dn1, dn2) are computed inside the loop.
-
     for (int vi = threadIdx.x; vi < n_vars; vi += blockDim.x) {
         int v = v_start + vi;
 
@@ -1287,15 +1284,14 @@ void fused_windowed_twopop(const signed char* hap1_t,
             if (a >= 0) { valid2++; if (a > 0) ac2_1++; }
         }
 
+        if (valid1 == 0 || valid2 == 0) continue;
+
         double dn1 = (double)valid1;
         double dn2 = (double)valid2;
         double ac1_0 = dn1 - ac1_1;
         double ac2_0 = dn2 - ac2_1;
         double d_ac1_1 = (double)ac1_1;
         double d_ac2_1 = (double)ac2_1;
-
-        // Skip sites with no valid samples in either population
-        if (valid1 == 0 || valid2 == 0) continue;
 
         // Hudson: within-pop mean pairwise difference
         double n1_pairs = dn1 * (dn1 - 1.0) / 2.0;
