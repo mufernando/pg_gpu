@@ -11,6 +11,8 @@ import matplotlib.colors as mcolors
 import seaborn as sns
 from typing import Optional, Union, Tuple
 
+from .windowed_analysis import CANONICAL_WINDOW_PREFIX
+
 
 # ---------------------------------------------------------------------------
 # Site Frequency Spectrum
@@ -389,7 +391,7 @@ def plot_windowed_panel(results, statistics=None, figsize=None, colors=None):
     ----------
     results : dict
         Output from windowed_statistics() or windowed_statistics_fused().
-        Must contain 'window_start' and statistic arrays.
+        Must contain 'start' and statistic arrays.
     statistics : list of str, optional
         Which statistics to plot. If None, plots all non-metadata keys.
     figsize : tuple, optional
@@ -402,7 +404,7 @@ def plot_windowed_panel(results, statistics=None, figsize=None, colors=None):
     fig : matplotlib.figure.Figure
     axes : list of matplotlib.axes.Axes
     """
-    skip_keys = {'window_start', 'window_stop', 'n_variants'}
+    skip_keys = set(CANONICAL_WINDOW_PREFIX)
 
     if statistics is None:
         statistics = [k for k in results if k not in skip_keys]
@@ -419,7 +421,7 @@ def plot_windowed_panel(results, statistics=None, figsize=None, colors=None):
     if n_panels == 1:
         axes = [axes]
 
-    window_start = results['window_start']
+    window_start = results['start']
 
     for i, stat in enumerate(statistics):
         plot_windowed(window_start, results[stat], ax=axes[i],

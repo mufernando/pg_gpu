@@ -116,7 +116,7 @@ def plot_comparison(df_unmasked, df_masked, outpath):
         (axes[0], df_unmasked, "Unmasked — raw sliding-window π"),
         (axes[1], df_masked, "Masked — sliding-window π (exon excluded)"),
     ]:
-        centers_mb = 0.5 * (df["start"] + df["stop"]) / 1e6
+        centers_mb = df["center"].to_numpy() / 1e6
         ax.plot(centers_mb, df["pi"], color="#2980b9",
                 linewidth=1.0, alpha=0.9)
         ax.axhline(expected_pi, color="0.4", linestyle="--", linewidth=0.7,

@@ -164,10 +164,7 @@ def main() -> None:
     scalar_df = windowed_analysis(
         hm, window_size=scalar_window, step_size=scalar_step,
         statistics=['garud_h12'], window_type='bp')
-    # Column names vary between pipelines; pick whichever start/stop pair exists.
-    start_col = 'window_start' if 'window_start' in scalar_df.columns else 'start'
-    stop_col = 'window_stop' if 'window_stop' in scalar_df.columns else 'stop'
-    scalar_centers = ((scalar_df[start_col] + scalar_df[stop_col]) / 2).to_numpy()
+    scalar_centers = scalar_df['center'].to_numpy()
     print(f"  n_scalar_windows={len(scalar_df)}")
 
     if args.no_plot:

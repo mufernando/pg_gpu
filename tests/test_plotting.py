@@ -105,7 +105,7 @@ class TestWindowedPlots:
         matrix, _, _ = sim_data
         bp_bins = np.arange(0, 100001, 10000)
         result = windowed_statistics(matrix, bp_bins, statistics=('pi',))
-        ax = plotting.plot_windowed(result['window_start'], result['pi'],
+        ax = plotting.plot_windowed(result['start'], result['pi'],
                                     stat_name='pi')
         assert ax is not None
 

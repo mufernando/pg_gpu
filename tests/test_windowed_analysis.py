@@ -8,7 +8,7 @@ import pandas as pd
 from pg_gpu import HaplotypeMatrix, diversity, divergence
 from pg_gpu.windowed_analysis import (
     WindowedAnalyzer, windowed_analysis, WindowParams,
-    WindowIterator, WindowData
+    WindowIterator, WindowData, CANONICAL_WINDOW_PREFIX,
 )
 
 
@@ -527,7 +527,7 @@ class TestFusedMissingData:
 
         # Build the same windows the scatter path used
         ws = r_scatter['start'].values.astype(np.float64)
-        we = r_scatter['stop'].values.astype(np.float64)
+        we = r_scatter['end'].values.astype(np.float64)
         bp_bins = np.concatenate([ws, [we[-1]]])
 
         # Fused kernel path with identical windows
@@ -646,7 +646,7 @@ class TestFullyMaskedWindowNaN:
         hm, ms, me = self._build_hm_with_mask()
         df = windowed_analysis(hm, window_size=10_000, step_size=10_000,
                                statistics=["pi", "theta_w"])
-        fully_masked = (df["start"] >= ms) & (df["stop"] <= me)
+        fully_masked = (df["start"] >= ms) & (df["end"] <= me)
         assert fully_masked.sum() > 0, "test needs at least one fully-masked window"
         assert df.loc[fully_masked, "pi"].isna().all(), (
             "fully-masked windows must report pi = NaN, got "
@@ -658,7 +658,7 @@ class TestFullyMaskedWindowNaN:
         df = windowed_analysis(hm, window_size=10_000, step_size=10_000,
                                statistics=["pi"])
         # Windows entirely outside the mask should have finite pi.
-        accessible = (df["stop"] <= ms) | (df["start"] >= me)
+        accessible = (df["end"] <= ms) | (df["start"] >= me)
         assert accessible.sum() > 0
         assert df.loc[accessible, "pi"].notna().all()
         assert (df.loc[accessible, "pi"] > 0).all()
@@ -668,7 +668,7 @@ class TestFullyMaskedWindowNaN:
         hm, ms, me = self._build_hm_with_mask()
         df = windowed_analysis(hm, window_size=10_000, step_size=10_000,
                                statistics=["segregating_sites"])
-        fully_masked = (df["start"] >= ms) & (df["stop"] <= me)
+        fully_masked = (df["start"] >= ms) & (df["end"] <= me)
         assert (df.loc[fully_masked, "segregating_sites"] == 0).all()
 
     def test_twopop_dxy_is_nan_for_fully_masked_windows(self):
@@ -677,7 +677,7 @@ class TestFullyMaskedWindowNaN:
         df = windowed_analysis(hm, window_size=10_000, step_size=10_000,
                                statistics=["dxy", "da"],
                                populations=["a", "b"])
-        fully_masked = (df["start"] >= ms) & (df["stop"] <= me)
+        fully_masked = (df["start"] >= ms) & (df["end"] <= me)
         assert fully_masked.sum() > 0
         assert df.loc[fully_masked, "dxy"].isna().all()
         assert df.loc[fully_masked, "da"].isna().all()
@@ -693,8 +693,8 @@ class TestFullyMaskedWindowNaN:
             hm, bp_bins=bp_bins, statistics=("mu_var",),
             per_base=True)
 
-        starts = r["window_start"]
-        stops = r["window_stop"]
+        starts = r["start"]
+        stops = r["end"]
         fully_masked = (starts >= ms) & (stops <= me)
         assert fully_masked.sum() > 0
         assert np.isnan(r["mu_var"][fully_masked]).all(), (
@@ -843,3 +843,59 @@ class TestOverlappingWindowsScatter:
             assert np.isclose(max_daf_scatter, ref, atol=1e-12), (
                 f"window [{start}, {stop}): scatter={max_daf_scatter}, "
                 f"ref={ref}")
+
+
+class TestCanonicalWindowSchema:
+    """Regression for issue #70: every dispatch path must emit the same
+    window prefix columns so that cross-path requests and downstream joins
+    are not path-sensitive."""
+
+    @pytest.fixture
+    def hm(self):
+        rng = np.random.default_rng(1)
+        haps = rng.integers(0, 2, (20, 500), dtype=np.int8)
+        return HaplotypeMatrix(haps, np.arange(500) * 1000, 0, 500_000)
+
+    @pytest.mark.parametrize("stats", [
+        ['pi'],
+        ['tajimas_d'],
+        ['pi', 'tajimas_d'],
+        ['garud_h12'],
+        ['garud_h12', 'garud_h2h1'],
+        ['pi', 'garud_h12'],
+    ])
+    def test_prefix_is_canonical(self, hm, stats):
+        df = windowed_analysis(hm, window_size=50_000, step_size=25_000,
+                               statistics=stats, window_type='bp')
+        assert tuple(df.columns[:6]) == CANONICAL_WINDOW_PREFIX, (
+            f"statistics={stats}: expected prefix {CANONICAL_WINDOW_PREFIX}, "
+            f"got {tuple(df.columns[:6])}")
+        for stat in stats:
+            assert stat in df.columns
+
+    def test_twopop_prefix_is_canonical(self, hm):
+        hm.sample_sets = {"a": list(range(10)), "b": list(range(10, 20))}
+        df = windowed_analysis(hm, window_size=50_000, step_size=25_000,
+                               statistics=['fst', 'dxy'],
+                               populations=['a', 'b'])
+        assert tuple(df.columns[:6]) == CANONICAL_WINDOW_PREFIX
+
+    def test_mixed_singlepop_twopop_prefix_is_canonical(self, hm):
+        hm.sample_sets = {"a": list(range(10)), "b": list(range(10, 20))}
+        df = windowed_analysis(hm, window_size=50_000, step_size=25_000,
+                               statistics=['pi', 'fst'],
+                               populations=['a', 'b'])
+        assert tuple(df.columns[:6]) == CANONICAL_WINDOW_PREFIX
+
+    def test_center_equals_midpoint(self, hm):
+        df = windowed_analysis(hm, window_size=50_000, step_size=25_000,
+                               statistics=['pi'])
+        np.testing.assert_array_equal(
+            df['center'].to_numpy(),
+            (df['start'].to_numpy() + df['end'].to_numpy()) // 2)
+
+    def test_window_id_is_monotonic(self, hm):
+        df = windowed_analysis(hm, window_size=50_000, step_size=25_000,
+                               statistics=['garud_h12'])
+        np.testing.assert_array_equal(
+            df['window_id'].to_numpy(), np.arange(len(df)))

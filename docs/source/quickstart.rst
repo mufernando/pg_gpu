@@ -302,8 +302,8 @@ automatically routes through fused kernels when possible.
        h, window_size=100_000,
        statistics=['pi', 'theta_w', 'tajimas_d']
    )
-   # results is a DataFrame with columns: window_start, window_stop,
-   # n_variants, pi, theta_w, tajimas_d
+   # results is a DataFrame with columns: chrom, start, end, center,
+   # n_variants, window_id, pi, theta_w, tajimas_d
 
    # Two-population divergence stats
    results = windowed_analysis(

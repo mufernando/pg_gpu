@@ -58,6 +58,29 @@ def _compute_window_bases(haplotype_matrix, win_starts, win_stops,
     return we - ws
 
 
+CANONICAL_WINDOW_PREFIX = (
+    'chrom', 'start', 'end', 'center', 'n_variants', 'window_id')
+
+
+def _init_window_results(chrom, win_starts_bp, win_stops_bp, n_variants):
+    """Canonical window prefix columns, shared by every dispatch path.
+
+    Inserts ``chrom, start, end, center, n_variants, window_id`` in that
+    order. Dict insertion order drives column order in the final DataFrame.
+    """
+    start = np.asarray(win_starts_bp).astype(int)
+    end = np.asarray(win_stops_bp).astype(int)
+    n = len(start)
+    return {
+        'chrom': np.repeat(chrom if chrom is not None else 1, n),
+        'start': start,
+        'end': end,
+        'center': (start + end) // 2,
+        'n_variants': np.asarray(n_variants).astype(int),
+        'window_id': np.arange(n, dtype=int),
+    }
+
+
 @dataclass
 class WindowParams:
     """Parameters defining genomic windows."""
@@ -691,7 +714,7 @@ def _build_scatter_indices(pos_cpu, chrom_start, chrom_end,
 
 def _windowed_thetas_scatter(haplotype_matrix, window_size, step_size,
                               statistics, populations, missing_data,
-                              span_normalize):
+                              span_normalize, chrom=None):
     """Compute windowed theta estimators via scatter-add on GPU.
 
     Uses dac_and_n fused kernel + direct vectorized arithmetic + scatter_add
@@ -742,16 +765,18 @@ def _windowed_thetas_scatter(haplotype_matrix, window_size, step_size,
         return out
 
     # Compute requested per-variant contributions and scatter
-    results = {}
-    results['start'] = win_starts.astype(int)
-    results['stop'] = np.minimum(win_stops, chrom_end).astype(int)
+    n_variants_per_window = np.bincount(
+        k_safe[contains], minlength=n_windows)
+    results = _init_window_results(
+        chrom, win_starts, np.minimum(win_stops, chrom_end),
+        n_variants=n_variants_per_window)
 
     # Span for normalization
     if span_normalize is not False:
         if haplotype_matrix.has_accessible_mask:
             am = haplotype_matrix.accessible_mask
             spans = am.count_accessible_windows(
-                results['start'], results['stop'])
+                results['start'], results['end'])
         elif matrix.n_total_sites is not None:
             # Proportional from n_total_sites
             total_span = chrom_end - chrom_start
@@ -913,7 +938,7 @@ def _twopop_site_components(hap1, hap2):
 
 def _windowed_twopop_scatter(haplotype_matrix, window_size, step_size,
                               statistics, populations, missing_data,
-                              span_normalize):
+                              span_normalize, chrom=None):
     """Compute windowed two-population stats via scatter-add on GPU.
 
     Same pattern as _windowed_thetas_scatter but for fst, dxy, da.
@@ -966,16 +991,18 @@ def _windowed_twopop_scatter(haplotype_matrix, window_size, step_size,
             scatter_add(out, win_idx_gpu, rep * mask_gpu)
         return out
 
-    results = {}
-    results['start'] = win_starts.astype(int)
-    results['stop'] = np.minimum(win_stops, chrom_end).astype(int)
+    n_variants_per_window = np.bincount(
+        k_safe[contains], minlength=n_windows)
+    results = _init_window_results(
+        chrom, win_starts, np.minimum(win_stops, chrom_end),
+        n_variants=n_variants_per_window)
 
     # Span normalization
     if span_normalize is not False:
         if haplotype_matrix.has_accessible_mask:
             am = haplotype_matrix.accessible_mask
             spans = am.count_accessible_windows(
-                results['start'], results['stop'])
+                results['start'], results['end'])
         elif haplotype_matrix.n_total_sites is not None:
             total_span = chrom_end - chrom_start
             spans = (win_stops - win_starts) * haplotype_matrix.n_total_sites / total_span
@@ -1112,23 +1139,13 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
                 **{k: v for k, v in kwargs.items()
                    if k not in _LOCAL_PCA_ONLY_KWARGS},
             )
-            # The scalar dispatch paths use inconsistent window column names
-            # ('window_id' in StatisticsComputer, 'start' in scatter, neither
-            # in fused); see issue #70. Join on whichever is available.
-            if 'window_id' in scalar_df.columns:
-                merged = result.windows.merge(
-                    scalar_df, on='window_id', how='left',
-                    suffixes=('', '_scalar'))
-            elif 'start' in scalar_df.columns:
-                merged = result.windows.merge(
-                    scalar_df, on='start', how='left',
-                    suffixes=('', '_scalar'))
-            else:
-                merged = result.windows.merge(
-                    scalar_df.rename(columns={'window_start': 'start',
-                                              'window_stop': 'end'}),
-                    on='start', how='left', suffixes=('', '_scalar'))
-            result.windows = merged
+            # result.windows already carries the canonical prefix; drop it
+            # from scalar_df and merge on window_id to avoid duplicates.
+            duplicates = [c for c in CANONICAL_WINDOW_PREFIX
+                          if c != 'window_id' and c in scalar_df.columns]
+            result.windows = result.windows.merge(
+                scalar_df.drop(columns=duplicates),
+                on='window_id', how='left')
         return result
 
     # Scatter-add path: single-pop theta estimators via dac_and_n + scatter
@@ -1143,7 +1160,8 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
         if requested <= scatter_single and len(populations or []) <= 1:
             result = _windowed_thetas_scatter(
                 haplotype_matrix, window_size, step_size,
-                statistics, populations, missing_data, span_normalize)
+                statistics, populations, missing_data, span_normalize,
+                chrom=chrom)
             if result is not None:
                 return result
 
@@ -1151,7 +1169,8 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
         if requested <= scatter_twopop and len(populations or []) == 2:
             result = _windowed_twopop_scatter(
                 haplotype_matrix, window_size, step_size,
-                statistics, populations, missing_data, span_normalize)
+                statistics, populations, missing_data, span_normalize,
+                chrom=chrom)
             if result is not None:
                 return result
 
@@ -1163,14 +1182,17 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
                 and len(populations or []) == 2):
             df1 = _windowed_thetas_scatter(
                 haplotype_matrix, window_size, step_size,
-                single_stats, [populations[0]], missing_data, span_normalize)
+                single_stats, [populations[0]], missing_data, span_normalize,
+                chrom=chrom)
             df2 = _windowed_twopop_scatter(
                 haplotype_matrix, window_size, step_size,
-                twopop_stats, populations, missing_data, span_normalize)
+                twopop_stats, populations, missing_data, span_normalize,
+                chrom=chrom)
             if df1 is not None and df2 is not None:
-                # Merge on window boundaries
+                # Both DataFrames share the canonical prefix; copy only the
+                # per-stat columns from df2 into df1.
                 for col in df2.columns:
-                    if col not in ('start', 'stop'):
+                    if col not in CANONICAL_WINDOW_PREFIX:
                         df1[col] = df2[col].values
                 return df1
 
@@ -1240,6 +1262,7 @@ def windowed_analysis(haplotype_matrix: HaplotypeMatrix,
             _win_starts=win_starts,
             _win_stops=win_stops,
             missing_data=missing_data,
+            chrom=chrom,
         )
         return pd.DataFrame(result_dict)
 
@@ -1644,7 +1667,8 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
                               is_accessible=None,
                               _win_starts=None,
                               _win_stops=None,
-                              missing_data='include'):
+                              missing_data='include',
+                              chrom=None):
     """GPU-native windowed statistics using fused CUDA kernels.
 
     One kernel launch processes ALL windows in parallel. Each thread block
@@ -1668,11 +1692,15 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
         Normalize by window size in base pairs.
     is_accessible : array_like, optional
         Accessibility mask for per-base normalization.
+    chrom : str or int, optional
+        Chromosome label emitted in the ``chrom`` output column.
 
     Returns
     -------
     dict
-        Maps statistic names to numpy arrays of shape (n_windows,).
+        Maps column names to numpy arrays of shape (n_windows,). The first
+        six columns are always ``chrom, start, end, center, n_variants,
+        window_id``, followed by one column per requested statistic.
     """
     from ._utils import get_population_matrix
 
@@ -1711,15 +1739,18 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
         ws_gpu = bp_bins_gpu[:-1]
         we_gpu = bp_bins_gpu[1:]
 
-    results = {
-        'window_start': ws_gpu.get() if hasattr(ws_gpu, 'get') else ws_gpu,
-        'window_stop': we_gpu.get() if hasattr(we_gpu, 'get') else we_gpu,
-    }
+    ws_cpu = ws_gpu.get() if hasattr(ws_gpu, 'get') else ws_gpu
+    we_cpu = we_gpu.get() if hasattr(we_gpu, 'get') else we_gpu
+    # Raw variant-index span is the fallback n_variants; single-pop kernels
+    # overwrite below with a missing-data-aware count.
+    results = _init_window_results(
+        chrom, ws_cpu, we_cpu,
+        n_variants=(win_stop - win_start).get())
 
     if per_base:
         window_bases = _compute_window_bases(
-            haplotype_matrix, results['window_start'],
-            results['window_stop'], is_accessible)
+            haplotype_matrix, results['start'],
+            results['end'], is_accessible)
 
     # single-pop stats via fused kernel
     single_pop_stats = {'pi', 'theta_w', 'tajimas_d', 'segregating_sites',
@@ -1844,9 +1875,6 @@ def windowed_statistics_fused(haplotype_matrix: HaplotypeMatrix,
              np.int32(n_total_var), np.int32(n_windows),
              out_fst_num, out_fst_den, out_dxy, out_pi1, out_pi2,
              out_wc_a, out_wc_ab))
-
-        if 'n_variants' not in results:
-            results['n_variants'] = (win_stop - win_start).get().astype(int)
 
         # Post-process on GPU, single .get() per result
         if 'fst' in statistics or 'fst_hudson' in statistics:
@@ -2030,7 +2058,8 @@ def windowed_statistics_fused_chunked(haplotype_matrix: HaplotypeMatrix,
                                       is_accessible=None,
                                       _win_starts=None,
                                       _win_stops=None,
-                                      missing_data='include'):
+                                      missing_data='include',
+                                      chrom=None):
     """Chunked fused windowed statistics for data too large for a single pass.
 
     Same interface and results as windowed_statistics_fused(), but splits the
@@ -2075,15 +2104,18 @@ def windowed_statistics_fused_chunked(haplotype_matrix: HaplotypeMatrix,
         ws_gpu = bp_bins_gpu[:-1]
         we_gpu = bp_bins_gpu[1:]
 
-    results = {
-        'window_start': ws_gpu.get() if hasattr(ws_gpu, 'get') else ws_gpu,
-        'window_stop': we_gpu.get() if hasattr(we_gpu, 'get') else we_gpu,
-    }
+    ws_cpu = ws_gpu.get() if hasattr(ws_gpu, 'get') else ws_gpu
+    we_cpu = we_gpu.get() if hasattr(we_gpu, 'get') else we_gpu
+    # Raw variant-index span is the fallback n_variants; single-pop kernels
+    # overwrite below with a missing-data-aware count.
+    results = _init_window_results(
+        chrom, ws_cpu, we_cpu,
+        n_variants=(win_stop - win_start).get())
 
     if per_base:
         window_bases = _compute_window_bases(
-            haplotype_matrix, results['window_start'],
-            results['window_stop'], is_accessible)
+            haplotype_matrix, results['start'],
+            results['end'], is_accessible)
 
     # Determine chunk size
     chunk_size = estimate_fused_chunk_size(n_hap)
@@ -2282,9 +2314,6 @@ def windowed_statistics_fused_chunked(haplotype_matrix: HaplotypeMatrix,
             del hap1_t, hap2_t
             free_gpu_pool()
 
-        if 'n_variants' not in results:
-            results['n_variants'] = (win_stop - win_start).get().astype(int)
-
         # Post-process on GPU, single .get() per result
         if 'fst' in statistics or 'fst_hudson' in statistics:
             hudson_fst = cp.where(acc_fst_den > 0,
@@ -2334,7 +2363,7 @@ def windowed_statistics_fused_chunked(haplotype_matrix: HaplotypeMatrix,
             population=population, pop1=pop1, pop2=pop2,
             per_base=per_base, is_accessible=is_accessible,
             _win_starts=_win_starts, _win_stops=_win_stops,
-            missing_data=missing_data)
+            missing_data=missing_data, chrom=chrom)
         for k, v in extra.items():
             if k not in results:
                 results[k] = v
@@ -2622,7 +2651,8 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
                         pop1=None,
                         pop2=None,
                         per_base: bool = True,
-                        is_accessible=None):
+                        is_accessible=None,
+                        chrom=None):
     """GPU-native windowed statistics with no Python loop over windows.
 
     Computes per-variant values once, then aggregates into windows using
@@ -2648,13 +2678,15 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
         If True, normalize by window size in base pairs.
     is_accessible : array_like, optional
         Boolean accessibility mask for per-base normalization.
+    chrom : str or int, optional
+        Chromosome label emitted in the ``chrom`` output column.
 
     Returns
     -------
     dict
-        Maps statistic names to numpy arrays of shape (n_windows,).
-        Also includes 'n_variants' (count per window) and 'window_start',
-        'window_stop' arrays.
+        Maps column names to numpy arrays of shape (n_windows,). The first
+        six columns are ``chrom, start, end, center, n_variants, window_id``,
+        followed by one column per requested statistic.
     """
     from ._utils import get_population_matrix
 
@@ -2690,17 +2722,15 @@ def windowed_statistics(haplotype_matrix: HaplotypeMatrix,
 
     variant_counts = _bin_counts(bin_idx, n_windows)
 
-    results = {
-        'window_start': bp_bins[:-1].get(),
-        'window_stop': bp_bins[1:].get(),
-        'n_variants': variant_counts.get().astype(int),
-    }
+    results = _init_window_results(
+        chrom, bp_bins[:-1].get(), bp_bins[1:].get(),
+        n_variants=variant_counts.get())
 
     # window sizes for per-base normalization
     if per_base:
         window_bases = _compute_window_bases(
-            haplotype_matrix, results['window_start'],
-            results['window_stop'], is_accessible)
+            haplotype_matrix, results['start'],
+            results['end'], is_accessible)
         window_bases = cp.asarray(window_bases, dtype=cp.float64)
 
     # Phase 1: compute per-variant values and aggregate

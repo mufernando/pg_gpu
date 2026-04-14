@@ -91,9 +91,8 @@ class TestLocalPCAShape:
         assert res.eigvecs.shape == (res.n_windows, 2, small_hm.num_haplotypes)
         assert res.sumsq.shape == (res.n_windows,)
         assert len(res.windows) == res.n_windows
-        expected_cols = {'chrom', 'start', 'end', 'center', 'n_variants',
-                         'window_id'}
-        assert expected_cols <= set(res.windows.columns)
+        from pg_gpu.windowed_analysis import CANONICAL_WINDOW_PREFIX
+        assert set(CANONICAL_WINDOW_PREFIX) <= set(res.windows.columns)
         # Eigvals are sorted descending
         assert np.all(res.eigvals[:, 0] >= res.eigvals[:, 1])
 
