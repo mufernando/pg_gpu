@@ -109,7 +109,7 @@ def main() -> None:
     # Build a HaplotypeMatrix from raw numpy. The constructor takes the
     # (n_haplotypes, n_variants) matrix, variant positions, and the genomic
     # region bounds [start, stop). For real data, prefer the loader class
-    # methods: HaplotypeMatrix.from_vcf / from_zarr / from_ts. 
+    # methods: HaplotypeMatrix.from_vcf / from_zarr / from_ts.
     hm = HaplotypeMatrix(hap, positions, 0, SEQ_LEN)
 
     # windowed_analysis runs one fused GPU kernel across all windows and
