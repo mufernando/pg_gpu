@@ -95,6 +95,8 @@ class TestLocalPCAShape:
         assert set(CANONICAL_WINDOW_PREFIX) <= set(res.windows.columns)
         # Eigvals are sorted descending
         assert np.all(res.eigvals[:, 0] >= res.eigvals[:, 1])
+        # jackknife_se is None when jackknife not requested
+        assert res.jackknife_se is None
 
     def test_to_lostruct_matrix(self, small_hm):
         res = local_pca(small_hm, window_size=100, window_type='snp', k=3)
@@ -301,6 +303,44 @@ class TestWindowedAnalysisDispatch:
         assert isinstance(res, LocalPCAResult)
         assert 'pi' in res.windows.columns
 
+    def test_jackknife_alone(self, small_hm):
+        res = windowed_analysis(small_hm, window_size=200_000,
+                                step_size=200_000,
+                                statistics=['local_pca_jackknife'], k=2,
+                                n_blocks=5, window_type='bp')
+        assert isinstance(res, LocalPCAResult)
+        assert res.jackknife_se is not None
+        assert res.eigvals.shape[0] == res.jackknife_se.shape[0]
+
+    def test_jackknife_with_local_pca(self, small_hm):
+        res = windowed_analysis(small_hm, window_size=200_000,
+                                step_size=200_000,
+                                statistics=['local_pca', 'local_pca_jackknife'],
+                                k=2, n_blocks=5, window_type='bp')
+        assert isinstance(res, LocalPCAResult)
+        assert res.jackknife_se is not None
+        assert np.all(np.isfinite(res.eigvals))
+
+    def test_jackknife_with_scalar_stat(self, small_hm):
+        res = windowed_analysis(small_hm, window_size=200_000,
+                                step_size=200_000,
+                                statistics=['pi', 'local_pca_jackknife'],
+                                k=2, n_blocks=5, window_type='bp')
+        assert isinstance(res, LocalPCAResult)
+        assert 'pi' in res.windows.columns
+        assert res.jackknife_se is not None
+
+    def test_jackknife_aggregate_none(self, small_hm):
+        res = windowed_analysis(small_hm, window_size=200_000,
+                                step_size=200_000,
+                                statistics=['local_pca_jackknife'], k=2,
+                                n_blocks=5, aggregate=None, window_type='bp')
+        assert isinstance(res, LocalPCAResult)
+        assert res.jackknife_se is not None
+        assert res.jackknife_se.ndim == 3
+        assert res.jackknife_se.shape == (
+            res.n_windows, 2, small_hm.num_haplotypes)
+
 
 # ---------------------------------------------------------------------------
 # Corners
@@ -374,3 +414,53 @@ class TestJackknife:
         V_flipped_aligned = _sign_align_replicates(V_flipped)
         var2 = cp.var(V_flipped_aligned, axis=0).get()
         np.testing.assert_allclose(var1, var2, rtol=1e-10, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Fused local_pca + jackknife
+# ---------------------------------------------------------------------------
+
+
+class TestFusedJackknife:
+
+    def test_fused_matches_separate(self, small_hm):
+        from pg_gpu.decomposition import _local_pca_with_jackknife
+
+        k, n_blocks = 2, 5
+        wkw = dict(window_size=200, window_type='snp', k=k)
+
+        fused = _local_pca_with_jackknife(small_hm, n_blocks=n_blocks,
+                                          aggregate='mean', **wkw)
+        separate_pca = local_pca(small_hm, **wkw)
+        separate_jk = local_pca_jackknife(small_hm, n_blocks=n_blocks,
+                                          aggregate='mean', **wkw)
+
+        assert isinstance(fused, LocalPCAResult)
+        np.testing.assert_allclose(fused.eigvals, separate_pca.eigvals,
+                                   rtol=1e-10)
+        np.testing.assert_allclose(fused.sumsq, separate_pca.sumsq,
+                                   rtol=1e-10)
+        assert fused.jackknife_se is not None
+        np.testing.assert_allclose(fused.jackknife_se, separate_jk,
+                                   rtol=1e-10)
+
+    def test_fused_partial_validity(self):
+        """Windows valid for PCA but not for jackknife."""
+        rng = np.random.default_rng(99)
+        # 12 variants total: with window_size=4 and n_blocks=5, the
+        # jackknife threshold (max(k,2)*n_blocks = 10) exceeds window size
+        # but PCA threshold (max(k,2) = 2) is met.
+        n_hap, n_var = 20, 12
+        hap = rng.integers(0, 2, (n_hap, n_var), dtype=np.int8)
+        pos = np.arange(n_var, dtype=np.int64) * 1000
+        hm = HaplotypeMatrix(hap, pos, 0, n_var * 1000)
+
+        from pg_gpu.decomposition import _local_pca_with_jackknife
+        result = _local_pca_with_jackknife(hm, window_size=4, window_type='snp',
+                                           k=2, n_blocks=5, aggregate='mean')
+
+        # PCA should be valid (4 >= 2)
+        assert np.all(np.isfinite(result.eigvals))
+        # Jackknife should be NaN (4 < 10)
+        assert result.jackknife_se is not None
+        assert np.all(np.isnan(result.jackknife_se))
