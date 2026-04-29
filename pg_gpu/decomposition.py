@@ -675,6 +675,152 @@ def _local_pca_window_rsvd(X: "cp.ndarray", n_var: int, k: int,
     return eigvals, eigvecs, sumsq
 
 
+def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
+                          engine, tile_size, oversample,
+                          n_subspace_iter, random_state, window_params):
+    """Tiled streaming local PCA dispatcher.
+
+    Iterates the WindowIterator in tiles of ``tile_size`` windows; each
+    tile materialises only its own per-window working set on the GPU,
+    runs the per-window kernel chosen by ``engine``, copies the small
+    (k,) eigvals + (k, n_hap) eigvecs + scalar sumsq results to host,
+    and frees the tile's GPU buffers before the next tile.
+
+    Memory bound is `tile_size * (gram + workspace)` on top of the
+    persistent haplotype matrix, independent of the total window count.
+    """
+    n_samples = matrix.num_haplotypes
+
+    if tile_size is None:
+        # Auto-size: keep the per-tile transient working set under
+        # ~30% of currently-free GPU memory. Each window contributes
+        # one Gram (n^2 * 8 bytes) plus eigh workspace (~3x), so the
+        # dense path is the binding constraint.
+        free = cp.cuda.Device().mem_info[0]
+        per_window = n_samples * n_samples * 8 * 4
+        tile_size = max(1, int(free * _GPU_MEM_BUDGET) // max(per_window, 1))
+
+    if engine == 'streaming-rsvd':
+        seed = 12345 if random_state is None else int(random_state)
+        rng = cp.random.RandomState(seed=seed)
+    else:
+        rng = None
+
+    window_meta = []
+    eigvals_chunks = []
+    eigvecs_chunks = []
+    sumsq_chunks = []
+    valid_chunks = []
+
+    pending_starts = []
+    pending_grams = []
+    pending_sumsqs = []
+    pending_indices = []
+
+    def _flush_dense_tile():
+        """Batched eigh on the pending tile of dense Grams (streaming-dense)."""
+        if not pending_grams:
+            return
+        gram_stack = cp.stack(pending_grams, axis=0)
+        eigvals_tile, eigvecs_tile = _batched_top_k_eigh(gram_stack, k)
+        sumsq_tile = cp.stack(pending_sumsqs).get()
+        for i, w_idx in enumerate(pending_indices):
+            eigvals_chunks[w_idx] = eigvals_tile[i]
+            eigvecs_chunks[w_idx] = eigvecs_tile[i]
+            sumsq_chunks[w_idx] = float(sumsq_tile[i])
+        pending_grams.clear()
+        pending_sumsqs.clear()
+        pending_indices.clear()
+        del gram_stack
+        cp.get_default_memory_pool().free_all_blocks()
+
+    for window in iterator:
+        window_meta.append(window)
+        # Pre-allocate placeholder slots so flush can fill them by index.
+        eigvals_chunks.append(None)
+        eigvecs_chunks.append(None)
+        sumsq_chunks.append(None)
+        if window.n_variants < max(k, 2):
+            eigvals_chunks[-1] = np.full(k, np.nan)
+            eigvecs_chunks[-1] = np.full((k, n_samples), np.nan)
+            sumsq_chunks[-1] = np.nan
+            valid_chunks.append(False)
+            continue
+
+        X = _prepare_matrix(window.matrix, scaler, population=None,
+                            missing_data=missing_data)
+        X = _materialize_prepared(X)
+        valid_chunks.append(True)
+
+        if engine == 'streaming-dense':
+            # Build the Gram and sumsq inline; defer the eigh to the
+            # per-tile flush so cuSOLVER's batched syevd amortises its
+            # per-call overhead.
+            C, sumsq = _window_gram(X, X.shape[1])
+            pending_grams.append(C)
+            pending_sumsqs.append(sumsq)
+            pending_indices.append(len(window_meta) - 1)
+            del X
+            if len(pending_grams) >= tile_size:
+                _flush_dense_tile()
+        else:  # streaming-rsvd
+            evals, evecs, sumsq = _local_pca_window_rsvd(
+                X, X.shape[1], k,
+                oversample=oversample,
+                n_iter=n_subspace_iter,
+                rng=rng,
+            )
+            eigvals_chunks[-1] = _cupy_to_host_1d(evals, k)
+            eigvecs_chunks[-1] = _cupy_to_host_2d(evecs, k, n_samples)
+            sumsq_chunks[-1] = float(cp.asnumpy(sumsq))
+            del X, evals, evecs, sumsq
+
+    _flush_dense_tile()
+
+    if len(window_meta) == 0:
+        raise ValueError("WindowIterator produced no windows.")
+
+    eigvals_host = np.stack(eigvals_chunks, axis=0)
+    eigvecs_host = np.stack(eigvecs_chunks, axis=0)
+    sumsq_host = np.array(sumsq_chunks, dtype=np.float64)
+    valid_mask = np.array(valid_chunks, dtype=bool)
+
+    windows_df = pd.DataFrame({
+        'chrom': [w.chrom for w in window_meta],
+        'start': [w.start for w in window_meta],
+        'end': [w.end for w in window_meta],
+        'center': [w.center for w in window_meta],
+        'n_variants': [w.n_variants for w in window_meta],
+        'window_id': [w.window_id for w in window_meta],
+    })
+
+    eigvals_host[~valid_mask] = np.nan
+    eigvecs_host[~valid_mask] = np.nan
+    sumsq_host[~valid_mask] = np.nan
+
+    return LocalPCAResult(
+        windows=windows_df,
+        eigvals=eigvals_host,
+        eigvecs=eigvecs_host,
+        sumsq=sumsq_host,
+        k=k,
+        scaler=scaler,
+        missing_data=missing_data,
+    )
+
+
+def _cupy_to_host_1d(arr, length):
+    out = np.asarray(cp.asnumpy(arr), dtype=np.float64).reshape(-1)
+    if out.shape[0] != length:
+        raise ValueError(
+            f"expected length-{length} array, got {out.shape[0]}")
+    return out
+
+
+def _cupy_to_host_2d(arr, k, n):
+    return np.asarray(cp.asnumpy(arr), dtype=np.float64).reshape(k, n)
+
+
 def _batched_top_k_eigh(gram_stack: "cp.ndarray", k: int,
                         batch_size: Optional[int] = None
                         ) -> Tuple[np.ndarray, np.ndarray]:
@@ -759,7 +905,12 @@ def local_pca(haplotype_matrix: "HaplotypeMatrix",
               window_size: Optional[int] = None,
               step_size: Optional[int] = None,
               window_type: str = 'snp',
-              regions=None) -> LocalPCAResult:
+              regions=None,
+              engine: str = 'dense-eigh',
+              tile_size: Optional[int] = None,
+              oversample: int = 8,
+              n_subspace_iter: int = 1,
+              random_state: Optional[int] = None) -> LocalPCAResult:
     """Local PCA along the genome (lostruct; Li & Ralph 2019).
 
     For each genomic window, computes the top-k eigenvalues/eigenvectors of the
@@ -791,6 +942,11 @@ def local_pca(haplotype_matrix: "HaplotypeMatrix",
     """
     from .windowed_analysis import WindowIterator
 
+    valid_engines = ('dense-eigh', 'streaming-dense', 'streaming-rsvd')
+    if engine not in valid_engines:
+        raise ValueError(
+            f"engine must be one of {valid_engines}, got {engine!r}")
+
     window_params = _resolve_window_params(
         window_params, window_size, step_size, window_type, regions,
         caller='local_pca')
@@ -804,6 +960,22 @@ def local_pca(haplotype_matrix: "HaplotypeMatrix",
 
     n_samples = matrix.num_haplotypes
     iterator = WindowIterator(matrix, window_params)
+
+    if engine in ('streaming-dense', 'streaming-rsvd'):
+        return _local_pca_streaming(
+            matrix=matrix,
+            iterator=iterator,
+            k=k,
+            scaler=scaler,
+            missing_data=missing_data,
+            engine=engine,
+            tile_size=tile_size,
+            oversample=oversample,
+            n_subspace_iter=n_subspace_iter,
+            random_state=random_state,
+            window_params=window_params,
+        )
+
     identity_placeholder = cp.eye(n_samples, dtype=cp.float64)
     nan_scalar = cp.asarray(np.nan, dtype=cp.float64)
 
@@ -1348,6 +1520,11 @@ def lostruct(haplotype_matrix: "HaplotypeMatrix",
              corner_prop: float = 0.05,
              n_corners: int = 3,
              random_state: Optional[int] = None,
+             # streaming engine controls (forwarded to local_pca)
+             engine: str = 'dense-eigh',
+             tile_size: Optional[int] = None,
+             oversample: int = 8,
+             n_subspace_iter: int = 1,
              ) -> "LostructResult":
     """End-to-end lostruct pipeline (Li & Ralph 2019).
 
@@ -1436,7 +1613,11 @@ def lostruct(haplotype_matrix: "HaplotypeMatrix",
                         scaler=scaler, missing_data=missing_data,
                         population=population, batch_size=batch_size,
                         window_size=window_size, step_size=step_size,
-                        window_type=window_type, regions=regions)
+                        window_type=window_type, regions=regions,
+                        engine=engine, tile_size=tile_size,
+                        oversample=oversample,
+                        n_subspace_iter=n_subspace_iter,
+                        random_state=random_state)
     dist = pc_dist(pca, npc=npc, normalize=normalize, w=pc_dist_weights)
     mds, evr = pcoa(dist, n_components=n_components)
     if n_corners is None or n_corners <= 0:
