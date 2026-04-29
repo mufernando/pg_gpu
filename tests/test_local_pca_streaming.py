@@ -397,7 +397,10 @@ class TestStreamingDispatcher:
             pytest.skip("engine= kwarg not yet implemented")
         d_legacy = pc_dist(legacy)
         d_new = pc_dist(new)
-        np.testing.assert_allclose(d_new, d_legacy, rtol=1e-6, atol=1e-8)
+        # atol=1e-6 absorbs FP-roundoff differences on the
+        # mathematically-zero diagonal entries (per-window eigh and
+        # batched eigh accumulate roundoff in different orders).
+        np.testing.assert_allclose(d_new, d_legacy, rtol=1e-6, atol=1e-6)
 
     def test_streaming_rsvd_subspace_within_tolerance(self, structured_hm):
         """Streaming-rsvd matches legacy subspace per window under

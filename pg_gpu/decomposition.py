@@ -678,27 +678,25 @@ def _local_pca_window_rsvd(X: "cp.ndarray", n_var: int, k: int,
 def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
                           engine, tile_size, oversample,
                           n_subspace_iter, random_state, window_params):
-    """Tiled streaming local PCA dispatcher.
+    """Streaming local PCA dispatcher (engine='streaming-dense' or
+    'streaming-rsvd').
 
-    Iterates the WindowIterator in tiles of ``tile_size`` windows; each
-    tile materialises only its own per-window working set on the GPU,
-    runs the per-window kernel chosen by ``engine``, copies the small
-    (k,) eigvals + (k, n_hap) eigvecs + scalar sumsq results to host,
-    and frees the tile's GPU buffers before the next tile.
+    Iterates the WindowIterator and processes each window's per-window
+    kernel through to host arrays before continuing, so peak GPU
+    memory is bounded by the per-window working set rather than
+    n_windows. Periodically calls ``cp.get_default_memory_pool().
+    free_all_blocks()`` to keep the cupy pool from fragmenting across
+    long whole-genome runs.
 
-    Memory bound is `tile_size * (gram + workspace)` on top of the
-    persistent haplotype matrix, independent of the total window count.
+    The ``tile_size`` argument is the period at which the cupy memory
+    pool is asked to release unused blocks (auto-sized to ~16 windows
+    if not given). It does not affect numerics; lowering it reduces
+    peak fragmentation at a small per-call cost.
     """
     n_samples = matrix.num_haplotypes
 
     if tile_size is None:
-        # Auto-size: keep the per-tile transient working set under
-        # ~30% of currently-free GPU memory. Each window contributes
-        # one Gram (n^2 * 8 bytes) plus eigh workspace (~3x), so the
-        # dense path is the binding constraint.
-        free = cp.cuda.Device().mem_info[0]
-        per_window = n_samples * n_samples * 8 * 4
-        tile_size = max(1, int(free * _GPU_MEM_BUDGET) // max(per_window, 1))
+        tile_size = 16
 
     if engine == 'streaming-rsvd':
         seed = 12345 if random_state is None else int(random_state)
@@ -712,31 +710,9 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
     sumsq_chunks = []
     valid_chunks = []
 
-    pending_starts = []
-    pending_grams = []
-    pending_sumsqs = []
-    pending_indices = []
-
-    def _flush_dense_tile():
-        """Batched eigh on the pending tile of dense Grams (streaming-dense)."""
-        if not pending_grams:
-            return
-        gram_stack = cp.stack(pending_grams, axis=0)
-        eigvals_tile, eigvecs_tile = _batched_top_k_eigh(gram_stack, k)
-        sumsq_tile = cp.stack(pending_sumsqs).get()
-        for i, w_idx in enumerate(pending_indices):
-            eigvals_chunks[w_idx] = eigvals_tile[i]
-            eigvecs_chunks[w_idx] = eigvecs_tile[i]
-            sumsq_chunks[w_idx] = float(sumsq_tile[i])
-        pending_grams.clear()
-        pending_sumsqs.clear()
-        pending_indices.clear()
-        del gram_stack
-        cp.get_default_memory_pool().free_all_blocks()
-
+    n_processed = 0
     for window in iterator:
         window_meta.append(window)
-        # Pre-allocate placeholder slots so flush can fill them by index.
         eigvals_chunks.append(None)
         eigvecs_chunks.append(None)
         sumsq_chunks.append(None)
@@ -753,16 +729,8 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
         valid_chunks.append(True)
 
         if engine == 'streaming-dense':
-            # Build the Gram and sumsq inline; defer the eigh to the
-            # per-tile flush so cuSOLVER's batched syevd amortises its
-            # per-call overhead.
-            C, sumsq = _window_gram(X, X.shape[1])
-            pending_grams.append(C)
-            pending_sumsqs.append(sumsq)
-            pending_indices.append(len(window_meta) - 1)
-            del X
-            if len(pending_grams) >= tile_size:
-                _flush_dense_tile()
+            evals, evecs, sumsq = _local_pca_window_dense(
+                X, X.shape[1], k)
         else:  # streaming-rsvd
             evals, evecs, sumsq = _local_pca_window_rsvd(
                 X, X.shape[1], k,
@@ -770,12 +738,17 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
                 n_iter=n_subspace_iter,
                 rng=rng,
             )
-            eigvals_chunks[-1] = _cupy_to_host_1d(evals, k)
-            eigvecs_chunks[-1] = _cupy_to_host_2d(evecs, k, n_samples)
-            sumsq_chunks[-1] = float(cp.asnumpy(sumsq))
-            del X, evals, evecs, sumsq
 
-    _flush_dense_tile()
+        eigvals_chunks[-1] = _cupy_to_host_1d(evals, k)
+        eigvecs_chunks[-1] = _cupy_to_host_2d(evecs, k, n_samples)
+        sumsq_chunks[-1] = float(cp.asnumpy(sumsq))
+
+        del X, evals, evecs, sumsq
+        n_processed += 1
+        if n_processed % tile_size == 0:
+            cp.get_default_memory_pool().free_all_blocks()
+
+    cp.get_default_memory_pool().free_all_blocks()
 
     if len(window_meta) == 0:
         raise ValueError("WindowIterator produced no windows.")
