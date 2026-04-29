@@ -710,9 +710,18 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
     sumsq_chunks = []
     valid_chunks = []
 
+    # Keep only the small per-window metadata; the GPU-resident
+    # window.matrix returned by WindowIterator.get_subset materializes
+    # a fresh int8 copy of the haplotype block (fancy indexing makes
+    # a copy, not a view), so retaining the WindowData object across
+    # the loop would leak ~tens of GB of GPU memory by the end of a
+    # whole-arm scan. We extract only what windows_df needs.
     n_processed = 0
     for window in iterator:
-        window_meta.append(window)
+        window_meta.append((
+            window.chrom, window.start, window.end, window.center,
+            window.n_variants, window.window_id,
+        ))
         eigvals_chunks.append(None)
         eigvecs_chunks.append(None)
         sumsq_chunks.append(None)
@@ -721,6 +730,7 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
             eigvecs_chunks[-1] = np.full((k, n_samples), np.nan)
             sumsq_chunks[-1] = np.nan
             valid_chunks.append(False)
+            del window
             continue
 
         X = _prepare_matrix(window.matrix, scaler, population=None,
@@ -743,7 +753,7 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
         eigvecs_chunks[-1] = _cupy_to_host_2d(evecs, k, n_samples)
         sumsq_chunks[-1] = float(cp.asnumpy(sumsq))
 
-        del X, evals, evecs, sumsq
+        del X, evals, evecs, sumsq, window
         n_processed += 1
         if n_processed % tile_size == 0:
             cp.get_default_memory_pool().free_all_blocks()
@@ -758,18 +768,19 @@ def _local_pca_streaming(matrix, iterator, k, scaler, missing_data,
     sumsq_host = np.array(sumsq_chunks, dtype=np.float64)
     valid_mask = np.array(valid_chunks, dtype=bool)
 
-    windows_df = pd.DataFrame({
-        'chrom': [w.chrom for w in window_meta],
-        'start': [w.start for w in window_meta],
-        'end': [w.end for w in window_meta],
-        'center': [w.center for w in window_meta],
-        'n_variants': [w.n_variants for w in window_meta],
-        'window_id': [w.window_id for w in window_meta],
-    })
-
     eigvals_host[~valid_mask] = np.nan
     eigvecs_host[~valid_mask] = np.nan
     sumsq_host[~valid_mask] = np.nan
+
+    chrom_col, start_col, end_col, center_col, nvar_col, wid_col = zip(*window_meta)
+    windows_df = pd.DataFrame({
+        'chrom': list(chrom_col),
+        'start': list(start_col),
+        'end': list(end_col),
+        'center': list(center_col),
+        'n_variants': list(nvar_col),
+        'window_id': list(wid_col),
+    })
 
     return LocalPCAResult(
         windows=windows_df,
